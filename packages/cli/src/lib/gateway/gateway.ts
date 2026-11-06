@@ -27,6 +27,7 @@ import { AGX_CLI_VERSION } from "../version.js";
 import { DeliveryQueue, deliver } from "./delivery.js";
 import { messageEvent, receiptEvent, taskEvent } from "./events.js";
 import { ApiError, readJson, sendError, sendJson } from "./http.js";
+import { parseIdempotencyKey, TaskIdempotencyStore } from "./idempotency.js";
 import { verifyGatewayKey } from "./keys.js";
 import { type OperationDeps, readCard, requestTask, sendMessage } from "./operations.js";
 import { Requester } from "./requester.js";
@@ -155,6 +156,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				log(`A message could not be stored and will be retried: ${error instanceof Error ? error.message : String(error)}`),
 		});
 		const subscriptions = new SubscriptionStore(name);
+		const taskOperations = new TaskIdempotencyStore(name);
 		const queue = new DeliveryQueue({
 			retryDelaysMs: options.deliveryRetryDelaysMs,
 			onFailure: (subscription, eventId, detail) =>
@@ -498,16 +500,23 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 					);
 				}
 				tasksWaiting += 1;
-				// A caller that goes away (n8n gave up, a proxy timed out) stops the wait.
+				const idempotencyKey = parseIdempotencyKey(req.headers["idempotency-key"]);
 				const gone = new AbortController();
-				res.on("close", () => {
-					if (!res.writableFinished) {
-						gone.abort();
-					}
-				});
+				if (idempotencyKey === null) {
+					// Without idempotency, preserve caller-abandon behavior. An idempotent
+					// operation must outlive every individual HTTP connection.
+					res.on("close", () => {
+						if (!res.writableFinished) {
+							gone.abort();
+						}
+					});
+				}
 				try {
 					const body = await readJson(req);
-					sendJson(res, 200, await requestTask(deps, body, gone.signal));
+					const output = idempotencyKey === null
+						? await requestTask(deps, body, gone.signal)
+						: await taskOperations.execute(bearer(req), idempotencyKey, body, () => requestTask(deps, body));
+					sendJson(res, 200, output);
 				} finally {
 					tasksWaiting -= 1;
 				}
@@ -604,6 +613,11 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				server.close(() => resolve());
 				server.closeAllConnections();
 			});
+			try {
+				taskOperations.close();
+			} catch (error) {
+				log(`task outcomes could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+			}
 			requester.stop();
 			// One budget for the whole stop, under the 10 s a container runtime
 			// gives before it kills the process.

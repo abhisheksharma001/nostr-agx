@@ -415,6 +415,22 @@ An error is `{ "error": { "code", "message", "description"? } }` with a matching
 a task nobody answered — the usual sign that the agent has not allowed this one — and `401` for a
 missing or revoked key.
 
+### Idempotent task submission
+
+`POST /v1/tasks` accepts an optional `Idempotency-Key` header of 1–255 visible ASCII characters.
+For one API credential, the same key and canonically identical JSON body share one in-flight AGX
+request and return the same stored outcome. Object-key order does not matter. A key reused with a
+different body gets `409 idempotency_key_reused`; another credential has an independent key scope.
+
+Outcomes are kept for 24 hours, with at most 1,000 live idempotent operations per profile. The
+gateway records an operation before publishing it. If the gateway stops before recording the
+outcome, retries get `409 result_unknown` instead of executing possibly duplicate work. Check the
+remote agent's effects before using a different key. An individual HTTP disconnect does not cancel
+an idempotent operation. Requests without the header retain the existing caller-abandon behavior.
+
+This prevents duplicate submission through one gateway; it does not prove exactly-once execution
+after an uncertain remote crash.
+
 ### Subscriptions
 
 A subscription names a webhook URL, the `events` to deliver (`task`, `message`, `receipt`), the
@@ -444,8 +460,8 @@ multicast or unspecified address, such as a cloud metadata service.
   at a time per webhook with 30 seconds for each answer, and retried three times over about 40
   seconds when the webhook is unreachable or answers `429`, `502`, `503` or `504`.
 - **An answer over 1 MiB** is not read: the requester gets "result too large". Up to 256 task
-  requests through the API wait at once (more get `503`), and one whose caller disconnects stops
-  waiting.
+  requests through the API wait at once (more get `503`). Without an idempotency key, one whose
+  caller disconnects stops waiting; an idempotent operation continues for later retries.
 
 Every delivery is signed with the subscription's secret, which `POST /v1/subscriptions` returns
 once: `x-agx-signature` is `v1=` and the hex HMAC-SHA256 of `"<x-agx-timestamp>.<body>"`. Check
@@ -709,6 +725,8 @@ on their behalf.
   profiles/<name>/gateway-keys.json   `agx gateway` API keys, as SHA-256 hashes
   profiles/<name>/gateway-subscriptions.json
                                       webhooks `agx gateway` delivers to, with their signing secrets
+  profiles/<name>/gateway-task-operations.json
+                                      idempotent task requests and their retained outcomes
 ```
 
 `credentials.json` and `pending-login.json` are secrets: never paste, upload or
