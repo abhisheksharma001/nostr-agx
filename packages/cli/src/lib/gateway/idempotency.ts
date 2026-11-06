@@ -1,12 +1,23 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync } from "node:fs";
 import { z } from "zod";
 import { gatewayTaskOperationsPath, writePrivateJson } from "../paths.js";
 import { ApiError } from "./http.js";
 
 export const TASK_IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const MAX_IDEMPOTENCY_KEY_CHARS = 255;
+export const MAX_TASK_OUTCOME_BYTES = 16 * 1024;
+export const MAX_TASK_OPERATIONS_PER_CREDENTIAL = 100;
 const MAX_TASK_OPERATIONS = 1_000;
+const RETRYABLE_TASK_ERROR_CODES = new Set([
+	"invalid_request",
+	"invalid_peer",
+	"payload_too_large",
+	"relays_unreachable",
+	"no_card",
+	"capability_not_advertised",
+	"publish_failed",
+]);
 
 const outcomeSchema = z.discriminatedUnion("kind", [
 	z.object({
@@ -23,6 +34,7 @@ const outcomeSchema = z.discriminatedUnion("kind", [
 ]);
 const operationSchema = z.object({
 	id: z.string().regex(/^[0-9a-f]{64}$/),
+	credential: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 	fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
 	createdAt: z.number().int(),
 	updatedAt: z.number().int(),
@@ -39,6 +51,8 @@ type Operation = z.infer<typeof operationSchema>;
 export interface TaskIdempotencyOptions {
 	now?: () => number;
 	retentionMs?: number;
+	maxOperationsPerCredential?: number;
+	log?: (line: string) => void;
 }
 
 function unknownOutcome(): Outcome {
@@ -112,6 +126,8 @@ export class TaskIdempotencyStore {
 	private readonly path: string;
 	private readonly now: () => number;
 	private readonly retentionMs: number;
+	private readonly maxOperationsPerCredential: number;
+	private readonly log: (line: string) => void;
 	private readonly records: Map<string, Operation>;
 	private readonly inFlight = new Map<string, Promise<Record<string, unknown>>>();
 	private closed = false;
@@ -120,20 +136,22 @@ export class TaskIdempotencyStore {
 		this.path = gatewayTaskOperationsPath(profile);
 		this.now = options.now ?? Date.now;
 		this.retentionMs = options.retentionMs ?? TASK_IDEMPOTENCY_RETENTION_MS;
-		const raw: unknown = existsSync(this.path)
-			? JSON.parse(readFileSync(this.path, "utf8"))
-			: { version: 1, operations: [] };
-		const parsed = fileSchema.safeParse(raw);
-		if (!parsed.success) {
-			throw new Error(`${this.path} is not a gateway task-operation file this version can read`);
-		}
-		this.records = new Map(parsed.data.operations.map((operation) => [operation.id, operation]));
+		this.maxOperationsPerCredential = options.maxOperationsPerCredential ?? MAX_TASK_OPERATIONS_PER_CREDENTIAL;
+		this.log = options.log ?? (() => undefined);
+		this.records = new Map(this.readOperations().map((operation) => [operation.id, operation]));
 		let changed = this.prune();
 		for (const operation of this.records.values()) {
 			if (operation.outcome === null) {
 				operation.outcome = unknownOutcome();
 				operation.updatedAt = this.now();
 				changed = true;
+			} else {
+				const retained = this.retainedOutcome(operation.outcome);
+				if (retained !== operation.outcome) {
+					operation.outcome = retained;
+					operation.updatedAt = this.now();
+					changed = true;
+				}
 			}
 		}
 		if (changed) {
@@ -153,6 +171,7 @@ export class TaskIdempotencyStore {
 		if (this.prune()) {
 			this.persist();
 		}
+		const credentialHash = hash(credential);
 		const id = hash(`POST /v1/tasks\0${credential}\0${key}`);
 		const fingerprint = hash(canonicalJson(body));
 		const existing = this.records.get(id);
@@ -176,6 +195,20 @@ export class TaskIdempotencyStore {
 			}
 			return this.replay(existing);
 		}
+		let credentialOperations = 0;
+		for (const record of this.records.values()) {
+			if (record.credential === credentialHash) {
+				credentialOperations += 1;
+			}
+		}
+		if (credentialOperations >= this.maxOperationsPerCredential) {
+			throw new ApiError(
+				503,
+				"idempotency_store_full",
+				`This API credential already retains ${this.maxOperationsPerCredential} task outcomes`,
+				"Retry after older outcomes expire, or submit without an idempotency key if duplicate execution is safe.",
+			);
+		}
 		if (this.records.size >= MAX_TASK_OPERATIONS) {
 			throw new ApiError(
 				503,
@@ -186,6 +219,7 @@ export class TaskIdempotencyStore {
 		}
 		const created = {
 			id,
+			credential: credentialHash,
 			fingerprint,
 			createdAt: this.now(),
 			updatedAt: this.now(),
@@ -227,26 +261,66 @@ export class TaskIdempotencyStore {
 		}
 	}
 
+	private readOperations(): Operation[] {
+		if (!existsSync(this.path)) {
+			return [];
+		}
+		let raw: unknown;
+		try {
+			raw = JSON.parse(readFileSync(this.path, "utf8"));
+		} catch (error) {
+			this.quarantine(error);
+			return [];
+		}
+		const parsed = fileSchema.safeParse(raw);
+		if (!parsed.success) {
+			this.quarantine(parsed.error);
+			return [];
+		}
+		return parsed.data.operations;
+	}
+
+	private quarantine(reason: unknown): void {
+		const corruptPath = `${this.path}.corrupt`;
+		try {
+			renameSync(this.path, corruptPath);
+		} catch (error) {
+			throw new Error(
+				`${this.path} is unreadable and could not be moved to ${corruptPath}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		this.log(
+			`Unreadable task-operation store moved to ${corruptPath}: ${reason instanceof Error ? reason.message : String(reason)}`,
+		);
+	}
+
 	private async perform(
 		operation: Operation,
 		run: () => Promise<Record<string, unknown>>,
 	): Promise<Record<string, unknown>> {
+		let outcome: Outcome;
 		let unexpected: unknown;
 		let failed = false;
 		try {
-			operation.outcome = { kind: "success", body: await run() };
+			outcome = { kind: "success", body: await run() };
 		} catch (error) {
 			failed = true;
 			unexpected = error;
-			operation.outcome = errorOutcome(error);
+			outcome = errorOutcome(error);
 		}
+		const retryable = failed && unexpected instanceof ApiError && RETRYABLE_TASK_ERROR_CODES.has(unexpected.code);
+		operation.outcome = retryable ? null : this.retainedOutcome(outcome);
 		operation.updatedAt = this.now();
 		if (!this.closed && this.records.get(operation.id) === operation) {
 			try {
+				if (retryable) {
+					this.records.delete(operation.id);
+				}
 				this.persist();
 			} catch {
 				operation.outcome = unknownOutcome();
 				operation.updatedAt = this.now();
+				this.records.set(operation.id, operation);
 				throw new ApiError(
 					500,
 					"idempotency_store_failed",
@@ -258,11 +332,30 @@ export class TaskIdempotencyStore {
 		if (failed && !(unexpected instanceof ApiError)) {
 			throw unexpected;
 		}
-		return this.replay(operation);
+		return this.replay(operation, outcome);
 	}
 
-	private replay(operation: Operation): Record<string, unknown> {
-		const outcome = operation.outcome ?? unknownOutcome();
+	private retainedOutcome(outcome: Outcome): Outcome {
+		let bytes: number;
+		try {
+			bytes = Buffer.byteLength(JSON.stringify(outcome, null, 2), "utf8");
+		} catch {
+			bytes = Number.POSITIVE_INFINITY;
+		}
+		if (bytes <= MAX_TASK_OUTCOME_BYTES) {
+			return outcome;
+		}
+		return {
+			kind: "error",
+			status: 409,
+			code: "outcome_not_retained",
+			message: "The task finished, but its outcome was too large to retain",
+			description: `The callers waiting for this run received its outcome. Stored outcomes are limited to ${MAX_TASK_OUTCOME_BYTES} bytes; check the remote agent before submitting new work with a different key.`,
+		};
+	}
+
+	private replay(operation: Operation, actual?: Outcome): Record<string, unknown> {
+		const outcome = actual ?? operation.outcome ?? unknownOutcome();
 		if (outcome.kind === "success") {
 			return outcome.body;
 		}

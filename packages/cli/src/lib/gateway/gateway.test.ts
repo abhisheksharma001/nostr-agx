@@ -402,6 +402,78 @@ describe("agx gateway: outbound", () => {
 		expect(runs).toBe(1);
 	}, 30_000);
 
+	it("does not leak waiting slots when idempotency keys are invalid", async () => {
+		const reviewer = await peer({ authorize: "accept-all" });
+		reviewer.client.handle("invoice.invalid-key", () => ({ ok: true }));
+		await gateway.close();
+		gateway = await startGateway({ ...gatewayOptions(), maxTaskRequestsWaiting: 1 });
+		try {
+			for (const value of ["", "has space", "x".repeat(256)]) {
+				const invalid = await api("/v1/tasks", {
+					method: "POST",
+					headers: { "idempotency-key": value },
+					body: "{}",
+				});
+				expect(invalid.status).toBe(400);
+				expect(await json(invalid)).toMatchObject({ error: { code: "invalid_idempotency_key" } });
+			}
+			const valid = await pumping(api("/v1/tasks", {
+				method: "POST",
+				body: JSON.stringify({ peer: reviewer.npub, capability: "invoice.invalid-key", timeoutSec: 20 }),
+			}), reviewer.client);
+			expect(valid.status).toBe(200);
+		} finally {
+			await gateway.close();
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 30_000);
+
+	it("releases a disconnected joiner's slot while the shared task keeps running", async () => {
+		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
+		let runs = 0;
+		let release: () => void = () => undefined;
+		reviewer.client.handle("invoice.joiner-disconnect", async () => {
+			runs += 1;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { run: runs };
+		});
+		await gateway.close();
+		gateway = await startGateway({ ...gatewayOptions(), maxTaskRequestsWaiting: 2 });
+		const call = (signal?: AbortSignal) => api("/v1/tasks", {
+			method: "POST",
+			headers: { "idempotency-key": "joiner-disconnect" },
+			body: JSON.stringify({ peer: reviewer.npub, capability: "invoice.joiner-disconnect", timeoutSec: 20 }),
+			signal,
+		});
+		try {
+			const first = call();
+			first.catch(() => undefined);
+			await waitForPeer(() => runs === 1, reviewer.client);
+			const gone = new AbortController();
+			const joiner = call(gone.signal);
+			await new Promise((resolve) => setTimeout(resolve, 250));
+			gone.abort();
+			await expect(joiner).rejects.toThrow();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			const rejoined = call();
+			rejoined.catch(() => undefined);
+			await new Promise((resolve) => setTimeout(resolve, 250));
+			release();
+			const responses = await pumping(Promise.all([first, rejoined]), reviewer.client);
+			expect(responses.map((res) => res.status)).toEqual([200, 200]);
+			const outputs = await Promise.all(responses.map(json));
+			expect(outputs[0]).toMatchObject({ status: "completed", output: { run: 1 } });
+			expect(outputs[1]).toEqual(outputs[0]);
+			expect(runs).toBe(1);
+		} finally {
+			release();
+			await gateway.close();
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 30_000);
+
 	it("restores completed idempotent results and reports unresolved work after restart", async () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 4 });
 		let completedRuns = 0;

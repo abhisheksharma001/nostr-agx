@@ -1,8 +1,11 @@
+import { existsSync, readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { sandbox } from "../../test/helpers.js";
+import { gatewayTaskOperationsPath, writePrivateJson, writePrivateText } from "../paths.js";
 import { ApiError } from "./http.js";
 import {
 	MAX_IDEMPOTENCY_KEY_CHARS,
+	MAX_TASK_OUTCOME_BYTES,
 	parseIdempotencyKey,
 	TASK_IDEMPOTENCY_RETENTION_MS,
 	TaskIdempotencyStore,
@@ -114,6 +117,128 @@ describe("TaskIdempotencyStore", () => {
 		release?.();
 		await expect(pending).resolves.toEqual({ status: "completed" });
 		restarted.close();
+	});
+
+	it("retries failures that prove no task was published", async () => {
+		const store = new TaskIdempotencyStore("test");
+		const failures = [
+			[400, "invalid_request"],
+			[400, "invalid_peer"],
+			[413, "payload_too_large"],
+			[503, "relays_unreachable"],
+			[404, "no_card"],
+			[422, "capability_not_advertised"],
+			[502, "publish_failed"],
+		] as const;
+		for (const [status, code] of failures) {
+			let runs = 0;
+			const operation = async (): Promise<Record<string, unknown>> => {
+				runs += 1;
+				throw new ApiError(status, code, "Try again");
+			};
+			for (let attempt = 0; attempt < 2; attempt++) {
+				await expect(store.execute("credential-a", code, {}, operation)).rejects.toMatchObject({ status, code });
+			}
+			expect(runs).toBe(2);
+		}
+		store.close();
+	});
+
+	it("retains timeouts because remote execution is uncertain", async () => {
+		const store = new TaskIdempotencyStore("test");
+		let runs = 0;
+		const operation = async (): Promise<Record<string, unknown>> => {
+			runs += 1;
+			throw new ApiError(504, "timeout", "No result arrived");
+		};
+		for (let attempt = 0; attempt < 2; attempt++) {
+			await expect(store.execute("credential-a", "timeout", {}, operation)).rejects.toMatchObject({
+				status: 504,
+				code: "timeout",
+			});
+		}
+		expect(runs).toBe(1);
+		store.close();
+	});
+
+	it("returns an oversized outcome once and retains an explicit marker", async () => {
+		const store = new TaskIdempotencyStore("test");
+		let runs = 0;
+		const output = { large: "x".repeat(MAX_TASK_OUTCOME_BYTES) };
+		const operation = async () => ({ status: "completed", output, run: ++runs });
+		await expect(store.execute("credential-a", "large", {}, operation)).resolves.toEqual({
+			status: "completed",
+			output,
+			run: 1,
+		});
+		await expect(store.execute("credential-a", "large", {}, operation)).rejects.toMatchObject({
+			status: 409,
+			code: "outcome_not_retained",
+		});
+		expect(runs).toBe(1);
+		store.close();
+
+		const restored = new TaskIdempotencyStore("test");
+		await expect(restored.execute("credential-a", "large", {}, operation)).rejects.toMatchObject({
+			status: 409,
+			code: "outcome_not_retained",
+		});
+		expect(runs).toBe(1);
+		expect(Buffer.byteLength(readFileSync(gatewayTaskOperationsPath("test"), "utf8"))).toBeLessThan(
+			MAX_TASK_OUTCOME_BYTES * 2,
+		);
+		restored.close();
+	});
+
+	it("bounds retained operations per credential without blocking other credentials", async () => {
+		const store = new TaskIdempotencyStore("test", { maxOperationsPerCredential: 1 });
+		await store.execute("credential-a", "first", {}, async () => ({ owner: "a" }));
+		await expect(store.execute("credential-a", "second", {}, async () => ({ owner: "a" }))).rejects.toMatchObject({
+			status: 503,
+			code: "idempotency_store_full",
+		});
+		await expect(store.execute("credential-b", "first", {}, async () => ({ owner: "b" }))).resolves.toEqual({
+			owner: "b",
+		});
+		store.close();
+	});
+
+	it("restores operations written before per-credential quotas", async () => {
+		const written = new TaskIdempotencyStore("test");
+		await written.execute("credential-a", "legacy", {}, async () => ({ run: 1 }));
+		written.close();
+		const path = gatewayTaskOperationsPath("test");
+		const raw = JSON.parse(readFileSync(path, "utf8")) as { operations: Record<string, unknown>[] };
+		delete raw.operations[0]!.credential;
+		writePrivateJson(path, raw);
+
+		const restored = new TaskIdempotencyStore("test");
+		let runs = 0;
+		await expect(restored.execute("credential-a", "legacy", {}, async () => ({ run: ++runs + 1 }))).resolves.toEqual({
+			run: 1,
+		});
+		expect(runs).toBe(0);
+		restored.close();
+	});
+
+	it("quarantines unreadable stores and starts with an empty one", async () => {
+		for (const profile of ["broken-json", "broken-schema"]) {
+			const path = gatewayTaskOperationsPath(profile);
+			if (profile === "broken-json") {
+				writePrivateText(path, "{not json");
+			} else {
+				writePrivateJson(path, { version: 1, operations: [{ invalid: true }] });
+			}
+			const lines: string[] = [];
+			const store = new TaskIdempotencyStore(profile, { log: (line) => lines.push(line) });
+			expect(existsSync(path)).toBe(false);
+			expect(existsSync(`${path}.corrupt`)).toBe(true);
+			expect(lines.join("\n")).toContain(`${path}.corrupt`);
+			await expect(store.execute("credential-a", "after-recovery", {}, async () => ({ ok: true }))).resolves.toEqual({
+				ok: true,
+			});
+			store.close();
+		}
 	});
 
 	it("expires retained outcomes", async () => {

@@ -76,6 +76,8 @@ export interface GatewayOptions {
 	/** Tasks the gateway runs or holds at once; past it, a task is answered
 	 * that the gateway is busy. Default 64. */
 	maxTasksInFlight?: number;
+	/** For tests: API task requests waiting for results. Default 256. */
+	maxTaskRequestsWaiting?: number;
 }
 
 export interface RunningGateway {
@@ -156,7 +158,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				log(`A message could not be stored and will be retried: ${error instanceof Error ? error.message : String(error)}`),
 		});
 		const subscriptions = new SubscriptionStore(name);
-		const taskOperations = new TaskIdempotencyStore(name);
+		const taskOperations = new TaskIdempotencyStore(name, { log });
 		const queue = new DeliveryQueue({
 			retryDelaysMs: options.deliveryRetryDelaysMs,
 			onFailure: (subscription, eventId, detail) =>
@@ -451,6 +453,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 		};
 
 		let tasksWaiting = 0;
+		const maxTaskRequestsWaiting = options.maxTaskRequestsWaiting ?? MAX_TASK_REQUESTS_WAITING;
 		const route = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
 			const url = new URL(req.url ?? "/", "http://gateway");
 			const method = req.method ?? "GET";
@@ -490,27 +493,35 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				return;
 			}
 			if (method === "POST" && path === "/v1/tasks") {
+				const idempotencyKey = parseIdempotencyKey(req.headers["idempotency-key"]);
 				// Each one holds a connection and a result poll until it is answered.
-				if (tasksWaiting >= MAX_TASK_REQUESTS_WAITING) {
+				if (tasksWaiting >= maxTaskRequestsWaiting) {
 					throw new ApiError(
 						503,
 						"busy",
-						`${MAX_TASK_REQUESTS_WAITING} task requests are already waiting for results`,
+						`${maxTaskRequestsWaiting} task requests are already waiting for results`,
 						"Try again shortly.",
 					);
 				}
 				tasksWaiting += 1;
-				const idempotencyKey = parseIdempotencyKey(req.headers["idempotency-key"]);
+				let released = false;
+				const releaseWaiting = () => {
+					if (!released) {
+						released = true;
+						tasksWaiting -= 1;
+					}
+				};
 				const gone = new AbortController();
-				if (idempotencyKey === null) {
-					// Without idempotency, preserve caller-abandon behavior. An idempotent
-					// operation must outlive every individual HTTP connection.
-					res.on("close", () => {
-						if (!res.writableFinished) {
+				res.on("close", () => {
+					if (!res.writableFinished) {
+						// Only work without a key belongs to this one HTTP caller. Every
+						// disconnected caller stops consuming a waiting slot immediately.
+						if (idempotencyKey === null) {
 							gone.abort();
 						}
-					});
-				}
+						releaseWaiting();
+					}
+				});
 				try {
 					const body = await readJson(req);
 					const output = idempotencyKey === null
@@ -518,7 +529,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 						: await taskOperations.execute(bearer(req), idempotencyKey, body, () => requestTask(deps, body));
 					sendJson(res, 200, output);
 				} finally {
-					tasksWaiting -= 1;
+					releaseWaiting();
 				}
 				return;
 			}

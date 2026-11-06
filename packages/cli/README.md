@@ -422,11 +422,21 @@ For one API credential, the same key and canonically identical JSON body share o
 request and return the same stored outcome. Object-key order does not matter. A key reused with a
 different body gets `409 idempotency_key_reused`; another credential has an independent key scope.
 
-Outcomes are kept for 24 hours, with at most 1,000 live idempotent operations per profile. The
-gateway records an operation before publishing it. If the gateway stops before recording the
+Outcomes are kept for 24 hours, with at most 100 live idempotent operations per API credential and
+1,000 per profile. Past either limit, a new keyed submission gets `503 idempotency_store_full`. Each
+stored outcome is capped at 16 KiB. Callers attached to a run that returns a larger outcome still
+receive it; later retries get `409 outcome_not_retained` instead of executing the task again.
+
+The gateway records an operation before publishing it. If the gateway stops before recording the
 outcome, retries get `409 result_unknown` instead of executing possibly duplicate work. Check the
-remote agent's effects before using a different key. An individual HTTP disconnect does not cancel
-an idempotent operation. Requests without the header retain the existing caller-abandon behavior.
+remote agent's effects before using a different key. Validation, card-resolution and publish failures
+that prove no task was sent are not retained, so the same key can retry after the cause is fixed.
+Timeouts and remote task failures are retained and replayed because remote execution is uncertain.
+
+An individual HTTP disconnect does not cancel an idempotent operation or keep its waiting slot.
+Requests without the header retain the existing caller-abandon behavior. If the operation store is
+unreadable, the gateway moves it to `gateway-task-operations.json.corrupt`, logs the path, and starts
+with an empty store.
 
 This prevents duplicate submission through one gateway; it does not prove exactly-once execution
 after an uncertain remote crash.
