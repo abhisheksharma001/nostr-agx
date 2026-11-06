@@ -24,7 +24,7 @@ ChatGPT/Codex may also explain the [Claude requester path](../examples/claude-he
 
 ## Optional: installed marketplace integration with real peers
 
-This section preserves `elladex-chatgpt-plugins` at `f41a2c061c8839575dda0fa04e3beeabfb8447cc`. The inspected plugin supports local-only Work/Codex with trusted local hooks. Ordinary Chat, Work Cloud, synced local-access tasks and the Codex IDE extension are not covered. Giving terminal sample instructions does not claim native integration on those surfaces.
+This section preserves the earlier inspection of `elladex-chatgpt-plugins` (no longer publicly reachable, see step 3) at `f41a2c061c8839575dda0fa04e3beeabfb8447cc`. The inspected plugin supports local-only Work/Codex with trusted local hooks. Ordinary Chat, Work Cloud, synced local-access tasks and the Codex IDE extension are not covered. Giving terminal sample instructions does not claim native integration on those surfaces.
 
 ### Bootstrap in dependency order
 
@@ -32,18 +32,12 @@ This section preserves `elladex-chatgpt-plugins` at `f41a2c061c8839575dda0fa04e3
 2. If global `agx` is missing or lacks task support, the user installs:
 
    ```sh
-   npm install -g @nostr-agx/cli@0.4.0
+   npm install -g @nostr-agx/cli@0.5.0
    ```
 
-   Keep compatible existing installations. This optional integration uses published 0.4.0 for new installations; the self-contained examples deliberately retain their tested 0.3.0 lockfiles.
-3. If the plugin is absent, the inspected repository documents:
+   Keep compatible existing installations. This optional integration uses published 0.5.0 for new installations; the self-contained examples deliberately retain their tested 0.3.0 lockfiles.
+3. If the plugin is absent, do not offer a marketplace install command. The public repository this section was written against, `ellavox-ai/elladex-chatgpt-plugins`, returned HTTP 404 on October 24, 2026, so its documented `codex plugin marketplace add` and `codex plugin add` commands could not be re-verified. A user who already has the plugin can keep using it through the host's Plugins UI. Everyone else can use the terminal sample, which needs no plugin.
 
-   ```sh
-   codex plugin marketplace add ellavox-ai/elladex-chatgpt-plugins
-   codex plugin add elladex-agx@ellaworks
-   ```
-
-   The supported desktop Plugins UI is another route after adding the marketplace. Directory search is optional. If those commands are unavailable on the installed host, use its Plugins UI or [upstream instructions](https://github.com/ellavox-ai/elladex-chatgpt-plugins#install), not an invented command or promised store listing.
 4. Only after installation, review/trust Elladex hooks in the supported host, then start a new session. Require `Elladex guard active.` for this installed marketplace integration; hook errors remain blockers. Never ask the user to trust nonexistent hooks or write trust settings yourself.
 
 This shared local draft is not yet in that marketplace. The isolated fixture performs none of these plugin/configuration steps.

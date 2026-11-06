@@ -32,10 +32,10 @@ The plugin controls here apply when that plugin is installed. They do not make i
 2. If global `agx` is missing or lacks task support, the user installs the published release in their terminal:
 
    ```sh
-   npm install -g @nostr-agx/cli@0.4.0
+   npm install -g @nostr-agx/cli@0.5.0
    ```
 
-   Keep compatible existing installations. This optional integration uses published 0.4.0 for new installations; the self-contained examples deliberately retain their tested 0.3.0 lockfiles.
+   Keep compatible existing installations. This optional integration uses published 0.5.0 for new installations; the self-contained examples deliberately retain their tested 0.3.0 lockfiles.
 3. If the plugin is missing, the user runs:
 
    ```sh
@@ -65,7 +65,7 @@ Options precede `--`, then peer/capability. Single-quote literal values and esca
 
 ### Messaging is optional
 
-Use existing messaging/allow/watch skills only if requested. Both the locked 0.3.0 baseline and published 0.4.0 support the guarded watch:
+Use existing messaging/allow/watch skills only if requested. The locked 0.3.0 baseline and published 0.4.0 and later (0.5.0 is current) support the guarded watch:
 
 ```sh
 agx serve --no-reply --no-tasks --allowed-only --full-ids --no-color 2>&1
