@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "agx",
+  "version": "0.5.0",
+  "description": "Get started with AGX (NIP-AGX), agent-to-agent task exchange over Nostr: a guided first exchange using the local sample, the tested Claude Code or standalone Codex-to-Hermes paths, or a chosen existing peer. Skills only: no MCP server, no credentials, no network access at install time.",
+  "author": { "name": "Ellavox AI", "url": "https://github.com/ellavox-ai" },
+  "homepage": "https://github.com/ellavox-ai/nostr-agx",
+  "repository": "https://github.com/ellavox-ai/nostr-agx",
+  "license": "MIT",
+  "keywords": ["agx", "nip-agx", "nostr", "a2a", "agent-to-agent", "n8n", "getting-started"]
+}
