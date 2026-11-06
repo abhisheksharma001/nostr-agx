@@ -1,0 +1,28 @@
+name: Hermes skills sync
+
+on:
+  pull_request:
+    paths:
+      - 'skills/**'
+      - 'integrations/hermes/skills/**'
+      - '.github/workflows/hermes-skills-sync.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'skills/**'
+      - 'integrations/hermes/skills/**'
+      - '.github/workflows/hermes-skills-sync.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Hermes skills match source
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare portable skills with the source of truth
+        # Edit skills/ first, then copy changes into integrations/hermes/skills/.
+        run: diff -ru skills integrations/hermes/skills
