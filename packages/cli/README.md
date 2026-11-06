@@ -423,27 +423,38 @@ For one API credential, the same key and canonically identical JSON body share o
 request and return the same stored outcome. Object-key order does not matter. A key reused with a
 different body gets `409 idempotency_key_reused`; another credential has an independent key scope.
 
-Outcomes are kept for 24 hours, with at most 100 live task operations per API credential and 1,000
-per profile. Past either limit, a new keyed synchronous submission or any background submission gets
-`503 idempotency_store_full`. Each stored outcome is capped at 16 KiB. Synchronous callers attached
-to a run that returns a larger outcome still receive it; later retries get `409 outcome_not_retained`
-instead of executing the task again. A background task with an oversized outcome becomes `failed`
-with `outcome_not_retained`.
+Outcomes are kept for up to 24 hours, with at most 100 retained operations per API credential and
+1,000 per profile. At either cap, the gateway evicts the oldest settled outcome. Reusing an evicted
+key starts new work, and an evicted public ID returns `404`. If every operation at the cap is still
+running, a new submission gets `503 idempotency_store_full`. The complete operation store is also capped at
+16 MiB, with the same oldest-settled eviction policy.
+
+At most 256 keyed synchronous operations and 64 background operations run at once, including
+operations whose callers disconnected. Further distinct submissions get `503 busy`; a retry of a
+running key still joins it. These limits count running work, not open HTTP connections or daily
+submission totals.
+
+Each synchronous stored outcome is capped at 16 KiB. Callers attached to a run that returns a larger
+outcome still receive it; later retries get `409 outcome_not_retained` instead of executing the task
+again. Background outcomes are capped at 1 MiB. A background task with an outcome over that limit
+becomes `failed` with `outcome_not_retained`.
 
 The gateway records an operation before publishing it. If the gateway stops before recording the
 outcome, retries get `409 result_unknown` instead of executing possibly duplicate work. Check the
-remote agent's effects before using a different key. Validation, card-resolution and publish failures
-that prove no task was sent are not retained, so the same key can retry after the cause is fixed. A
-background retry after one of these failures creates a new public task ID. Timeouts and remote task
-failures are retained and replayed because remote execution is uncertain.
+remote agent's effects before using a different key. Validation and card-resolution failures that prove
+no task was sent are not retained for synchronous callers, so the same key can retry after the cause is
+fixed. A background public ID remains available as `failed` with the real error, while its idempotency
+key is freed for a retry with a new public ID. Publish failures, timeouts and remote task failures are
+retained and replayed: a relay may have stored a task even when publishing reports failure, so remote
+execution is uncertain.
 
 An individual HTTP disconnect does not cancel an idempotent operation or keep its waiting slot.
 Synchronous requests without the header retain the existing caller-abandon behavior. If the operation
 store is unreadable, the gateway moves it to `gateway-task-operations.json.corrupt`, logs the path,
 and starts with an empty store.
 
-This prevents duplicate submission through one gateway; it does not prove exactly-once execution
-after an uncertain remote crash.
+This prevents duplicate submission through one gateway while its outcome remains retained; it does
+not prove exactly-once execution after an uncertain remote crash or after an outcome is evicted.
 
 ### Background task results
 
@@ -451,19 +462,20 @@ With `"background": true`, `POST /v1/tasks` validates the request, stores the op
 and answers `202` before remote completion:
 
 ```json
-{ "id": "task_…", "status": "pending", "createdAt": "…", "updatedAt": "…" }
+{ "id": "task_…", "status": "running", "createdAt": "…", "updatedAt": "…" }
 ```
 
 The work continues after the caller disconnects. `GET /v1/tasks/<id>` with the same API credential
 returns `200` and the current `running`, `completed`, or `failed` view with ISO timestamps. A
 completed view has `result`, containing the same body a synchronous task submission returns. A
 failed lookup itself succeeds with `200`; its `error` contains the stored `code`, `message`, and
-optional `description`. An unknown ID or another credential's ID gets `404`.
+optional `description`. An unknown, evicted, or another credential's ID gets `404`.
 
 An optional idempotency key makes background retries return the same task ID without publishing
-another AGX request. Retained completed and failed views survive gateway restart for the same
-24-hour retention period. An operation interrupted before its outcome was recorded becomes `failed`
-with `result_unknown`; the gateway does not execute it again automatically.
+another AGX request, except after a retryable pre-publish failure as described above. Retained
+completed and failed views survive gateway restart for the same 24-hour retention period. An
+operation interrupted before its outcome was recorded becomes `failed` with `result_unknown`; the
+gateway does not execute it again automatically.
 
 ### Subscriptions
 

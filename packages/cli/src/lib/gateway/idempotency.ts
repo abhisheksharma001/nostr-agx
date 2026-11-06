@@ -7,7 +7,11 @@ import { ApiError } from "./http.js";
 export const TASK_IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const MAX_IDEMPOTENCY_KEY_CHARS = 255;
 export const MAX_TASK_OUTCOME_BYTES = 16 * 1024;
+export const MAX_BACKGROUND_TASK_OUTCOME_BYTES = 1024 * 1024;
+export const MAX_TASK_OPERATION_STORE_BYTES = 16 * 1024 * 1024;
 export const MAX_TASK_OPERATIONS_PER_CREDENTIAL = 100;
+export const MAX_TASK_OPERATIONS_IN_FLIGHT = 256;
+export const MAX_BACKGROUND_TASKS_IN_FLIGHT = 64;
 const MAX_TASK_OPERATIONS = 1_000;
 const RETRYABLE_TASK_ERROR_CODES = new Set([
 	"invalid_request",
@@ -16,7 +20,6 @@ const RETRYABLE_TASK_ERROR_CODES = new Set([
 	"relays_unreachable",
 	"no_card",
 	"capability_not_advertised",
-	"publish_failed",
 ]);
 const PUBLIC_TASK_ID_PATTERN = /^task_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
@@ -39,6 +42,7 @@ const operationSchema = z.object({
 	credential: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 	fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
 	background: z.boolean().default(false),
+	keyed: z.boolean().default(false),
 	createdAt: z.number().int(),
 	updatedAt: z.number().int(),
 	outcome: outcomeSchema.nullable(),
@@ -55,6 +59,9 @@ export interface TaskIdempotencyOptions {
 	now?: () => number;
 	retentionMs?: number;
 	maxOperationsPerCredential?: number;
+	maxInFlight?: number;
+	maxBackgroundInFlight?: number;
+	maxStoreBytes?: number;
 	log?: (line: string) => void;
 }
 
@@ -130,9 +137,14 @@ export class TaskOperationStore {
 	private readonly now: () => number;
 	private readonly retentionMs: number;
 	private readonly maxOperationsPerCredential: number;
+	private readonly maxInFlight: number;
+	private readonly maxBackgroundInFlight: number;
+	private readonly maxStoreBytes: number;
 	private readonly log: (line: string) => void;
 	private readonly records: Map<string, Operation>;
 	private readonly inFlight = new Map<string, Promise<Record<string, unknown>>>();
+	private readonly synchronousInFlight = new Set<string>();
+	private readonly backgroundInFlight = new Set<string>();
 	private closed = false;
 
 	constructor(profile: string, options: TaskIdempotencyOptions = {}) {
@@ -140,6 +152,9 @@ export class TaskOperationStore {
 		this.now = options.now ?? Date.now;
 		this.retentionMs = options.retentionMs ?? TASK_IDEMPOTENCY_RETENTION_MS;
 		this.maxOperationsPerCredential = options.maxOperationsPerCredential ?? MAX_TASK_OPERATIONS_PER_CREDENTIAL;
+		this.maxInFlight = options.maxInFlight ?? MAX_TASK_OPERATIONS_IN_FLIGHT;
+		this.maxBackgroundInFlight = options.maxBackgroundInFlight ?? MAX_BACKGROUND_TASKS_IN_FLIGHT;
+		this.maxStoreBytes = options.maxStoreBytes ?? MAX_TASK_OPERATION_STORE_BYTES;
 		this.log = options.log ?? (() => undefined);
 		this.records = new Map(this.readOperations().map((operation) => [operation.id, operation]));
 		let changed = this.prune();
@@ -149,13 +164,16 @@ export class TaskOperationStore {
 				operation.updatedAt = this.now();
 				changed = true;
 			} else {
-				const retained = this.retainedOutcome(operation.outcome);
+				const retained = this.retainedOutcome(operation.outcome, operation.background);
 				if (retained !== operation.outcome) {
 					operation.outcome = retained;
 					operation.updatedAt = this.now();
 					changed = true;
 				}
 			}
+		}
+		if (this.enforceByteBudget().length > 0) {
+			changed = true;
 		}
 		if (changed) {
 			this.persist();
@@ -192,12 +210,21 @@ export class TaskOperationStore {
 			}
 			return this.replay(existing);
 		}
-		this.assertCapacity(credentialHash);
+		if (this.synchronousInFlight.size >= this.maxInFlight) {
+			throw new ApiError(
+				503,
+				"busy",
+				`${this.maxInFlight} idempotent task operations are already running`,
+				"Try again when an operation finishes.",
+			);
+		}
+		const evicted = this.makeStorageRoom(credentialHash);
 		const created = {
 			id,
 			credential: credentialHash,
 			fingerprint,
 			background: false,
+			keyed: true,
 			createdAt: this.now(),
 			updatedAt: this.now(),
 			outcome: null,
@@ -207,13 +234,18 @@ export class TaskOperationStore {
 			this.persist();
 		} catch (error) {
 			this.records.delete(id);
+			for (const operation of evicted) {
+				this.records.set(operation.id, operation);
+			}
 			throw error;
 		}
 		const running = this.perform(created, operation);
 		this.inFlight.set(id, running);
+		this.synchronousInFlight.add(id);
 		try {
 			return await running;
 		} finally {
+			this.synchronousInFlight.delete(id);
 			if (this.inFlight.get(id) === running) {
 				this.inFlight.delete(id);
 			}
@@ -247,13 +279,22 @@ export class TaskOperationStore {
 			}
 			return this.view(existing);
 		}
-		this.assertCapacity(credentialHash, true);
+		if (this.backgroundInFlight.size >= this.maxBackgroundInFlight) {
+			throw new ApiError(
+				503,
+				"busy",
+				`${this.maxBackgroundInFlight} background task operations are already running`,
+				"Try again when a background task finishes.",
+			);
+		}
+		const evicted = this.makeStorageRoom(credentialHash);
 		const created = {
 			id,
 			publicId,
 			credential: credentialHash,
 			fingerprint,
 			background: true,
+			keyed: key !== null,
 			createdAt: this.now(),
 			updatedAt: this.now(),
 			outcome: null,
@@ -263,21 +304,21 @@ export class TaskOperationStore {
 			this.persist();
 		} catch (error) {
 			this.records.delete(id);
+			for (const operation of evicted) {
+				this.records.set(operation.id, operation);
+			}
 			throw error;
 		}
 		const running = this.perform(created, operation);
 		this.inFlight.set(id, running);
+		this.backgroundInFlight.add(id);
 		void running.catch(() => undefined).finally(() => {
+			this.backgroundInFlight.delete(id);
 			if (this.inFlight.get(id) === running) {
 				this.inFlight.delete(id);
 			}
 		});
-		return {
-			id: publicId,
-			status: "pending",
-			createdAt: new Date(created.createdAt).toISOString(),
-			updatedAt: new Date(created.updatedAt).toISOString(),
-		};
+		return this.view(created);
 	}
 
 	get(credential: string, publicId: string): Record<string, unknown> | null {
@@ -360,31 +401,93 @@ export class TaskOperationStore {
 		}
 	}
 
-	private assertCapacity(credentialHash: string, background = false): void {
+	private makeStorageRoom(credentialHash: string): Operation[] {
+		const evicted: Operation[] = [];
 		let credentialOperations = 0;
 		for (const record of this.records.values()) {
 			if (record.credential === credentialHash) {
 				credentialOperations += 1;
 			}
 		}
-		const description = background
-			? "Retry after older outcomes expire."
-			: "Retry after older outcomes expire, or submit without an idempotency key if duplicate execution is safe.";
-		if (credentialOperations >= this.maxOperationsPerCredential) {
-			throw new ApiError(
-				503,
-				"idempotency_store_full",
-				`This API credential already retains ${this.maxOperationsPerCredential} task outcomes`,
-				description,
-			);
+		try {
+			while (credentialOperations >= this.maxOperationsPerCredential) {
+				const oldest = this.oldestSettled(credentialHash);
+				if (!oldest) {
+					throw new ApiError(
+						503,
+						"idempotency_store_full",
+						`This API credential already has ${this.maxOperationsPerCredential} task operations running`,
+						"Retry when an operation finishes.",
+					);
+				}
+				this.records.delete(oldest.id);
+				evicted.push(oldest);
+				credentialOperations -= 1;
+			}
+			while (this.records.size >= MAX_TASK_OPERATIONS) {
+				const oldest = this.oldestSettled();
+				if (!oldest) {
+					throw new ApiError(
+						503,
+						"idempotency_store_full",
+						`The gateway already has ${MAX_TASK_OPERATIONS} task operations running`,
+						"Retry when an operation finishes.",
+					);
+				}
+				this.records.delete(oldest.id);
+				evicted.push(oldest);
+			}
+		} catch (error) {
+			for (const operation of evicted) {
+				this.records.set(operation.id, operation);
+			}
+			throw error;
 		}
-		if (this.records.size >= MAX_TASK_OPERATIONS) {
-			throw new ApiError(
-				503,
-				"idempotency_store_full",
-				`The gateway already retains ${MAX_TASK_OPERATIONS} task outcomes`,
-				description,
-			);
+		return evicted;
+	}
+
+	private oldestSettled(credentialHash?: string, excludeId?: string): Operation | undefined {
+		let oldest: Operation | undefined;
+		for (const operation of this.records.values()) {
+			if (
+				operation.outcome === null ||
+				operation.id === excludeId ||
+				(credentialHash !== undefined && operation.credential !== credentialHash)
+			) {
+				continue;
+			}
+			if (
+				!oldest ||
+				operation.updatedAt < oldest.updatedAt ||
+				(operation.updatedAt === oldest.updatedAt && operation.id < oldest.id)
+			) {
+				oldest = operation;
+			}
+		}
+		return oldest;
+	}
+
+	private enforceByteBudget(protectedId?: string): Operation[] {
+		const evicted: Operation[] = [];
+		while (this.storeBytes() > this.maxStoreBytes) {
+			const oldest = this.oldestSettled(undefined, protectedId);
+			if (!oldest) {
+				break;
+			}
+			this.records.delete(oldest.id);
+			evicted.push(oldest);
+		}
+		return evicted;
+	}
+
+	private storeBytes(): number {
+		try {
+			return Buffer.byteLength(JSON.stringify({
+				version: 1,
+				operations: Array.from(this.records.values()),
+			}, null, 2), "utf8");
+		} catch {
+			return Number.POSITIVE_INFINITY;
 		}
 	}
 
@@ -414,15 +517,24 @@ export class TaskOperationStore {
 			outcome = errorOutcome(error);
 		}
 		const retryable = failed && unexpected instanceof ApiError && RETRYABLE_TASK_ERROR_CODES.has(unexpected.code);
-		operation.outcome = retryable ? null : this.retainedOutcome(outcome);
+		operation.outcome = retryable && !operation.background ? null : this.retainedOutcome(outcome, operation.background);
 		operation.updatedAt = this.now();
 		if (!this.closed && this.records.get(operation.id) === operation) {
+			let evicted: Operation[] = [];
 			try {
 				if (retryable) {
-					this.records.delete(operation.id);
+					if (operation.background) {
+						this.releaseBackgroundKey(operation);
+					} else {
+						this.records.delete(operation.id);
+					}
 				}
+				evicted = this.enforceByteBudget(operation.id);
 				this.persist();
 			} catch {
+				for (const settled of evicted) {
+					this.records.set(settled.id, settled);
+				}
 				operation.outcome = unknownOutcome();
 				operation.updatedAt = this.now();
 				this.records.set(operation.id, operation);
@@ -440,14 +552,25 @@ export class TaskOperationStore {
 		return this.replay(operation, outcome);
 	}
 
-	private retainedOutcome(outcome: Outcome): Outcome {
+	private releaseBackgroundKey(operation: Operation): void {
+		if (!operation.keyed || !operation.publicId) {
+			return;
+		}
+		this.records.delete(operation.id);
+		operation.id = hash(`background task\0${operation.publicId}`);
+		operation.keyed = false;
+		this.records.set(operation.id, operation);
+	}
+
+	private retainedOutcome(outcome: Outcome, background: boolean): Outcome {
+		const limit = background ? MAX_BACKGROUND_TASK_OUTCOME_BYTES : MAX_TASK_OUTCOME_BYTES;
 		let bytes: number;
 		try {
 			bytes = Buffer.byteLength(JSON.stringify(outcome, null, 2), "utf8");
 		} catch {
 			bytes = Number.POSITIVE_INFINITY;
 		}
-		if (bytes <= MAX_TASK_OUTCOME_BYTES) {
+		if (bytes <= limit) {
 			return outcome;
 		}
 		return {
@@ -455,7 +578,9 @@ export class TaskOperationStore {
 			status: 409,
 			code: "outcome_not_retained",
 			message: "The task finished, but its outcome was too large to retain",
-			description: `Synchronous callers attached to this run received its actual outcome. Stored outcomes are limited to ${MAX_TASK_OUTCOME_BYTES} bytes; check the remote agent before submitting new work with a different key.`,
+			description: background
+				? `Background tasks have no attached synchronous caller. Stored background outcomes are limited to ${limit} bytes; check the remote agent before submitting new work.`
+				: `Synchronous callers attached to this run received its actual outcome. Stored outcomes are limited to ${limit} bytes; check the remote agent before submitting new work with a different key.`,
 		};
 	}
 

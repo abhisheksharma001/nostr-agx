@@ -580,7 +580,7 @@ describe("agx gateway: outbound", () => {
 		expect(acceptedResponse.status).toBe(202);
 		const accepted = await json(acceptedResponse);
 		const id = accepted.id as string;
-		expect(accepted).toMatchObject({ id, status: "pending" });
+		expect(accepted).toMatchObject({ id, status: "running" });
 		expect(id).toMatch(/^task_[0-9a-f-]{36}$/);
 		expect(await backgroundTask(id)).toMatchObject({ id, status: "running" });
 		const otherKey = createGatewayKey(profile, "background-other-credential").key;

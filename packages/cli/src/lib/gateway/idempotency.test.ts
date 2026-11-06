@@ -4,6 +4,7 @@ import { sandbox } from "../../test/helpers.js";
 import { gatewayTaskOperationsPath, writePrivateJson, writePrivateText } from "../paths.js";
 import { ApiError } from "./http.js";
 import {
+	MAX_BACKGROUND_TASK_OUTCOME_BYTES,
 	MAX_IDEMPOTENCY_KEY_CHARS,
 	MAX_TASK_OUTCOME_BYTES,
 	parseIdempotencyKey,
@@ -128,7 +129,6 @@ describe("TaskOperationStore", () => {
 			[503, "relays_unreachable"],
 			[404, "no_card"],
 			[422, "capability_not_advertised"],
-			[502, "publish_failed"],
 		] as const;
 		for (const [status, code] of failures) {
 			let runs = 0;
@@ -141,6 +141,23 @@ describe("TaskOperationStore", () => {
 			}
 			expect(runs).toBe(2);
 		}
+		store.close();
+	});
+
+	it("retains publish failures because a relay may have stored the task", async () => {
+		const store = new TaskOperationStore("test");
+		let runs = 0;
+		const operation = async (): Promise<Record<string, unknown>> => {
+			runs += 1;
+			throw new ApiError(502, "publish_failed", "Relay delivery is uncertain");
+		};
+		for (let attempt = 0; attempt < 2; attempt++) {
+			await expect(store.execute("credential-a", "publish", {}, operation)).rejects.toMatchObject({
+				status: 502,
+				code: "publish_failed",
+			});
+		}
+		expect(runs).toBe(1);
 		store.close();
 	});
 
@@ -190,16 +207,64 @@ describe("TaskOperationStore", () => {
 		restored.close();
 	});
 
-	it("bounds retained operations per credential without blocking other credentials", async () => {
+	it("evicts the oldest settled outcome instead of imposing a daily submission cap", async () => {
 		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 1 });
-		await store.execute("credential-a", "first", {}, async () => ({ owner: "a" }));
-		await expect(store.execute("credential-a", "second", {}, async () => ({ owner: "a" }))).rejects.toMatchObject({
+		let runs = 0;
+		const operation = async () => ({ run: ++runs });
+		await expect(store.execute("credential-a", "first", {}, operation)).resolves.toEqual({ run: 1 });
+		await expect(store.execute("credential-a", "second", {}, operation)).resolves.toEqual({ run: 2 });
+		await expect(store.execute("credential-a", "first", {}, operation)).resolves.toEqual({ run: 3 });
+		await expect(store.execute("credential-b", "first", {}, operation)).resolves.toEqual({ run: 4 });
+		store.close();
+	});
+
+	it("keeps running operations when retained capacity is full", async () => {
+		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 1 });
+		let runs = 0;
+		let release: (() => void) | undefined;
+		const operation = async () => {
+			runs += 1;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { run: runs };
+		};
+		const first = store.execute("credential-a", "first", {}, operation);
+		await expect(store.execute("credential-a", "second", {}, operation)).rejects.toMatchObject({
 			status: 503,
 			code: "idempotency_store_full",
 		});
-		await expect(store.execute("credential-b", "first", {}, async () => ({ owner: "b" }))).resolves.toEqual({
-			owner: "b",
+		const joined = store.execute("credential-a", "first", {}, operation);
+		release?.();
+		await expect(first).resolves.toEqual({ run: 1 });
+		await expect(joined).resolves.toEqual({ run: 1 });
+		expect(runs).toBe(1);
+		store.close();
+	});
+
+	it("limits running keyed operations even after their callers leave", async () => {
+		const store = new TaskOperationStore("test", { maxInFlight: 1 });
+		let runs = 0;
+		let release: (() => void) | undefined;
+		const operation = async () => {
+			runs += 1;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { run: runs };
+		};
+		const first = store.execute("credential-a", "first", {}, operation);
+		await expect(store.execute("credential-a", "second", {}, operation)).rejects.toMatchObject({
+			status: 503,
+			code: "busy",
 		});
+		const joined = store.execute("credential-a", "first", {}, operation);
+		release?.();
+		await expect(first).resolves.toEqual({ run: 1 });
+		await expect(joined).resolves.toEqual({ run: 1 });
+		const second = store.execute("credential-a", "second", {}, operation);
+		release?.();
+		await expect(second).resolves.toEqual({ run: 2 });
 		store.close();
 	});
 
@@ -286,7 +351,7 @@ describe("TaskOperationStore background tasks", () => {
 			return { status: "completed", output: { run: runs } };
 		});
 		const id = accepted.id as string;
-		expect(accepted).toMatchObject({ id, status: "pending" });
+		expect(accepted).toMatchObject({ id, status: "running" });
 		expect(id).toMatch(/^task_[0-9a-f-]{36}$/);
 		expect(runs).toBe(1);
 		expect(store.get("credential-a", id)).toMatchObject({ id, status: "running" });
@@ -361,43 +426,52 @@ describe("TaskOperationStore background tasks", () => {
 		restarted.close();
 	});
 
-	it("retries background failures that prove no task was published", async () => {
+	it("keeps a failed public ID while freeing its key after a pre-publish failure", async () => {
 		const store = new TaskOperationStore("test");
 		let runs = 0;
 		const operation = async (): Promise<Record<string, unknown>> => {
 			runs += 1;
 			if (runs === 1) {
-				throw new ApiError(502, "publish_failed", "The task was not sent");
+				throw new ApiError(404, "no_card", "No Agent Card was found");
 			}
 			return { status: "completed", output: { run: runs } };
 		};
 		const first = store.submit("credential-a", "background-retry", { background: true }, operation);
-		let removed = false;
-		for (let attempt = 0; attempt < 100; attempt++) {
-			if (store.get("credential-a", first.id as string) === null) {
-				removed = true;
-				break;
-			}
-			await new Promise((resolve) => setTimeout(resolve, 0));
-		}
-		expect(removed).toBe(true);
+		const failure = await waitForStatus(store, "credential-a", first.id as string, "failed");
+		expect(failure).toMatchObject({ error: { code: "no_card", message: "No Agent Card was found" } });
 
 		const second = store.submit("credential-a", "background-retry", { background: true }, operation);
 		expect(second.id).not.toBe(first.id);
 		await expect(waitForStatus(store, "credential-a", second.id as string, "completed")).resolves.toMatchObject({
 			result: { status: "completed", output: { run: 2 } },
 		});
+		expect(store.get("credential-a", first.id as string)).toEqual(failure);
 		expect(runs).toBe(2);
 		store.close();
 	});
 
-	it("applies per-credential capacity limits to background tasks", async () => {
+	it("does not free a background key after an uncertain publish failure", async () => {
+		const store = new TaskOperationStore("test");
+		let runs = 0;
+		const operation = async (): Promise<Record<string, unknown>> => {
+			runs += 1;
+			throw new ApiError(502, "publish_failed", "Relay delivery is uncertain");
+		};
+		const first = store.submit("credential-a", "background-publish", { background: true }, operation);
+		const failure = await waitForStatus(store, "credential-a", first.id as string, "failed");
+		expect(failure).toMatchObject({ error: { code: "publish_failed" } });
+		expect(store.submit("credential-a", "background-publish", { background: true }, operation)).toEqual(failure);
+		expect(runs).toBe(1);
+		store.close();
+	});
+
+	it("evicts settled background outcomes instead of imposing a daily submission cap", async () => {
 		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 1 });
 		const first = store.submit("credential-a", null, { background: true }, async () => ({ owner: "a" }));
 		await waitForStatus(store, "credential-a", first.id as string, "completed");
-		expect(() => store.submit("credential-a", null, { background: true }, async () => ({ owner: "a" }))).toThrowError(
-			expect.objectContaining({ status: 503, code: "idempotency_store_full" }),
-		);
+		const second = store.submit("credential-a", null, { background: true }, async () => ({ owner: "a" }));
+		await waitForStatus(store, "credential-a", second.id as string, "completed");
+		expect(store.get("credential-a", first.id as string)).toBeNull();
 
 		const other = store.submit("credential-b", null, { background: true }, async () => ({ owner: "b" }));
 		await expect(waitForStatus(store, "credential-b", other.id as string, "completed")).resolves.toMatchObject({
@@ -406,21 +480,82 @@ describe("TaskOperationStore background tasks", () => {
 		store.close();
 	});
 
-	it("retains an explicit marker for an oversized background outcome", async () => {
+	it("limits running background tasks independently of retained outcomes", async () => {
+		const store = new TaskOperationStore("test", { maxBackgroundInFlight: 1 });
+		let runs = 0;
+		let release: (() => void) | undefined;
+		const operation = async () => {
+			runs += 1;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { run: runs };
+		};
+		const first = store.submit("credential-a", "background-first", { background: true }, operation);
+		expect(store.submit("credential-a", "background-first", { background: true }, operation)).toMatchObject({
+			id: first.id,
+			status: "running",
+		});
+		expect(() => store.submit("credential-a", "background-second", { background: true }, operation)).toThrowError(
+			expect.objectContaining({ status: 503, code: "busy" }),
+		);
+		release?.();
+		await waitForStatus(store, "credential-a", first.id as string, "completed");
+		const second = store.submit("credential-a", "background-second", { background: true }, operation);
+		release?.();
+		await expect(waitForStatus(store, "credential-a", second.id as string, "completed")).resolves.toMatchObject({
+			result: { run: 2 },
+		});
+		store.close();
+	});
+
+	it("retains background outcomes larger than the synchronous limit", async () => {
+		const store = new TaskOperationStore("test");
+		const output = { large: "x".repeat(MAX_TASK_OUTCOME_BYTES) };
+		const accepted = store.submit("credential-a", null, { background: true }, async () => ({
+			status: "completed",
+			output,
+		}));
+		const completed = await waitForStatus(store, "credential-a", accepted.id as string, "completed");
+		expect(completed).toMatchObject({ result: { status: "completed", output } });
+		store.close();
+
+		const restored = new TaskOperationStore("test");
+		expect(restored.get("credential-a", accepted.id as string)).toEqual(completed);
+		restored.close();
+	});
+
+	it("retains an explicit marker for an outcome over the background limit", async () => {
 		const store = new TaskOperationStore("test");
 		const accepted = store.submit("credential-a", null, { background: true }, async () => ({
 			status: "completed",
-			output: { large: "x".repeat(MAX_TASK_OUTCOME_BYTES) },
+			output: { large: "x".repeat(MAX_BACKGROUND_TASK_OUTCOME_BYTES) },
 		}));
 		const failed = await waitForStatus(store, "credential-a", accepted.id as string, "failed");
 		expect(failed).toMatchObject({ error: { code: "outcome_not_retained" } });
 		expect(Buffer.byteLength(readFileSync(gatewayTaskOperationsPath("test"), "utf8"))).toBeLessThan(
-			MAX_TASK_OUTCOME_BYTES * 2,
+			MAX_BACKGROUND_TASK_OUTCOME_BYTES * 2,
 		);
 		store.close();
 
 		const restored = new TaskOperationStore("test");
 		expect(restored.get("credential-a", accepted.id as string)).toEqual(failed);
 		restored.close();
+	});
+
+	it("evicts old settled outcomes to bound the total store size", async () => {
+		const store = new TaskOperationStore("test", { maxStoreBytes: 4096 });
+		const first = store.submit("credential-a", null, { background: true }, async () => ({
+			output: "x".repeat(2000),
+		}));
+		await waitForStatus(store, "credential-a", first.id as string, "completed");
+		const second = store.submit("credential-a", null, { background: true }, async () => ({
+			output: "y".repeat(2000),
+		}));
+		await waitForStatus(store, "credential-a", second.id as string, "completed");
+		expect(store.get("credential-a", first.id as string)).toBeNull();
+		expect(store.get("credential-a", second.id as string)).toMatchObject({ status: "completed" });
+		expect(Buffer.byteLength(readFileSync(gatewayTaskOperationsPath("test"), "utf8"))).toBeLessThanOrEqual(4097);
+		store.close();
 	});
 });
