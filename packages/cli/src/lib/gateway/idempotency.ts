@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync } from "node:fs";
 import { z } from "zod";
 import { gatewayTaskOperationsPath, writePrivateJson } from "../paths.js";
@@ -8,7 +8,6 @@ export const TASK_IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const MAX_IDEMPOTENCY_KEY_CHARS = 255;
 export const MAX_TASK_OUTCOME_BYTES = 16 * 1024;
 export const MAX_TASK_OPERATIONS_PER_CREDENTIAL = 100;
-export const MAX_TASK_OPERATIONS_IN_FLIGHT = 256;
 const MAX_TASK_OPERATIONS = 1_000;
 const RETRYABLE_TASK_ERROR_CODES = new Set([
 	"invalid_request",
@@ -17,7 +16,9 @@ const RETRYABLE_TASK_ERROR_CODES = new Set([
 	"relays_unreachable",
 	"no_card",
 	"capability_not_advertised",
+	"publish_failed",
 ]);
+const PUBLIC_TASK_ID_PATTERN = /^task_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
 const outcomeSchema = z.discriminatedUnion("kind", [
 	z.object({
@@ -34,8 +35,10 @@ const outcomeSchema = z.discriminatedUnion("kind", [
 ]);
 const operationSchema = z.object({
 	id: z.string().regex(/^[0-9a-f]{64}$/),
+	publicId: z.string().regex(PUBLIC_TASK_ID_PATTERN).optional(),
 	credential: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 	fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+	background: z.boolean().default(false),
 	createdAt: z.number().int(),
 	updatedAt: z.number().int(),
 	outcome: outcomeSchema.nullable(),
@@ -52,7 +55,6 @@ export interface TaskIdempotencyOptions {
 	now?: () => number;
 	retentionMs?: number;
 	maxOperationsPerCredential?: number;
-	maxInFlight?: number;
 	log?: (line: string) => void;
 }
 
@@ -62,7 +64,7 @@ function unknownOutcome(): Outcome {
 		status: 409,
 		code: "result_unknown",
 		message: "The gateway stopped before this task's outcome was recorded",
-		description: "The remote agent may have executed the task. Check its effects before submitting new work with a different idempotency key.",
+		description: "The remote agent may have executed the task. Check its effects before submitting new work.",
 	};
 }
 
@@ -121,14 +123,13 @@ export function parseIdempotencyKey(value: string | string[] | undefined): strin
 	return value;
 }
 
-/** Durable idempotent outcomes for POST /v1/tasks. The profile lock makes this
- * a single-writer store; callers sharing an operation also share its promise. */
-export class TaskIdempotencyStore {
+/** Durable task outcomes for POST /v1/tasks. The profile lock makes this a
+ * single-writer store; callers sharing an operation also share its promise. */
+export class TaskOperationStore {
 	private readonly path: string;
 	private readonly now: () => number;
 	private readonly retentionMs: number;
 	private readonly maxOperationsPerCredential: number;
-	private readonly maxInFlight: number;
 	private readonly log: (line: string) => void;
 	private readonly records: Map<string, Operation>;
 	private readonly inFlight = new Map<string, Promise<Record<string, unknown>>>();
@@ -139,7 +140,6 @@ export class TaskIdempotencyStore {
 		this.now = options.now ?? Date.now;
 		this.retentionMs = options.retentionMs ?? TASK_IDEMPOTENCY_RETENTION_MS;
 		this.maxOperationsPerCredential = options.maxOperationsPerCredential ?? MAX_TASK_OPERATIONS_PER_CREDENTIAL;
-		this.maxInFlight = options.maxInFlight ?? MAX_TASK_OPERATIONS_IN_FLIGHT;
 		this.log = options.log ?? (() => undefined);
 		this.records = new Map(this.readOperations().map((operation) => [operation.id, operation]));
 		let changed = this.prune();
@@ -168,9 +168,7 @@ export class TaskIdempotencyStore {
 		body: unknown,
 		operation: () => Promise<Record<string, unknown>>,
 	): Promise<Record<string, unknown>> {
-		if (this.closed) {
-			throw new ApiError(503, "gateway_stopping", "The gateway is stopping");
-		}
+		this.assertOpen();
 		if (this.prune()) {
 			this.persist();
 		}
@@ -179,13 +177,9 @@ export class TaskIdempotencyStore {
 		const fingerprint = hash(canonicalJson(body));
 		const existing = this.records.get(id);
 		if (existing) {
-			if (existing.fingerprint !== fingerprint) {
-				throw new ApiError(
-					409,
-					"idempotency_key_reused",
-					"This idempotency key was already used with a different task request",
-					"Use a new key for different work, or the original request body to retrieve its outcome.",
-				);
+			this.checkFingerprint(existing, fingerprint);
+			if (existing.background) {
+				throw new ApiError(409, "idempotency_key_reused", "This idempotency key belongs to a background task");
 			}
 			const running = this.inFlight.get(id);
 			if (running) {
@@ -198,19 +192,12 @@ export class TaskIdempotencyStore {
 			}
 			return this.replay(existing);
 		}
-		if (this.inFlight.size >= this.maxInFlight) {
-			throw new ApiError(
-				503,
-				"busy",
-				`${this.maxInFlight} idempotent task operations are already running`,
-				"Try again when an operation finishes.",
-			);
-		}
-		const evicted = this.makeStorageRoom(credentialHash);
+		this.assertCapacity(credentialHash);
 		const created = {
 			id,
 			credential: credentialHash,
 			fingerprint,
+			background: false,
 			createdAt: this.now(),
 			updatedAt: this.now(),
 			outcome: null,
@@ -220,9 +207,6 @@ export class TaskIdempotencyStore {
 			this.persist();
 		} catch (error) {
 			this.records.delete(id);
-			for (const operation of evicted) {
-				this.records.set(operation.id, operation);
-			}
 			throw error;
 		}
 		const running = this.perform(created, operation);
@@ -236,62 +220,87 @@ export class TaskIdempotencyStore {
 		}
 	}
 
-	private makeStorageRoom(credentialHash: string): Operation[] {
-		const evicted: Operation[] = [];
-		let credentialOperations = 0;
-		for (const record of this.records.values()) {
-			if (record.credential === credentialHash) {
-				credentialOperations += 1;
-			}
+	submit(
+		credential: string,
+		key: string | null,
+		body: unknown,
+		operation: () => Promise<Record<string, unknown>>,
+	): Record<string, unknown> {
+		this.assertOpen();
+		if (this.prune()) {
+			this.persist();
 		}
+		const credentialHash = hash(credential);
+		const publicId = `task_${randomUUID()}`;
+		const id = hash(`POST /v1/tasks\0${credential}\0${key ?? publicId}`);
+		const fingerprint = hash(canonicalJson(body));
+		const existing = key === null ? undefined : this.records.get(id);
+		if (existing) {
+			this.checkFingerprint(existing, fingerprint);
+			if (!existing.background || !existing.publicId) {
+				throw new ApiError(409, "idempotency_key_reused", "This idempotency key belongs to a synchronous task");
+			}
+			if (existing.outcome === null && !this.inFlight.has(id)) {
+				existing.outcome = unknownOutcome();
+				existing.updatedAt = this.now();
+				this.persist();
+			}
+			return this.view(existing);
+		}
+		this.assertCapacity(credentialHash, true);
+		const created = {
+			id,
+			publicId,
+			credential: credentialHash,
+			fingerprint,
+			background: true,
+			createdAt: this.now(),
+			updatedAt: this.now(),
+			outcome: null,
+		} satisfies Operation;
+		this.records.set(id, created);
 		try {
-			while (credentialOperations >= this.maxOperationsPerCredential) {
-				const oldest = this.oldestSettled(credentialHash);
-				if (!oldest) {
-					throw new ApiError(
-						503,
-						"idempotency_store_full",
-						`This API credential already has ${this.maxOperationsPerCredential} task operations running`,
-						"Retry when an operation finishes, or submit without an idempotency key if duplicate execution is safe.",
-					);
-				}
-				this.records.delete(oldest.id);
-				evicted.push(oldest);
-				credentialOperations -= 1;
-			}
-			while (this.records.size >= MAX_TASK_OPERATIONS) {
-				const oldest = this.oldestSettled();
-				if (!oldest) {
-					throw new ApiError(
-						503,
-						"idempotency_store_full",
-						`The gateway already has ${MAX_TASK_OPERATIONS} task operations running`,
-						"Retry when an operation finishes, or submit without an idempotency key if duplicate execution is safe.",
-					);
-				}
-				this.records.delete(oldest.id);
-				evicted.push(oldest);
-			}
+			this.persist();
 		} catch (error) {
-			for (const operation of evicted) {
-				this.records.set(operation.id, operation);
-			}
+			this.records.delete(id);
 			throw error;
 		}
-		return evicted;
+		const running = this.perform(created, operation);
+		this.inFlight.set(id, running);
+		void running.catch(() => undefined).finally(() => {
+			if (this.inFlight.get(id) === running) {
+				this.inFlight.delete(id);
+			}
+		});
+		return {
+			id: publicId,
+			status: "pending",
+			createdAt: new Date(created.createdAt).toISOString(),
+			updatedAt: new Date(created.updatedAt).toISOString(),
+		};
 	}
 
-	private oldestSettled(credentialHash?: string): Operation | undefined {
-		let oldest: Operation | undefined;
-		for (const operation of this.records.values()) {
-			if (operation.outcome === null || (credentialHash !== undefined && operation.credential !== credentialHash)) {
-				continue;
-			}
-			if (!oldest || operation.updatedAt < oldest.updatedAt || (operation.updatedAt === oldest.updatedAt && operation.id < oldest.id)) {
-				oldest = operation;
-			}
+	get(credential: string, publicId: string): Record<string, unknown> | null {
+		this.assertOpen();
+		if (this.prune()) {
+			this.persist();
 		}
-		return oldest;
+		if (!PUBLIC_TASK_ID_PATTERN.test(publicId)) {
+			return null;
+		}
+		const credentialHash = hash(credential);
+		const operation = Array.from(this.records.values()).find(
+			(record) => record.publicId === publicId && record.credential === credentialHash,
+		);
+		if (!operation) {
+			return null;
+		}
+		if (operation.outcome === null && !this.inFlight.has(operation.id)) {
+			operation.outcome = unknownOutcome();
+			operation.updatedAt = this.now();
+			this.persist();
+		}
+		return this.view(operation);
 	}
 
 	close(): void {
@@ -343,6 +352,51 @@ export class TaskIdempotencyStore {
 		this.log(
 			`Unreadable task-operation store moved to ${corruptPath}: ${reason instanceof Error ? reason.message : String(reason)}`,
 		);
+	}
+
+	private assertOpen(): void {
+		if (this.closed) {
+			throw new ApiError(503, "gateway_stopping", "The gateway is stopping");
+		}
+	}
+
+	private assertCapacity(credentialHash: string, background = false): void {
+		let credentialOperations = 0;
+		for (const record of this.records.values()) {
+			if (record.credential === credentialHash) {
+				credentialOperations += 1;
+			}
+		}
+		const description = background
+			? "Retry after older outcomes expire."
+			: "Retry after older outcomes expire, or submit without an idempotency key if duplicate execution is safe.";
+		if (credentialOperations >= this.maxOperationsPerCredential) {
+			throw new ApiError(
+				503,
+				"idempotency_store_full",
+				`This API credential already retains ${this.maxOperationsPerCredential} task outcomes`,
+				description,
+			);
+		}
+		if (this.records.size >= MAX_TASK_OPERATIONS) {
+			throw new ApiError(
+				503,
+				"idempotency_store_full",
+				`The gateway already retains ${MAX_TASK_OPERATIONS} task outcomes`,
+				description,
+			);
+		}
+	}
+
+	private checkFingerprint(operation: Operation, fingerprint: string): void {
+		if (operation.fingerprint !== fingerprint) {
+			throw new ApiError(
+				409,
+				"idempotency_key_reused",
+				"This idempotency key was already used with a different task request",
+				"Use a new key for different work, or the original request body to retrieve its outcome.",
+			);
+		}
 	}
 
 	private async perform(
@@ -401,8 +455,29 @@ export class TaskIdempotencyStore {
 			status: 409,
 			code: "outcome_not_retained",
 			message: "The task finished, but its outcome was too large to retain",
-			description: `The callers waiting for this run received its outcome. Stored outcomes are limited to ${MAX_TASK_OUTCOME_BYTES} bytes; check the remote agent before submitting new work with a different key.`,
+			description: `Synchronous callers attached to this run received its actual outcome. Stored outcomes are limited to ${MAX_TASK_OUTCOME_BYTES} bytes; check the remote agent before submitting new work with a different key.`,
 		};
+	}
+
+	private view(operation: Operation): Record<string, unknown> {
+		const outcome = operation.outcome;
+		const view: Record<string, unknown> = {
+			id: operation.publicId,
+			status: outcome === null ? "running" : outcome.kind === "success" ? "completed" : "failed",
+			createdAt: new Date(operation.createdAt).toISOString(),
+			updatedAt: new Date(operation.updatedAt).toISOString(),
+		};
+		if (outcome?.kind === "success") {
+			view.result = outcome.body;
+		}
+		if (outcome?.kind === "error") {
+			view.error = {
+				code: outcome.code,
+				message: outcome.message,
+				...(outcome.description ? { description: outcome.description } : {}),
+			};
+		}
+		return view;
 	}
 
 	private replay(operation: Operation, actual?: Outcome): Record<string, unknown> {
