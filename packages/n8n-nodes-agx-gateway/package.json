@@ -5,6 +5,7 @@
 	"license": "MIT",
 	"author": {
 		"name": "Ellavox AI",
+		"email": "hello@ellavox.ai",
 		"url": "https://www.ellavox.ai"
 	},
 	"homepage": "https://github.com/ellavox-ai/nostr-agx/tree/main/packages/n8n-nodes-agx-gateway#readme",
