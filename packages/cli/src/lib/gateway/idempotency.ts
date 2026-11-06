@@ -8,6 +8,7 @@ export const TASK_IDEMPOTENCY_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const MAX_IDEMPOTENCY_KEY_CHARS = 255;
 export const MAX_TASK_OUTCOME_BYTES = 16 * 1024;
 export const MAX_TASK_OPERATIONS_PER_CREDENTIAL = 100;
+export const MAX_TASK_OPERATIONS_IN_FLIGHT = 256;
 const MAX_TASK_OPERATIONS = 1_000;
 const RETRYABLE_TASK_ERROR_CODES = new Set([
 	"invalid_request",
@@ -16,7 +17,6 @@ const RETRYABLE_TASK_ERROR_CODES = new Set([
 	"relays_unreachable",
 	"no_card",
 	"capability_not_advertised",
-	"publish_failed",
 ]);
 
 const outcomeSchema = z.discriminatedUnion("kind", [
@@ -52,6 +52,7 @@ export interface TaskIdempotencyOptions {
 	now?: () => number;
 	retentionMs?: number;
 	maxOperationsPerCredential?: number;
+	maxInFlight?: number;
 	log?: (line: string) => void;
 }
 
@@ -127,6 +128,7 @@ export class TaskIdempotencyStore {
 	private readonly now: () => number;
 	private readonly retentionMs: number;
 	private readonly maxOperationsPerCredential: number;
+	private readonly maxInFlight: number;
 	private readonly log: (line: string) => void;
 	private readonly records: Map<string, Operation>;
 	private readonly inFlight = new Map<string, Promise<Record<string, unknown>>>();
@@ -137,6 +139,7 @@ export class TaskIdempotencyStore {
 		this.now = options.now ?? Date.now;
 		this.retentionMs = options.retentionMs ?? TASK_IDEMPOTENCY_RETENTION_MS;
 		this.maxOperationsPerCredential = options.maxOperationsPerCredential ?? MAX_TASK_OPERATIONS_PER_CREDENTIAL;
+		this.maxInFlight = options.maxInFlight ?? MAX_TASK_OPERATIONS_IN_FLIGHT;
 		this.log = options.log ?? (() => undefined);
 		this.records = new Map(this.readOperations().map((operation) => [operation.id, operation]));
 		let changed = this.prune();
@@ -195,28 +198,15 @@ export class TaskIdempotencyStore {
 			}
 			return this.replay(existing);
 		}
-		let credentialOperations = 0;
-		for (const record of this.records.values()) {
-			if (record.credential === credentialHash) {
-				credentialOperations += 1;
-			}
-		}
-		if (credentialOperations >= this.maxOperationsPerCredential) {
+		if (this.inFlight.size >= this.maxInFlight) {
 			throw new ApiError(
 				503,
-				"idempotency_store_full",
-				`This API credential already retains ${this.maxOperationsPerCredential} task outcomes`,
-				"Retry after older outcomes expire, or submit without an idempotency key if duplicate execution is safe.",
+				"busy",
+				`${this.maxInFlight} idempotent task operations are already running`,
+				"Try again when an operation finishes.",
 			);
 		}
-		if (this.records.size >= MAX_TASK_OPERATIONS) {
-			throw new ApiError(
-				503,
-				"idempotency_store_full",
-				`The gateway already retains ${MAX_TASK_OPERATIONS} task outcomes`,
-				"Retry after older outcomes expire, or submit without an idempotency key if duplicate execution is safe.",
-			);
-		}
+		const evicted = this.makeStorageRoom(credentialHash);
 		const created = {
 			id,
 			credential: credentialHash,
@@ -230,6 +220,9 @@ export class TaskIdempotencyStore {
 			this.persist();
 		} catch (error) {
 			this.records.delete(id);
+			for (const operation of evicted) {
+				this.records.set(operation.id, operation);
+			}
 			throw error;
 		}
 		const running = this.perform(created, operation);
@@ -241,6 +234,64 @@ export class TaskIdempotencyStore {
 				this.inFlight.delete(id);
 			}
 		}
+	}
+
+	private makeStorageRoom(credentialHash: string): Operation[] {
+		const evicted: Operation[] = [];
+		let credentialOperations = 0;
+		for (const record of this.records.values()) {
+			if (record.credential === credentialHash) {
+				credentialOperations += 1;
+			}
+		}
+		try {
+			while (credentialOperations >= this.maxOperationsPerCredential) {
+				const oldest = this.oldestSettled(credentialHash);
+				if (!oldest) {
+					throw new ApiError(
+						503,
+						"idempotency_store_full",
+						`This API credential already has ${this.maxOperationsPerCredential} task operations running`,
+						"Retry when an operation finishes, or submit without an idempotency key if duplicate execution is safe.",
+					);
+				}
+				this.records.delete(oldest.id);
+				evicted.push(oldest);
+				credentialOperations -= 1;
+			}
+			while (this.records.size >= MAX_TASK_OPERATIONS) {
+				const oldest = this.oldestSettled();
+				if (!oldest) {
+					throw new ApiError(
+						503,
+						"idempotency_store_full",
+						`The gateway already has ${MAX_TASK_OPERATIONS} task operations running`,
+						"Retry when an operation finishes, or submit without an idempotency key if duplicate execution is safe.",
+					);
+				}
+				this.records.delete(oldest.id);
+				evicted.push(oldest);
+			}
+		} catch (error) {
+			for (const operation of evicted) {
+				this.records.set(operation.id, operation);
+			}
+			throw error;
+		}
+		return evicted;
+	}
+
+	private oldestSettled(credentialHash?: string): Operation | undefined {
+		let oldest: Operation | undefined;
+		for (const operation of this.records.values()) {
+			if (operation.outcome === null || (credentialHash !== undefined && operation.credential !== credentialHash)) {
+				continue;
+			}
+			if (!oldest || operation.updatedAt < oldest.updatedAt || (operation.updatedAt === oldest.updatedAt && operation.id < oldest.id)) {
+				oldest = operation;
+			}
+		}
+		return oldest;
 	}
 
 	close(): void {

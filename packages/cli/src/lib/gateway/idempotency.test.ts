@@ -128,7 +128,6 @@ describe("TaskIdempotencyStore", () => {
 			[503, "relays_unreachable"],
 			[404, "no_card"],
 			[422, "capability_not_advertised"],
-			[502, "publish_failed"],
 		] as const;
 		for (const [status, code] of failures) {
 			let runs = 0;
@@ -141,6 +140,23 @@ describe("TaskIdempotencyStore", () => {
 			}
 			expect(runs).toBe(2);
 		}
+		store.close();
+	});
+
+	it("retains publish failures because a relay may have stored the task", async () => {
+		const store = new TaskIdempotencyStore("test");
+		let runs = 0;
+		const operation = async (): Promise<Record<string, unknown>> => {
+			runs += 1;
+			throw new ApiError(502, "publish_failed", "Relay delivery is uncertain");
+		};
+		for (let attempt = 0; attempt < 2; attempt++) {
+			await expect(store.execute("credential-a", "publish", {}, operation)).rejects.toMatchObject({
+				status: 502,
+				code: "publish_failed",
+			});
+		}
+		expect(runs).toBe(1);
 		store.close();
 	});
 
@@ -190,16 +206,64 @@ describe("TaskIdempotencyStore", () => {
 		restored.close();
 	});
 
-	it("bounds retained operations per credential without blocking other credentials", async () => {
+	it("evicts the oldest settled outcome instead of imposing a daily submission cap", async () => {
 		const store = new TaskIdempotencyStore("test", { maxOperationsPerCredential: 1 });
-		await store.execute("credential-a", "first", {}, async () => ({ owner: "a" }));
-		await expect(store.execute("credential-a", "second", {}, async () => ({ owner: "a" }))).rejects.toMatchObject({
+		let runs = 0;
+		const operation = async () => ({ run: ++runs });
+		await expect(store.execute("credential-a", "first", {}, operation)).resolves.toEqual({ run: 1 });
+		await expect(store.execute("credential-a", "second", {}, operation)).resolves.toEqual({ run: 2 });
+		await expect(store.execute("credential-a", "first", {}, operation)).resolves.toEqual({ run: 3 });
+		await expect(store.execute("credential-b", "first", {}, operation)).resolves.toEqual({ run: 4 });
+		store.close();
+	});
+
+	it("keeps running operations when retained capacity is full", async () => {
+		const store = new TaskIdempotencyStore("test", { maxOperationsPerCredential: 1 });
+		let runs = 0;
+		let release: (() => void) | undefined;
+		const operation = async () => {
+			runs += 1;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { run: runs };
+		};
+		const first = store.execute("credential-a", "first", {}, operation);
+		await expect(store.execute("credential-a", "second", {}, operation)).rejects.toMatchObject({
 			status: 503,
 			code: "idempotency_store_full",
 		});
-		await expect(store.execute("credential-b", "first", {}, async () => ({ owner: "b" }))).resolves.toEqual({
-			owner: "b",
+		const joined = store.execute("credential-a", "first", {}, operation);
+		release?.();
+		await expect(first).resolves.toEqual({ run: 1 });
+		await expect(joined).resolves.toEqual({ run: 1 });
+		expect(runs).toBe(1);
+		store.close();
+	});
+
+	it("limits running keyed operations even after their callers leave", async () => {
+		const store = new TaskIdempotencyStore("test", { maxInFlight: 1 });
+		let runs = 0;
+		let release: (() => void) | undefined;
+		const operation = async () => {
+			runs += 1;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { run: runs };
+		};
+		const first = store.execute("credential-a", "first", {}, operation);
+		await expect(store.execute("credential-a", "second", {}, operation)).rejects.toMatchObject({
+			status: 503,
+			code: "busy",
 		});
+		const joined = store.execute("credential-a", "first", {}, operation);
+		release?.();
+		await expect(first).resolves.toEqual({ run: 1 });
+		await expect(joined).resolves.toEqual({ run: 1 });
+		const second = store.execute("credential-a", "second", {}, operation);
+		release?.();
+		await expect(second).resolves.toEqual({ run: 2 });
 		store.close();
 	});
 

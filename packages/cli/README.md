@@ -422,16 +422,20 @@ For one API credential, the same key and canonically identical JSON body share o
 request and return the same stored outcome. Object-key order does not matter. A key reused with a
 different body gets `409 idempotency_key_reused`; another credential has an independent key scope.
 
-Outcomes are kept for 24 hours, with at most 100 live idempotent operations per API credential and
-1,000 per profile. Past either limit, a new keyed submission gets `503 idempotency_store_full`. Each
-stored outcome is capped at 16 KiB. Callers attached to a run that returns a larger outcome still
+Outcomes are kept for up to 24 hours, with at most 100 retained operations per API credential and
+1,000 per profile. At either cap, the gateway evicts the oldest settled outcome; reusing an evicted key
+starts new work. If every operation at the cap is still running, a new keyed submission gets
+`503 idempotency_store_full`. At most 256 keyed operations run at once, including operations whose
+callers disconnected; further distinct keys get `503 busy`, while retries of a running key still join it.
+Each stored outcome is capped at 16 KiB. Callers attached to a run that returns a larger outcome still
 receive it; later retries get `409 outcome_not_retained` instead of executing the task again.
 
 The gateway records an operation before publishing it. If the gateway stops before recording the
 outcome, retries get `409 result_unknown` instead of executing possibly duplicate work. Check the
-remote agent's effects before using a different key. Validation, card-resolution and publish failures
-that prove no task was sent are not retained, so the same key can retry after the cause is fixed.
-Timeouts and remote task failures are retained and replayed because remote execution is uncertain.
+remote agent's effects before using a different key. Validation and card-resolution failures that prove
+no task was sent are not retained, so the same key can retry after the cause is fixed. Publish failures,
+timeouts and remote task failures are retained and replayed: a relay may have stored a task even when
+publishing reports failure, so remote execution is uncertain.
 
 An individual HTTP disconnect does not cancel an idempotent operation or keep its waiting slot.
 Requests without the header retain the existing caller-abandon behavior. If the operation store is

@@ -78,6 +78,8 @@ export interface GatewayOptions {
 	maxTasksInFlight?: number;
 	/** For tests: API task requests waiting for results. Default 256. */
 	maxTaskRequestsWaiting?: number;
+	/** For tests: keyed task operations still running after callers disconnect. Default 256. */
+	maxTaskOperationsInFlight?: number;
 }
 
 export interface RunningGateway {
@@ -158,7 +160,10 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				log(`A message could not be stored and will be retried: ${error instanceof Error ? error.message : String(error)}`),
 		});
 		const subscriptions = new SubscriptionStore(name);
-		const taskOperations = new TaskIdempotencyStore(name, { log });
+		const taskOperations = new TaskIdempotencyStore(name, {
+			log,
+			maxInFlight: options.maxTaskOperationsInFlight ?? MAX_TASK_REQUESTS_WAITING,
+		});
 		const queue = new DeliveryQueue({
 			retryDelaysMs: options.deliveryRetryDelaysMs,
 			onFailure: (subscription, eventId, detail) =>
