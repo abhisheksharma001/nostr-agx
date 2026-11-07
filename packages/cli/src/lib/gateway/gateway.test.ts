@@ -109,6 +109,38 @@ async function json(res: Response): Promise<Record<string, unknown>> {
 	return (await res.json()) as Record<string, unknown>;
 }
 
+async function readSse(
+	res: Response,
+	client: AgxClient,
+	until: (text: string) => boolean,
+): Promise<string> {
+	if (!res.body) {
+		throw new Error("SSE response has no body");
+	}
+	const reader = res.body.getReader();
+	const reading = (async () => {
+		const decoder = new TextDecoder();
+		const deadline = Date.now() + 10_000;
+		let text = "";
+		try {
+			while (!until(text)) {
+				if (Date.now() > deadline) {
+					throw new Error(`SSE did not reach expected state: ${text}`);
+				}
+				const { done, value } = await reader.read();
+				if (done) {
+					break;
+				}
+				text += decoder.decode(value, { stream: true });
+			}
+			return text;
+		} finally {
+			await reader.cancel().catch(() => undefined);
+		}
+	})();
+	return pumping(reading, client);
+}
+
 /** Pump `client` until `promise` settles. */
 async function pumping<T>(promise: Promise<T>, client: AgxClient): Promise<T> {
 	let settled = false;
@@ -166,7 +198,7 @@ async function subscribe(body: Record<string, unknown>) {
 
 /** One task per webhook at a time, so a test can make one wait its turn. */
 function gatewayOptions() {
-	return { profile, port: 0, pollIntervalMs: 200, deliveryRetryDelaysMs: [100], maxTasksPerWebhook: 1 };
+	return { profile, port: 0, pollIntervalMs: 200, deliveryRetryDelaysMs: [100], maxTasksPerWebhook: 1, taskSseHeartbeatMs: 50 };
 }
 
 async function backgroundTask(id: string) {
@@ -610,6 +642,73 @@ describe("agx gateway: outbound", () => {
 		expect(await json(replay)).toEqual(completed);
 		expect(runs).toBe(1);
 	}, 30_000);
+
+	it("streams working updates and replays the stored terminal result without rerunning", async () => {
+		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
+		let runs = 0;
+		let release: () => void = () => undefined;
+		reviewer.client.handle("invoice.background.stream", async (task) => {
+			runs += 1;
+			await task.report?.("reviewing");
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { run: runs };
+		});
+		const acceptedResponse = await api("/v1/tasks", {
+			method: "POST",
+			body: JSON.stringify({ peer: reviewer.npub, capability: "invoice.background.stream", background: true, timeoutSec: 20 }),
+		});
+		expect(acceptedResponse.status).toBe(202);
+		const id = (await json(acceptedResponse)).id as string;
+		const otherKey = createGatewayKey(profile, "sse-other-credential").key;
+		expect((await api(`/v1/tasks/${id}/events`, { key: otherKey })).status).toBe(404);
+		expect((await api("/v1/tasks/task_00000000-0000-0000-0000-000000000000/events")).status).toBe(404);
+
+		const liveResponse = await api(`/v1/tasks/${id}/events`);
+		expect(liveResponse.status).toBe(200);
+		expect(liveResponse.headers.get("content-type")).toContain("text/event-stream");
+		expect(liveResponse.headers.get("cache-control")).toBe("no-store, no-transform");
+		expect(liveResponse.headers.get("x-accel-buffering")).toBe("no");
+		const early = await readSse(
+			liveResponse,
+			reviewer.client,
+			(text) => text.includes("event: working") && text.includes(": heartbeat"),
+		);
+		expect(early).toContain("id: 1");
+		expect(early).toContain('"message":"reviewing"');
+		expect(early).not.toContain("event: completed");
+		expect(await backgroundTask(id)).toMatchObject({ status: "running" });
+
+		release();
+		const completed = await settledBackgroundTask(id, reviewer.client);
+		expect(completed).toMatchObject({ status: "completed", result: { output: { run: 1 } } });
+		const replayResponse = await api(`/v1/tasks/${id}/events`, {
+			headers: { "last-event-id": "1" },
+		});
+		const replay = await readSse(
+			replayResponse,
+			reviewer.client,
+			(text) => text.includes("event: completed"),
+		);
+		expect(replay).not.toContain("event: working");
+		expect(replay).toContain('"status":"completed"');
+		expect(replay).toContain('"run":1');
+
+		await gateway.close();
+		gateway = await startGateway(gatewayOptions());
+		const restoredResponse = await api(`/v1/tasks/${id}/events`, {
+			headers: { "last-event-id": "1" },
+		});
+		const restored = await readSse(
+			restoredResponse,
+			reviewer.client,
+			(text) => text.includes("event: completed"),
+		);
+		expect(restored).toContain('"status":"completed"');
+		expect(restored).toContain('"run":1');
+		expect(runs).toBe(1);
+	}, 45_000);
 
 	it("restores completed and failed background outcomes after restart", async () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 4 });

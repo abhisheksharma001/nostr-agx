@@ -126,12 +126,23 @@ them like any message:
 
 - **request** — `{ t: "req", taskId, capability, payload }`. `payload` is arbitrary JSON the handler
   interprets (payload-agnostic).
+- **status** — `{ t: "status", taskId, status: "working", seq, message? }`, a nonterminal public
+  progress update correlated to the request by `taskId` and ordered by `seq` starting at 1.
 - **result** — `{ t: "res", taskId, status: "completed" | "failed", output?, error? }`, correlated to
   the request by `taskId`.
 
 States: `submitted → working → input-required → completed | failed | canceled`. A handler returning a
 value transitions the task to `completed` (its return is `output`); a handler that throws transitions
-to `failed`. `working` / `input-required` are reserved for status updates.
+to `failed`. `working` is available through status updates; `input-required` remains reserved.
+
+A handler calls `task.report(message?)` to publish best-effort `working` updates. A requester supplies
+`onTaskStatus` to receive them while its original request remains pending. Updates bind to both task
+ID and original peer. Duplicate or older sequence numbers are ignored; a later terminal result still
+settles the request normally. Status updates do not extend the request deadline. Messages are limited
+to 2,000 characters and contain handler-supplied public text, never raw reasoning or internal error
+details. Transport failure drops an update without failing the task. Unknown, late, and post-terminal
+status traffic receives no automatic reply and follows the plain-message trust path. Typed contracts
+advertise the `working` feature; this is not token-by-token model streaming.
 
 **Error boundary.** A `failed` result crosses trust domains, so a thrown handler error is reported to
 the peer **generically** (`handler failed`) and the real message is logged locally — an internal
@@ -158,8 +169,9 @@ automatically, and typed metadata does not change wildcard matching or peer sele
 Each skill has a concrete `id` (not `*` or a `.*` wildcard), a public `description`, and optional
 `tags`, `inputModes`, `outputModes`, `inputSchema`, `outputSchema`, and `features`. Modes are media
 types for the inner task payload and result; they do not change the AGX envelope or add artifact
-transport. Features are declarations only and do not implement lifecycle states. Schemas are inline
-metadata and MAY also drive local task input/output validation as specified below.
+transport. Feature labels advertise behavior rather than enabling it; client-created typed contracts
+include `working` because their handlers can report status. Schemas are inline metadata and MAY also
+drive local task input/output validation as specified below.
 
 Each extension has a stable `uri` and optional `required` (default `false`). AGX-namespaced identifiers
 such as `agx.task-status.v1` are recommended. An unknown optional extension is retained and does not

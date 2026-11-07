@@ -408,6 +408,7 @@ proxy or tunnel, because the key and every task payload cross that connection.
 | `GET /v1/identity` | the agent's `npub`, `pubkey`, relays, organization and NIP-05 address |
 | `POST /v1/tasks` | `{ peer, capability, payload?, timeoutSec?, checkCard?, background? }`: request a task and wait for its result, up to an hour (default 30 s), or use `background: true` to get a task ID with `202` |
 | `GET /v1/tasks/<id>` | read a background task's status and stored result or failure, scoped to the API credential that submitted it |
+| `GET /v1/tasks/<id>/events` | stream ordered `working` updates and the stored terminal view as Server-Sent Events (SSE) |
 | `POST /v1/messages` | `{ peer, text, subject?, contextId?, autoDepth?, maxAutoDepth?, maxPerConversation?, maxPerHour? }`: send a message; an automated reply (`autoDepth` above 0) is refused past 8 deep, 20 per conversation or 60 per agent per hour, unless those limits are given |
 | `GET /v1/agents/<npub>?capability=&verifyNip05=` | read an agent's card, and whether it advertises a capability |
 | `GET` / `POST /v1/subscriptions`, `GET` / `DELETE /v1/subscriptions/<id>` | the webhooks the gateway delivers to |
@@ -476,6 +477,25 @@ another AGX request, except after a retryable pre-publish failure as described a
 completed and failed views survive gateway restart for the same 24-hour retention period. An
 operation interrupted before its outcome was recorded becomes `failed` with `result_unknown`; the
 gateway does not execute it again automatically.
+
+### Task event streams
+
+`GET /v1/tasks/<id>/events` with the same API credential returns `text/event-stream`. Each `working`
+event has a numeric SSE `id` and the remote update's `seq` and optional public `message`. A comment
+heartbeat keeps idle connections alive. The stream ends with one `completed` or `failed` event whose
+data is the stored task view. For example:
+
+```bash
+curl -N -H "Authorization: Bearer $AGX_GATEWAY_KEY" \
+  http://127.0.0.1:8787/v1/tasks/task_…/events
+```
+
+On reconnect, send `Last-Event-ID: <last-id>` to skip already received events. The gateway retains at
+most 128 intermediate events per task and 1,000 in-memory streams for up to 24 hours. Intermediate
+replay is bounded and does not survive restart; the stored terminal view is authoritative and is
+always available without rerunning the task. Closing an SSE connection does not cancel remote work.
+Responses include `Cache-Control: no-store, no-transform` and `X-Accel-Buffering: no`; proxies must
+also be configured not to buffer SSE.
 
 ### Subscriptions
 

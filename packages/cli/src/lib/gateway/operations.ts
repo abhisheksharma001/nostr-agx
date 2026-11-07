@@ -4,6 +4,7 @@ import {
 	DEFAULT_CONTENT_TYPE,
 	matchesCapability,
 	randomId,
+	type TaskStatusUpdate,
 } from "@nostr-agx/core";
 import {
 	type AgxSigner,
@@ -103,6 +104,7 @@ export async function runTaskRequest(
 	deps: OperationDeps,
 	req: TaskRequest,
 	signal?: AbortSignal,
+	onTaskStatus?: (update: TaskStatusUpdate) => void | Promise<void>,
 ): Promise<Record<string, unknown>> {
 	if (req.checkCard) {
 		const { card, reachable } = await resolvePeerCardWithStatus(req.peer, deps.relays, deps.signer);
@@ -129,7 +131,14 @@ export async function runTaskRequest(
 
 	let output: unknown;
 	try {
-		output = await deps.requester.request(req.peer, req.capability, req.payload, req.timeoutSec * 1000, signal);
+		output = await deps.requester.request(
+			req.peer,
+			req.capability,
+			req.payload,
+			req.timeoutSec * 1000,
+			signal,
+			onTaskStatus,
+		);
 	} catch (error) {
 		const message = messageOf(error);
 		if (message.startsWith("AGX request timed out")) {

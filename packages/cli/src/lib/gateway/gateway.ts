@@ -32,6 +32,7 @@ import { verifyGatewayKey } from "./keys.js";
 import { type OperationDeps, parseTaskRequest, readCard, runTaskRequest, sendMessage } from "./operations.js";
 import { Requester } from "./requester.js";
 import { KeyedSlots } from "./slots.js";
+import { TaskEventStream, TaskEventStreams } from "./task-events.js";
 import {
 	assertWebhookHost,
 	parseSubscriptionInput,
@@ -82,6 +83,8 @@ export interface GatewayOptions {
 	maxTaskOperationsInFlight?: number;
 	/** For tests: background task operations running at once. Default 64. */
 	maxBackgroundTasksInFlight?: number;
+	/** SSE comment heartbeat interval. Default 15000. */
+	taskSseHeartbeatMs?: number;
 }
 
 export interface RunningGateway {
@@ -128,6 +131,91 @@ function bearer(req: IncomingMessage): string {
 	return header.startsWith("Bearer ") ? header.slice(7).trim() : "";
 }
 
+function serveTaskEvents(
+	req: IncomingMessage,
+	res: ServerResponse,
+	id: string,
+	taskOperations: TaskOperationStore,
+	taskEvents: TaskEventStreams,
+	heartbeatMs: number,
+): void {
+	const initial = taskOperations.get(bearer(req), id);
+	if (initial === null) {
+		throw new ApiError(404, "not_found", "No background task with that ID for this credential");
+	}
+	const stream = taskEvents.ensure(id);
+	const refreshTerminal = () => {
+		const view = taskOperations.get(bearer(req), id);
+		if (view !== null) {
+			stream.complete(view);
+		}
+	};
+	refreshTerminal();
+	const parsedLastId = Number(req.headers["last-event-id"] ?? 0);
+	let lastId = Number.isSafeInteger(parsedLastId) && parsedLastId > 0 ? parsedLastId : 0;
+	let finished = false;
+	let terminalTimer: ReturnType<typeof setInterval> | undefined;
+	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	const cleanup = () => {
+		if (finished) {
+			return;
+		}
+		finished = true;
+		if (terminalTimer) {
+			clearInterval(terminalTimer);
+		}
+		if (heartbeatTimer) {
+			clearInterval(heartbeatTimer);
+		}
+	};
+	const finish = () => {
+		cleanup();
+		res.end();
+	};
+	const writeEvents = () => {
+		const writeEvent = (event: ReturnType<TaskEventStream["after"]>[number]) => {
+			res.write(`id: ${event.id}\nevent: ${event.event}\ndata: ${JSON.stringify({ taskId: id, ...event.data })}\n\n`);
+			lastId = event.id;
+		};
+		const events = stream.after(lastId);
+		for (const event of events) {
+			writeEvent(event);
+		}
+		const terminal = stream.terminalEvent();
+		if (terminal && !events.some((event) => event.id === terminal.id)) {
+			writeEvent(terminal);
+		}
+		if (terminal) {
+			finish();
+		}
+	};
+
+	res.writeHead(200, {
+		"content-type": "text/event-stream; charset=utf-8",
+		"cache-control": "no-store, no-transform",
+		"connection": "keep-alive",
+		"x-accel-buffering": "no",
+		"x-content-type-options": "nosniff",
+		"retry": "1000",
+	});
+	res.write(": connected\n\n");
+	res.on("close", cleanup);
+	terminalTimer = setInterval(() => {
+		try {
+			refreshTerminal();
+			writeEvents();
+		} catch {
+			finish();
+		}
+	}, 250);
+	heartbeatTimer = setInterval(() => {
+		if (!res.writableEnded) {
+			res.write(": heartbeat\n\n");
+		}
+	}, heartbeatMs);
+	writeEvents();
+}
+
 export async function startGateway(options: GatewayOptions): Promise<RunningGateway> {
 	const name = options.profile;
 	const log = options.log ?? (() => undefined);
@@ -167,6 +255,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			maxInFlight: options.maxTaskOperationsInFlight ?? MAX_TASK_REQUESTS_WAITING,
 			maxBackgroundInFlight: options.maxBackgroundTasksInFlight,
 		});
+		const taskEvents = new TaskEventStreams();
 		const queue = new DeliveryQueue({
 			retryDelaysMs: options.deliveryRetryDelaysMs,
 			onFailure: (subscription, eventId, detail) =>
@@ -500,6 +589,18 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				});
 				return;
 			}
+			const eventRoute = /^\/v1\/tasks\/([^/]+)\/events$/.exec(path);
+			if (method === "GET" && eventRoute) {
+				serveTaskEvents(
+					req,
+					res,
+					decodeURIComponent(eventRoute[1]),
+					taskOperations,
+					taskEvents,
+					Math.max(10, options.taskSseHeartbeatMs ?? 15_000),
+				);
+				return;
+			}
 			const task = /^\/v1\/tasks\/([^/]+)$/.exec(path);
 			if (method === "GET" && task) {
 				const output = taskOperations.get(bearer(req), decodeURIComponent(task[1]));
@@ -544,7 +645,24 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 					const taskRequest = parseTaskRequest(body);
 					const operation = () => runTaskRequest(deps, taskRequest);
 					if (taskRequest.background) {
-						sendJson(res, 202, taskOperations.submit(bearer(req), idempotencyKey, body, operation));
+						const pendingEvents = new TaskEventStream();
+						const backgroundOperation = () => runTaskRequest(
+							deps,
+							taskRequest,
+							undefined,
+							(update) => pendingEvents.push(update),
+						);
+						const submitted = taskOperations.submit(
+							bearer(req),
+							idempotencyKey,
+							body,
+							backgroundOperation,
+						);
+						if (typeof submitted.id !== "string") {
+							throw new Error("Background task store returned no public task ID");
+						}
+						taskEvents.ensure(submitted.id, pendingEvents);
+						sendJson(res, 202, submitted);
 						return;
 					}
 					const output = idempotencyKey === null

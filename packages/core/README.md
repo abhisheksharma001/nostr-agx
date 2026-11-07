@@ -23,7 +23,10 @@ const agx = new AgxClient({
 });
 
 // The runtime only writes handlers; the library owns dispatch → lifecycle → result → receipt.
-agx.handle("invoice.review", async (task) => paperclip.run(task.payload), {
+agx.handle("invoice.review", async (task) => {
+  await task.report?.("reviewing");
+  return paperclip.run(task.payload);
+}, {
   description: "Review an invoice against approval policy",
   inputSchema: {
     type: "object",
@@ -39,9 +42,11 @@ agx.handle("invoice.review", async (task) => paperclip.run(task.payload), {
 
 await agx.start();
 
-// Optional: resolve the peer's typed card and reject bad input before publishing.
 const result = await agx.request(peer, "invoice.review", { amount: 25 }, {
-  validate: true,
+  validate: true, // Optional peer-card input preflight.
+  onTaskStatus(update) {
+    console.log(update.seq, update.message); // Ordered `working` updates; request stays pending.
+  },
 });
 ```
 

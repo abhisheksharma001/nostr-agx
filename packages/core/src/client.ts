@@ -13,6 +13,8 @@ import {
 	type TaskEnvelope,
 	type TaskRequestEnvelope,
 	type TaskResultEnvelope,
+	type TaskStatusEnvelope,
+	type TaskStatusUpdate,
 } from "./task";
 import type {
 	AgxAgentSkill,
@@ -120,6 +122,8 @@ interface Pending {
 	 * if its sender matches — correlation by `taskId` alone is forgeable, since the
 	 * responder legitimately knows the `taskId`. */
 	peer: string;
+	onTaskStatus?: (update: TaskStatusUpdate) => void | Promise<void>;
+	lastStatusSeq: number;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -248,9 +252,15 @@ export class AgxClient {
 	}
 
 	private typedSkills(): AgxAgentSkill[] {
-		return [...this.handlers].flatMap(([id, registered]) =>
-			registered.contract ? [{ ...registered.contract, id }] : [],
-		);
+		return [...this.handlers].flatMap(([id, registered]) => {
+			if (!registered.contract) {
+				return [];
+			}
+			const features = [
+				...new Set([...(registered.contract.features ?? []), "working"]),
+			];
+			return [{ ...registered.contract, features, id }];
+		});
 	}
 
 	/** Send a task to a peer and await its correlated result. Rejects on a `failed`
@@ -259,7 +269,11 @@ export class AgxClient {
 		peer: string,
 		capability: string,
 		payload: unknown,
-		opts?: { timeoutMs?: number; validate?: boolean },
+		opts?: {
+			timeoutMs?: number;
+			validate?: boolean;
+			onTaskStatus?: (update: TaskStatusUpdate) => void | Promise<void>;
+		},
 	): Promise<Output> {
 		if (opts?.validate) {
 			const card = (await this.transport.resolvePeer(peer)).card;
@@ -308,6 +322,8 @@ export class AgxClient {
 				reject,
 				timer,
 				peer: this.normalizeId(peer),
+				onTaskStatus: opts?.onTaskStatus,
+				lastStatusSeq: 0,
 			});
 		});
 		// The timeout or a stop() can settle it while the publish below is still
@@ -675,8 +691,8 @@ export class AgxClient {
 			// `contentType` is peer-supplied, so a task label can't be trusted to mean
 			// "this is task traffic for me". Consume it as a task ONLY when we can
 			// actually service it: a request for a capability WE registered, or a
-			// result correlated to a pending request of OURS. Anything else — an
-			// unknown capability, an unmatched/late result, a malformed envelope — is
+			// status/result correlated to a pending request of OURS. Anything else — an
+			// unknown capability, unmatched/late status/result, malformed envelope — is
 			// deliberately NOT auto-replied to (a reply would let any peer coax a
 			// signed event out of this identity) and NOT silently dropped; it falls
 			// through to `onMessage` so the host's own trust flow triages it exactly
@@ -685,6 +701,10 @@ export class AgxClient {
 			const env = parseTaskEnvelope(msg.text);
 			if (env?.t === "req" && this.handlers.has(env.capability)) {
 				await this.handleTaskRequest(msg, env);
+				return;
+			}
+			if (env?.t === "status" && this.pending.has(env.taskId)) {
+				await this.receiveTaskStatus(msg, env);
 				return;
 			}
 			if (env?.t === "res" && this.pending.has(env.taskId)) {
@@ -773,6 +793,7 @@ export class AgxClient {
 			})
 			.catch(() => undefined);
 
+		let statusSeq = 0;
 		const task: Task = {
 			taskId: env.taskId,
 			capability: env.capability,
@@ -782,6 +803,10 @@ export class AgxClient {
 			eventId: msg.eventId,
 			transportId: msg.transportId,
 			sentAt: msg.sentAt,
+			report: async (message) => {
+				statusSeq += 1;
+				await this.sendTaskStatus(msg.from, env.taskId, statusSeq, message);
+			},
 		};
 		if (this.maxConcurrentTasks === 1) {
 			await this.runTask(msg, env, registered, task);
@@ -870,6 +895,75 @@ export class AgxClient {
 					: "handler failed",
 			});
 		}
+	}
+
+	private async sendTaskStatus(
+		to: string,
+		taskId: string,
+		seq: number,
+		message?: string,
+	): Promise<void> {
+		const env: TaskStatusEnvelope = {
+			t: "status",
+			taskId,
+			status: "working",
+			seq,
+			...(message === undefined ? {} : { message }),
+		};
+		const text = encodeTaskEnvelope(env);
+		if ((message?.length ?? 0) > 2000 || !this.fitsWire(text)) {
+			this.log.warn?.("AGX: task status too large; dropping update", {
+				taskId,
+				seq,
+			});
+			return;
+		}
+		await this.transport
+			.publishMessage(to, {
+				text,
+				contextId: taskId,
+				contentType: TASK_CONTENT_TYPE,
+			})
+			.catch((error) =>
+				this.log.warn?.("AGX: failed to publish task status", {
+					taskId,
+					seq,
+					error: String(error),
+				}),
+			);
+	}
+
+	private async receiveTaskStatus(
+		msg: AgxIncomingMessage,
+		env: TaskStatusEnvelope,
+	): Promise<void> {
+		const pending = this.pending.get(env.taskId);
+		if (!pending) {
+			return;
+		}
+		if (this.normalizeId(msg.from) !== pending.peer) {
+			this.log.warn?.("AGX: task status from unexpected peer; dropping", {
+				taskId: env.taskId,
+				from: msg.from,
+				expected: pending.peer,
+			});
+			return;
+		}
+		if (env.seq <= pending.lastStatusSeq) {
+			this.log.debug?.("AGX: dropping duplicate or older task status", {
+				taskId: env.taskId,
+				seq: env.seq,
+				lastStatusSeq: pending.lastStatusSeq,
+			});
+			return;
+		}
+		await pending.onTaskStatus?.({
+			taskId: env.taskId,
+			status: env.status,
+			seq: env.seq,
+			...(env.message === undefined ? {} : { message: env.message }),
+		});
+		pending.lastStatusSeq = env.seq;
 	}
 
 	private async sendResult(

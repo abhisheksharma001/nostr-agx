@@ -2,7 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgxClient } from "./client";
 import { AgxPublicError, AgxTaskDeclined } from "./errors";
 import { randomId } from "./id";
-import { encodeTaskEnvelope, parseTaskEnvelope } from "./task";
+import {
+	encodeTaskEnvelope,
+	parseTaskEnvelope,
+	type TaskEnvelope,
+	type TaskRequestEnvelope,
+} from "./task";
 import type {
 	AgxIncomingMessage,
 	AgxIncomingReceipt,
@@ -100,6 +105,27 @@ beforeEach(() => {
 	bus = new MemoryBus();
 });
 
+function pushTaskEnvelope(to: string, from: string, envelope: TaskEnvelope): void {
+	bus.pushMessage(to, {
+		from,
+		text: encodeTaskEnvelope(envelope),
+		contextId: envelope.taskId,
+		messageId: randomId(),
+		subject: null,
+		autoDepth: null,
+		contentType: TASK_CONTENT_TYPE,
+	});
+}
+
+function outboundRequest(): TaskRequestEnvelope {
+	const message = bus.inbox.get(BOB)?.at(-1);
+	const envelope = message ? parseTaskEnvelope(message.text) : null;
+	if (!envelope || envelope.t !== "req") {
+		throw new Error("expected an outbound task request");
+	}
+	return envelope;
+}
+
 describe("AgxClient task request/response", () => {
 	it("routes a request to the peer's capability handler and returns the result", async () => {
 		const alice = new AgxClient({ transport: bus.transport(ALICE) });
@@ -116,6 +142,207 @@ describe("AgxClient task request/response", () => {
 		await bob.pump(); // Bob receives the request, runs the handler, replies
 		await alice.pump(); // Alice receives the correlated result
 		expect(await pending).toBe(5);
+	});
+
+	it("delivers ordered working updates before the terminal result", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+		});
+		bob.handle("long.task", async (task) => {
+			await task.report?.("started");
+			await task.report?.("almost done");
+			return "done";
+		});
+		const onTaskStatus = vi.fn();
+
+		const pending = alice.request(BOB, "long.task", {}, { onTaskStatus });
+		await bob.pump();
+		await alice.pump();
+
+		expect(await pending).toBe("done");
+		expect(onTaskStatus.mock.calls.map(([update]) => update)).toEqual([
+			{ taskId: expect.any(String), status: "working", seq: 1, message: "started" },
+			{ taskId: expect.any(String), status: "working", seq: 2, message: "almost done" },
+		]);
+	});
+
+	it("keeps the original request pending after a working update", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const onTaskStatus = vi.fn();
+		const pending = alice.request(BOB, "long.task", {}, {
+			timeoutMs: 1_000,
+			onTaskStatus,
+		});
+		const request = outboundRequest();
+		let settled = false;
+		const watched = pending.finally(() => {
+			settled = true;
+		});
+		watched.catch(() => undefined);
+
+		pushTaskEnvelope(ALICE, BOB, {
+			t: "status",
+			taskId: request.taskId,
+			status: "working",
+			seq: 1,
+			message: "still running",
+		});
+		await alice.pump();
+
+		expect(onTaskStatus).toHaveBeenCalledTimes(1);
+		expect(settled).toBe(false);
+		await alice.stop();
+		await expect(pending).rejects.toThrow("AGX client stopped");
+	});
+
+	it("drops wrong-peer, duplicate, and older working updates", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const onTaskStatus = vi.fn();
+		const pending = alice.request(BOB, "long.task", {}, {
+			timeoutMs: 1_000,
+			onTaskStatus,
+		});
+		const request = outboundRequest();
+		for (const [from, seq] of [["mallory", 1], [BOB, 2], [BOB, 1], [BOB, 2]] as const) {
+			pushTaskEnvelope(ALICE, from, {
+				t: "status",
+				taskId: request.taskId,
+				status: "working",
+				seq,
+			});
+		}
+		await alice.pump();
+
+		expect(onTaskStatus).toHaveBeenCalledTimes(1);
+		expect(onTaskStatus).toHaveBeenCalledWith({
+			taskId: request.taskId,
+			status: "working",
+			seq: 2,
+		});
+		await alice.stop();
+		await expect(pending).rejects.toThrow("AGX client stopped");
+	});
+
+	it("routes unknown-task status traffic to onMessage without replying", async () => {
+		const onMessage = vi.fn();
+		const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
+		pushTaskEnvelope(ALICE, BOB, {
+			t: "status",
+			taskId: "unknown",
+			status: "working",
+			seq: 1,
+		});
+
+		await alice.pump();
+		expect(onMessage).toHaveBeenCalledTimes(1);
+		expect(bus.inbox.get(BOB) ?? []).toHaveLength(0);
+	});
+
+	it("routes post-terminal status traffic to onMessage", async () => {
+		const onMessage = vi.fn();
+		const onTaskStatus = vi.fn();
+		const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
+		const pending = alice.request(BOB, "long.task", {}, { onTaskStatus });
+		const request = outboundRequest();
+		pushTaskEnvelope(ALICE, BOB, {
+			t: "res",
+			taskId: request.taskId,
+			status: "completed",
+			output: "done",
+		});
+		pushTaskEnvelope(ALICE, BOB, {
+			t: "status",
+			taskId: request.taskId,
+			status: "working",
+			seq: 1,
+			message: "late",
+		});
+
+		await alice.pump();
+		expect(await pending).toBe("done");
+		expect(onTaskStatus).not.toHaveBeenCalled();
+		expect(onMessage).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not extend the request deadline after a working update", async () => {
+		vi.useFakeTimers();
+		try {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const onTaskStatus = vi.fn();
+			const pending = alice.request(BOB, "long.task", {}, {
+				timeoutMs: 20,
+				onTaskStatus,
+			});
+			const request = outboundRequest();
+			await vi.advanceTimersByTimeAsync(15);
+			pushTaskEnvelope(ALICE, BOB, {
+				t: "status",
+				taskId: request.taskId,
+				status: "working",
+				seq: 1,
+			});
+			await alice.pump();
+			const rejection = expect(pending).rejects.toThrow("timed out after 20ms");
+			await vi.advanceTimersByTimeAsync(5);
+			await rejection;
+			expect(onTaskStatus).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps the task running when status publication fails", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bobTransport = bus.transport(BOB);
+		const publishMessage = bobTransport.publishMessage;
+		bobTransport.publishMessage = async (to, message) => {
+			if (parseTaskEnvelope(message.text)?.t === "status") {
+				throw new Error("relay down");
+			}
+			return publishMessage(to, message);
+		};
+		const warn = vi.fn();
+		const bob = new AgxClient({
+			transport: bobTransport,
+			authorize: "accept-all",
+			logger: { warn },
+		});
+		bob.handle("long.task", async (task) => {
+			await task.report?.("progress");
+			return "done";
+		});
+
+		const pending = alice.request(BOB, "long.task", {});
+		await bob.pump();
+		await alice.pump();
+		expect(await pending).toBe("done");
+		expect(warn).toHaveBeenCalledWith(
+			"AGX: failed to publish task status",
+			expect.objectContaining({ error: expect.stringContaining("relay down") }),
+		);
+	});
+
+	it("drops an oversized public status message without failing the task", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+		});
+		bob.handle("long.task", async (task) => {
+			await task.report?.("x".repeat(2001));
+			return "done";
+		});
+
+		const pending = alice.request(BOB, "long.task", {});
+		await bob.pump();
+		await alice.pump();
+		expect(await pending).toBe("done");
+		const statuses = (bus.inbox.get(ALICE) ?? []).filter(
+			(message) => parseTaskEnvelope(message.text)?.t === "status",
+		);
+		expect(statuses).toHaveLength(0);
 	});
 
 	it("preflights a typed peer skill before publishing", async () => {
@@ -271,6 +498,7 @@ describe("AgxClient task request/response", () => {
 					id: "invoice.review",
 					description: "Review an invoice",
 					inputSchema: { type: "object" },
+					features: ["working"],
 				}],
 			}),
 		);
