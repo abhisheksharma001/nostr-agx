@@ -54,6 +54,11 @@ interface SuspensionManagerOptions {
 	logger: AgxLogger;
 	normalizeId: (id: string) => string;
 	resumeHandler: (capability: string) => AgxResumeHandler | undefined;
+	validateResult: (
+		capability: string,
+		taskId: string,
+		result: TaskResult,
+	) => TaskResult;
 	attachTask: (task: Task, seq: number) => void;
 	sendStatus: (to: string, envelope: TaskStatusEnvelope) => Promise<void>;
 	sendResult: (to: string, taskId: string, result: TaskResult) => Promise<void>;
@@ -253,11 +258,19 @@ export class AgxSuspensionManager {
 		this.options.attachTask(task, entry.record.seq);
 		try {
 			const output = await resumeHandler(task, input);
-			if (output instanceof AgxResumeCompletion) {
-				await this.settle(entry, output.result, output.tasks);
-			} else {
-				await this.settle(entry, { status: "completed", output });
-			}
+			const completion = output instanceof AgxResumeCompletion ? output : undefined;
+			const result = completion?.result ?? { status: "completed", output };
+			await this.settle(
+				entry,
+				entry.continuation
+					? result
+					: this.options.validateResult(
+						entry.record.capability,
+						entry.record.taskId,
+						result,
+					),
+				completion?.tasks,
+			);
 		} catch (error) {
 			const isPublic = error instanceof AgxPublicError;
 			if (!isPublic) {
@@ -348,7 +361,7 @@ export class AgxSuspensionManager {
 			return;
 		}
 		await this.options.sendResult(entry.record.from, entry.record.taskId, result);
-		await this.remove(entry);
+		await this.finish(completion);
 	}
 
 	private async remove(entry: Entry): Promise<void> {

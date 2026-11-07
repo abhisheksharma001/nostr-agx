@@ -113,6 +113,7 @@ async function readSse(
 	res: Response,
 	client: AgxClient,
 	until: (text: string) => boolean,
+	expectOpen = false,
 ): Promise<string> {
 	if (!res.body) {
 		throw new Error("SSE response has no body");
@@ -129,9 +130,21 @@ async function readSse(
 				}
 				const { done, value } = await reader.read();
 				if (done) {
-					break;
+					throw new Error(`SSE ended before expected state: ${text}`);
 				}
 				text += decoder.decode(value, { stream: true });
+			}
+			if (expectOpen) {
+				const timeout = Symbol("still-open");
+				const next = await Promise.race([
+					reader.read(),
+					new Promise<typeof timeout>((resolve) => {
+						setTimeout(() => resolve(timeout), 100);
+					}),
+				]);
+				if (next !== timeout && next.done) {
+					throw new Error("SSE ended at a non-terminal event");
+				}
 			}
 			return text;
 		} finally {
@@ -677,6 +690,7 @@ describe("agx gateway: outbound", () => {
 			events,
 			reviewer.client,
 			(text) => text.includes("event: input-required"),
+			true,
 		);
 		expect(question).toContain("Approve invoice?");
 

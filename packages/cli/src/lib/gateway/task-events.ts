@@ -53,7 +53,9 @@ export class TaskEventStream {
 
 	terminalEvent(): TaskStreamEvent | undefined {
 		const event = this.events.at(-1);
-		return event?.event === "working" ? undefined : event;
+		return event?.event === "completed" || event?.event === "failed"
+			? event
+			: undefined;
 	}
 
 	touched(): number {

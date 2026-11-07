@@ -215,6 +215,22 @@ export class AgxClient {
 			logger: this.log,
 			normalizeId: (id) => this.normalizeId(id),
 			resumeHandler: (capability) => this.handlers.get(capability)?.resume,
+			validateResult: (capability, taskId, result) => {
+				const outputSchema = this.handlers.get(capability)?.contract?.outputSchema;
+				if (result.status !== "completed" || !outputSchema) {
+					return result;
+				}
+				const problem = validateAgxJsonPayload(outputSchema, result.output);
+				if (!problem) {
+					return result;
+				}
+				this.log.warn?.("AGX: resumed task output failed schema validation", {
+					taskId,
+					capability,
+					error: problem,
+				});
+				return { status: "failed", error: "invalid_output" };
+			},
 			attachTask: (task, seq) => this.attachTaskControl(task, seq),
 			sendStatus: (to, envelope) => this.sendTaskStatus(to, envelope),
 			sendResult: (to, taskId, result) =>
@@ -287,13 +303,14 @@ export class AgxClient {
 			if (!registered.contract) {
 				return [];
 			}
+			const protocolFeatures = registered.resume
+				? ["working", "input-required"]
+				: ["working"];
+			const declaredFeatures = registered.contract.features ?? [];
 			const features = new Set([
-				...(registered.contract.features ?? []),
-				"working",
+				...declaredFeatures.slice(0, 16 - protocolFeatures.length),
+				...protocolFeatures,
 			]);
-			if (registered.resume) {
-				features.add("input-required");
-			}
 			return [{ ...registered.contract, features: [...features], id }];
 		});
 	}

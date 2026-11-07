@@ -59,6 +59,8 @@ describe("input-required task events", () => {
 			resumeSchema: { type: "object" },
 			expiresAt: 4_000_000_000,
 		});
+		expect(stream.terminalEvent()).toBeUndefined();
+		expect(stream.isTerminal()).toBe(false);
 		expect(stream.after(0)[0]).toMatchObject({
 			event: "input-required",
 			data: {

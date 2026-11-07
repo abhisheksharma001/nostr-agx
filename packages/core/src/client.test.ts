@@ -507,6 +507,25 @@ describe("AgxClient task request/response", () => {
 		);
 	});
 
+	it("keeps protocol features when a typed card already has 16 features", async () => {
+		const advertise = vi.fn<NonNullable<AgxTransport["advertise"]>>(
+			async () => ({ ok: true }),
+		);
+		const bob = new AgxClient({
+			transport: { ...bus.transport(BOB), advertise },
+		});
+		bob.handle("invoice.approval", () => null, {
+			description: "Approve an invoice",
+			features: Array.from({ length: 16 }, (_, index) => `custom-${index}`),
+		}, () => null);
+
+		await bob.start({ pollIntervalMs: 0 });
+		const metadata = advertise.mock.calls[0]?.[1];
+		expect(metadata?.skills?.[0]?.features).toHaveLength(16);
+		expect(metadata?.skills?.[0]?.features).toContain("working");
+		expect(metadata?.skills?.[0]?.features).toContain("input-required");
+	});
+
 	it("advertises input-required for resume-capable typed handlers", async () => {
 		const advertise = vi.fn(async () => ({ ok: true }));
 		const bob = new AgxClient({
@@ -1928,6 +1947,115 @@ describe("AgxClient durable input-required resume", () => {
 		expect(restartedInitial).not.toHaveBeenCalled();
 		expect(resume).toHaveBeenCalledTimes(1);
 		expect(await store.list()).toEqual([]);
+	});
+
+	it("validates resumed output against the registered contract after restart", async () => {
+		const store = new InMemorySuspensionStore();
+		const seen = new InMemorySeenStore();
+		const initial = suspendedHandler();
+		const resume = vi.fn(() => ({ approved: "not-a-boolean" }));
+		const contract = {
+			description: "Approve an invoice",
+			outputSchema: {
+				type: "object",
+				required: ["approved"],
+				properties: { approved: { type: "boolean" } },
+			},
+		};
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const firstBob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			seen,
+			suspensions: store,
+		});
+		firstBob.handle("approval", initial, contract, resume);
+		const pending = alice.request(BOB, "approval", {});
+		const taskId = outboundRequest().taskId;
+		await firstBob.pump();
+		await alice.pump();
+		await firstBob.stop();
+
+		const secondBob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			seen,
+			suspensions: store,
+		});
+		secondBob.handle("approval", vi.fn(), contract, resume);
+		await secondBob.start({ pollIntervalMs: 0, advertise: false });
+		await alice.resume(taskId, { answer: "yes" });
+		await secondBob.pump();
+		await alice.pump();
+
+		await expect(pending).rejects.toThrow("invalid_output");
+		expect(resume).toHaveBeenCalledTimes(1);
+		expect(await store.list()).toEqual([]);
+	});
+
+	it("cleans every question after a restored multi-question resume", async () => {
+		const store = new InMemorySuspensionStore();
+		const seen = new InMemorySeenStore();
+		const initial = suspendedHandler();
+		const resume = vi.fn(async (task: Task, input: unknown) => {
+			const answer = (input as { answer: string }).answer;
+			if (answer === "first") {
+				return task.requireInput?.({
+					question: { kind: "confirmation", prompt: "Confirm second answer" },
+					resumeSchema,
+					state: { first: answer },
+				});
+			}
+			return { answer, state: task.state };
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const firstBob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			seen,
+			suspensions: store,
+		});
+		firstBob.handle("approval", initial, undefined, resume);
+		const onTaskStatus = vi.fn();
+		const pending = alice.request(BOB, "approval", {}, { onTaskStatus });
+		const taskId = outboundRequest().taskId;
+		await firstBob.pump();
+		await alice.pump();
+		await firstBob.stop();
+
+		const secondBob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			seen,
+			suspensions: store,
+		});
+		secondBob.handle("approval", vi.fn(), undefined, resume);
+		await secondBob.start({ pollIntervalMs: 0, advertise: false });
+		await alice.resume(taskId, { answer: "first" });
+		await pumpUntilStatus(onTaskStatus, 2, alice, secondBob);
+		await alice.resume(taskId, { answer: "second" });
+
+		expect(await pumpUntilResult(pending, alice, secondBob)).toEqual({
+			answer: "second",
+			state: { first: "first" },
+		});
+		expect(await store.list()).toEqual([]);
+		await secondBob.stop();
+		const resultCount = bus.inbox.get(ALICE)?.length ?? 0;
+
+		const thirdBob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			seen,
+			suspensions: store,
+		});
+		thirdBob.handle("approval", vi.fn(), undefined, resume);
+		await thirdBob.start({ pollIntervalMs: 0, advertise: false });
+		expect(bus.inbox.get(ALICE) ?? []).toHaveLength(resultCount);
 	});
 
 	it("marks an interrupted resume failed instead of executing it again", async () => {
