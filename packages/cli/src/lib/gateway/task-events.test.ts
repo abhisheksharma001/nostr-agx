@@ -45,3 +45,29 @@ describe("TaskEventStreams", () => {
 		expect(streams.get("task_public")?.after(0)).toHaveLength(1);
 	});
 });
+
+
+describe("input-required task events", () => {
+	it("includes the public question, resume schema, and expiry", () => {
+		const stream = new TaskEventStream();
+		const question = { kind: "confirmation" as const, prompt: "Approve?" };
+		stream.push({
+			taskId: "remote",
+			status: "input-required",
+			seq: 2,
+			question,
+			resumeSchema: { type: "object" },
+			expiresAt: 4_000_000_000,
+		});
+		expect(stream.after(0)[0]).toMatchObject({
+			event: "input-required",
+			data: {
+				status: "input-required",
+				seq: 2,
+				question,
+				resumeSchema: { type: "object" },
+				expiresAt: 4_000_000_000,
+			},
+		});
+	});
+});

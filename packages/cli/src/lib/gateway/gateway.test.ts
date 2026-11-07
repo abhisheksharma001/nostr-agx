@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import { AgxClient, DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
 import { generateKeypair, localSigner, NostrTransport, toNpub } from "@nostr-agx/nostr";
 import WebSocket from "ws";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { type RunningRelay, startRelay } from "../../relay/server.js";
 import { agx, sandbox } from "../../test/helpers.js";
 import { resolveProfileName } from "../config.js";
@@ -641,6 +641,71 @@ describe("agx gateway: outbound", () => {
 		expect(replay.status).toBe(202);
 		expect(await json(replay)).toEqual(completed);
 		expect(runs).toBe(1);
+	}, 30_000);
+
+	it("resumes a background task through the HTTP input-required route", async () => {
+		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
+		const initial = vi.fn(async (task: {
+			requireInput?: (options: {
+				question: { kind: "confirmation"; prompt: string };
+				resumeSchema: Record<string, unknown>;
+				state: { invoice: number };
+			}) => Promise<unknown>;
+		}) => task.requireInput?.({
+			question: { kind: "confirmation", prompt: "Approve invoice?" },
+			resumeSchema: {
+				type: "object",
+				required: ["approved"],
+				properties: { approved: { type: "boolean" } },
+				additionalProperties: false,
+			},
+			state: { invoice: 42 },
+		}));
+		const resume = vi.fn((task: { state?: unknown }, input: unknown) => ({
+			approved: (input as { approved: boolean }).approved,
+			invoice: task.state,
+		}));
+		reviewer.client.handle("invoice.approval", initial, undefined, resume);
+		const acceptedResponse = await api("/v1/tasks", {
+			method: "POST",
+			body: JSON.stringify({ peer: reviewer.npub, capability: "invoice.approval", background: true, timeoutSec: 20 }),
+		});
+		expect(acceptedResponse.status).toBe(202);
+		const id = (await json(acceptedResponse)).id as string;
+		const events = await api(`/v1/tasks/${id}/events`);
+		const question = await readSse(
+			events,
+			reviewer.client,
+			(text) => text.includes("event: input-required"),
+		);
+		expect(question).toContain("Approve invoice?");
+
+		const otherKey = createGatewayKey(profile, "resume-other-credential").key;
+		expect((await api(`/v1/tasks/${id}/resume`, {
+			method: "POST",
+			key: otherKey,
+			body: JSON.stringify({ payload: { approved: true } }),
+		})).status).toBe(404);
+		const invalid = await api(`/v1/tasks/${id}/resume`, {
+			method: "POST",
+			body: JSON.stringify({ payload: { approved: "yes" } }),
+		});
+		expect(invalid.status).toBe(422);
+		expect(await backgroundTask(id)).toMatchObject({ status: "running" });
+		const resumed = await api(`/v1/tasks/${id}/resume`, {
+			method: "POST",
+			body: JSON.stringify({ payload: { approved: true } }),
+		});
+		expect(resumed.status).toBe(202);
+		expect(await json(resumed)).toEqual({ id, status: "running" });
+
+		const completed = await settledBackgroundTask(id, reviewer.client);
+		expect(completed).toMatchObject({
+			status: "completed",
+			result: { output: { approved: true, invoice: { invoice: 42 } } },
+		});
+		expect(initial).toHaveBeenCalledTimes(1);
+		expect(resume).toHaveBeenCalledTimes(1);
 	}, 30_000);
 
 	it("streams working updates and replays the stored terminal result without rerunning", async () => {

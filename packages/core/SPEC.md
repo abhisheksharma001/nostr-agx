@@ -127,13 +127,16 @@ them like any message:
 - **request** — `{ t: "req", taskId, capability, payload }`. `payload` is arbitrary JSON the handler
   interprets (payload-agnostic).
 - **status** — `{ t: "status", taskId, status: "working", seq, message? }`, a nonterminal public
-  progress update correlated to the request by `taskId` and ordered by `seq` starting at 1.
+  progress update; or `{ t: "status", taskId, status: "input-required", seq, question, resumeSchema,
+  expiresAt }`, a typed question. Both are ordered by `seq` starting at 1.
+- **resume** — `{ t: "resume", taskId, seq, payload }`, the original requester's answer to the exact
+  `input-required` question sequence.
 - **result** — `{ t: "res", taskId, status: "completed" | "failed", output?, error? }`, correlated to
   the request by `taskId`.
 
 States: `submitted → working → input-required → completed | failed | canceled`. A handler returning a
 value transitions the task to `completed` (its return is `output`); a handler that throws transitions
-to `failed`. `working` is available through status updates; `input-required` remains reserved.
+to `failed`. `working` and `input-required` are available through status updates.
 
 A handler calls `task.report(message?)` to publish best-effort `working` updates. A requester supplies
 `onTaskStatus` to receive them while its original request remains pending. Updates bind to both task
@@ -143,6 +146,20 @@ to 2,000 characters and contain handler-supplied public text, never raw reasonin
 details. Transport failure drops an update without failing the task. Unknown, late, and post-terminal
 status traffic receives no automatic reply and follows the plain-message trust path. Typed contracts
 advertise the `working` feature; this is not token-by-token model streaming.
+
+A handler with a separately registered resume handler calls `task.requireInput` with a `text`, `choice`,
+or `confirmation` question, a bounded resume schema, and optional JSON host state. The default expiry
+is 300 seconds; the maximum is 86,400. The requester calls `client.resume(taskId, payload)` after local
+schema validation. Resume binds to the original peer, task ID, and question sequence and does not
+change the original deadline. Wrong-peer, duplicate, older, and unknown answers receive no automatic
+reply. Invalid input returns `invalid_resume_input`; expiry returns `input_required_expired`.
+
+An injected `AgxSuspensionStore` persists the question, schema, original task data, and host state. A
+separate resume handler continues from that state; the initial handler MUST NOT rerun after restart.
+Before invoking it, the responder persists `resuming: true`. A restart seeing that marker returns
+`resume_interrupted` instead of executing the handler again. Resume answers are not written to the
+suspension store. Questions and host state are shared with the original peer and persisted locally;
+secret answers are forbidden. Resume-capable typed contracts advertise `input-required`.
 
 **Error boundary.** A `failed` result crosses trust domains, so a thrown handler error is reported to
 the peer **generically** (`handler failed`) and the real message is logged locally — an internal

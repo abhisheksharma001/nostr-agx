@@ -7,12 +7,23 @@ import {
 import { type AgxLogger, noopLogger } from "./logger";
 import { InMemorySeenStore, type SeenStore } from "./seen-store";
 import {
+	AgxResumeCompletion,
+	type AgxResumeHandler,
+	AgxSuspensionManager,
+} from "./suspension";
+import {
+	type AgxSuspensionStore,
+	InMemorySuspensionStore,
+} from "./suspension-store";
+import {
 	encodeTaskEnvelope,
 	parseTaskEnvelope,
 	type Task,
 	type TaskEnvelope,
+	type TaskInputRequiredEnvelope,
 	type TaskRequestEnvelope,
 	type TaskResultEnvelope,
+	type TaskResumeEnvelope,
 	type TaskStatusEnvelope,
 	type TaskStatusUpdate,
 } from "./task";
@@ -48,6 +59,7 @@ export type AgxTaskContract = Omit<AgxAgentSkill, "id">;
 interface RegisteredTaskHandler {
 	handler: TaskHandler;
 	contract?: AgxTaskContract;
+	resume?: AgxResumeHandler;
 }
 
 /** Context for the trust/authorization hook, evaluated before a task runs. */
@@ -104,6 +116,9 @@ export interface AgxClientOptions {
 	 * (unbounded at-least-once retries). Prevents a poison event from stalling the
 	 * inbox and letting a held cursor outrun the SeenStore retention window. */
 	maxDispatchAttempts?: number;
+	/** Durable input-required records. Default in-memory. Inject a persistent store
+	 * to resume suspended tasks after process restart. */
+	suspensions?: AgxSuspensionStore;
 	/** Task handlers that may run at once. With the default, 1, a handler runs
 	 * inside `pump()`, which waits for it, and its request is recorded as handled
 	 * once it has answered. Above 1, `pump()` starts each task in a free slot and
@@ -124,6 +139,8 @@ interface Pending {
 	peer: string;
 	onTaskStatus?: (update: TaskStatusUpdate) => void | Promise<void>;
 	lastStatusSeq: number;
+	inputRequired?: TaskInputRequiredEnvelope;
+	resumeInFlight: boolean;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -164,6 +181,7 @@ export class AgxClient {
 	/** Handlers running outside `pump()` (`maxConcurrentTasks` above 1). */
 	private readonly runningTasks = new Set<Promise<void>>();
 	private readonly handlers = new Map<string, RegisteredTaskHandler>();
+	private readonly suspensions: AgxSuspensionManager;
 	private readonly pending = new Map<string, Pending>();
 	private cursor: number;
 	private pollTimer?: ReturnType<typeof setTimeout>;
@@ -191,6 +209,17 @@ export class AgxClient {
 		this.maxConcurrentTasks =
 			Number.isFinite(concurrent) && concurrent > 1 ? concurrent : 1;
 		this.cursor = opts.startCursor ?? 0;
+		this.suspensions = new AgxSuspensionManager({
+			store: opts.suspensions ?? new InMemorySuspensionStore(),
+			transport: this.transport,
+			logger: this.log,
+			normalizeId: (id) => this.normalizeId(id),
+			resumeHandler: (capability) => this.handlers.get(capability)?.resume,
+			attachTask: (task, seq) => this.attachTaskControl(task, seq),
+			sendStatus: (to, envelope) => this.sendTaskStatus(to, envelope),
+			sendResult: (to, taskId, result) =>
+				this.sendResult(to, taskId, result),
+		});
 	}
 
 	/** This agent's identity (from the transport). */
@@ -226,6 +255,7 @@ export class AgxClient {
 		capability: string,
 		handler: TaskHandler<Payload, Output>,
 		contract?: AgxTaskContract,
+		resume?: AgxResumeHandler,
 	): this {
 		for (const keyword of ["inputSchema", "outputSchema"] as const) {
 			const schema = contract?.[keyword];
@@ -242,6 +272,7 @@ export class AgxClient {
 		this.handlers.set(capability, {
 			handler: handler as TaskHandler,
 			contract,
+			resume,
 		});
 		return this;
 	}
@@ -256,10 +287,14 @@ export class AgxClient {
 			if (!registered.contract) {
 				return [];
 			}
-			const features = [
-				...new Set([...(registered.contract.features ?? []), "working"]),
-			];
-			return [{ ...registered.contract, features, id }];
+			const features = new Set([
+				...(registered.contract.features ?? []),
+				"working",
+			]);
+			if (registered.resume) {
+				features.add("input-required");
+			}
+			return [{ ...registered.contract, features: [...features], id }];
 		});
 	}
 
@@ -324,6 +359,7 @@ export class AgxClient {
 				peer: this.normalizeId(peer),
 				onTaskStatus: opts?.onTaskStatus,
 				lastStatusSeq: 0,
+				resumeInFlight: false,
 			});
 		});
 		// The timeout or a stop() can settle it while the publish below is still
@@ -346,6 +382,53 @@ export class AgxClient {
 			);
 		}
 		return result;
+	}
+
+	/** Answer the current input-required question for a pending task. The original
+	 * request promise remains pending for the responder's terminal result. */
+	async resume(taskId: string, payload: unknown): Promise<void> {
+		const pending = this.pending.get(taskId);
+		if (!pending) {
+			throw new Error("AGX resume: unknown or already settled task");
+		}
+		const required = pending.inputRequired;
+		if (!required) {
+			throw new Error("AGX resume: task is not waiting for input");
+		}
+		if (required.expiresAt <= Math.floor(Date.now() / 1000)) {
+			throw new Error("AGX resume: input-required question expired");
+		}
+		if (pending.resumeInFlight) {
+			throw new Error("AGX resume: answer already published");
+		}
+		const problem = validateAgxJsonPayload(required.resumeSchema, payload);
+		if (problem) {
+			throw new Error(`AGX resume: invalid_resume_input: ${problem}`);
+		}
+		const envelope: TaskResumeEnvelope = {
+			t: "resume",
+			taskId,
+			seq: required.seq,
+			payload,
+		};
+		const text = encodeTaskEnvelope(envelope);
+		if (!this.fitsWire(text)) {
+			throw new Error("AGX resume: encoded payload exceeds the transport size limit");
+		}
+		pending.resumeInFlight = true;
+		try {
+			const sent = await this.transport.publishMessage(pending.peer, {
+				text,
+				contextId: taskId,
+				contentType: TASK_CONTENT_TYPE,
+			});
+			if (!sent.ok) {
+				throw new Error("AGX resume: publish failed");
+			}
+		} catch (error) {
+			pending.resumeInFlight = false;
+			throw error;
+		}
 	}
 
 	/** One poll → dispatch cycle. Drains inbound messages, dispatches task requests
@@ -412,6 +495,7 @@ export class AgxClient {
 		dispatched: number;
 		complete: boolean;
 	}> {
+		await this.suspensions.load();
 		// One clock read for the whole pump, taken BEFORE the poll: it is both the
 		// skew ceiling and, on a complete pump, the new cursor.
 		const nowSec = Math.floor(Date.now() / 1000);
@@ -630,6 +714,7 @@ export class AgxClient {
 		advertise?: boolean;
 	}): Promise<void> {
 		await this.transport.start?.();
+		await this.suspensions.load();
 		if (opts?.advertise !== false && this.transport.advertise) {
 			const skills = this.typedSkills();
 			await this.transport
@@ -672,6 +757,7 @@ export class AgxClient {
 	 * are rejected (their result can no longer arrive) rather than left hanging. */
 	async stop(): Promise<void> {
 		this.running = false;
+		this.suspensions.stop();
 		if (this.pollTimer) {
 			clearTimeout(this.pollTimer);
 			this.pollTimer = undefined;
@@ -701,6 +787,10 @@ export class AgxClient {
 			const env = parseTaskEnvelope(msg.text);
 			if (env?.t === "req" && this.handlers.has(env.capability)) {
 				await this.handleTaskRequest(msg, env);
+				return;
+			}
+			if (env?.t === "resume" && (await this.suspensions.has(env.taskId))) {
+				await this.suspensions.resume(msg, env);
 				return;
 			}
 			if (env?.t === "status" && this.pending.has(env.taskId)) {
@@ -793,7 +883,6 @@ export class AgxClient {
 			})
 			.catch(() => undefined);
 
-		let statusSeq = 0;
 		const task: Task = {
 			taskId: env.taskId,
 			capability: env.capability,
@@ -803,11 +892,8 @@ export class AgxClient {
 			eventId: msg.eventId,
 			transportId: msg.transportId,
 			sentAt: msg.sentAt,
-			report: async (message) => {
-				statusSeq += 1;
-				await this.sendTaskStatus(msg.from, env.taskId, statusSeq, message);
-			},
 		};
+		this.attachTaskControl(task, 0);
 		if (this.maxConcurrentTasks === 1) {
 			await this.runTask(msg, env, registered, task);
 			return;
@@ -833,6 +919,24 @@ export class AgxClient {
 		}
 	}
 
+	private attachTaskControl(task: Task, seq: number): void {
+		let statusSeq = seq;
+		task.report = async (message) => {
+			statusSeq += 1;
+			await this.sendTaskStatus(task.from, {
+				t: "status",
+				taskId: task.taskId,
+				status: "working",
+				seq: statusSeq,
+				...(message === undefined ? {} : { message }),
+			});
+		};
+		task.requireInput = async (options) => {
+			statusSeq += 1;
+			return this.suspensions.requireInput(task, options, statusSeq);
+		};
+	}
+
 	/** Run a task's handler and send its result. */
 	private async runTask(
 		msg: AgxIncomingMessage,
@@ -841,8 +945,15 @@ export class AgxClient {
 		task: Task,
 	): Promise<void> {
 		try {
-			const output = await registered.handler(task);
-			if (registered.contract?.outputSchema) {
+			const produced = await registered.handler(task);
+			const completion = produced instanceof AgxResumeCompletion
+				? produced
+				: undefined;
+			const output = completion ? completion.result.output : produced;
+			if (
+				registered.contract?.outputSchema &&
+				(!completion || completion.result.status === "completed")
+			) {
 				const problem = validateAgxJsonPayload(
 					registered.contract.outputSchema,
 					output,
@@ -857,8 +968,16 @@ export class AgxClient {
 						status: "failed",
 						error: "invalid_output",
 					});
+					if (completion) {
+						await this.suspensions.finish(completion);
+					}
 					return;
 				}
+			}
+			if (completion) {
+				await this.sendResult(msg.from, env.taskId, completion.result);
+				await this.suspensions.finish(completion);
+				return;
 			}
 			await this.sendResult(msg.from, env.taskId, {
 				status: "completed",
@@ -899,35 +1018,29 @@ export class AgxClient {
 
 	private async sendTaskStatus(
 		to: string,
-		taskId: string,
-		seq: number,
-		message?: string,
+		env: TaskStatusEnvelope,
 	): Promise<void> {
-		const env: TaskStatusEnvelope = {
-			t: "status",
-			taskId,
-			status: "working",
-			seq,
-			...(message === undefined ? {} : { message }),
-		};
 		const text = encodeTaskEnvelope(env);
-		if ((message?.length ?? 0) > 2000 || !this.fitsWire(text)) {
+		if (
+			(env.status === "working" && (env.message?.length ?? 0) > 2000) ||
+			!this.fitsWire(text)
+		) {
 			this.log.warn?.("AGX: task status too large; dropping update", {
-				taskId,
-				seq,
+				taskId: env.taskId,
+				seq: env.seq,
 			});
 			return;
 		}
 		await this.transport
 			.publishMessage(to, {
 				text,
-				contextId: taskId,
+				contextId: env.taskId,
 				contentType: TASK_CONTENT_TYPE,
 			})
 			.catch((error) =>
 				this.log.warn?.("AGX: failed to publish task status", {
-					taskId,
-					seq,
+					taskId: env.taskId,
+					seq: env.seq,
 					error: String(error),
 				}),
 			);
@@ -957,12 +1070,36 @@ export class AgxClient {
 			});
 			return;
 		}
-		await pending.onTaskStatus?.({
-			taskId: env.taskId,
-			status: env.status,
-			seq: env.seq,
-			...(env.message === undefined ? {} : { message: env.message }),
-		});
+		if (env.status === "input-required") {
+			const problem = validateAgxJsonSchema(env.resumeSchema);
+			if (problem) {
+				this.log.warn?.("AGX: input-required schema invalid; dropping", {
+					taskId: env.taskId,
+					error: problem,
+				});
+				return;
+			}
+		}
+		const update: TaskStatusUpdate = env.status === "working"
+			? {
+				taskId: env.taskId,
+				status: env.status,
+				seq: env.seq,
+				...(env.message === undefined ? {} : { message: env.message }),
+			}
+			: {
+				taskId: env.taskId,
+				status: env.status,
+				seq: env.seq,
+				question: env.question,
+				resumeSchema: env.resumeSchema,
+				expiresAt: env.expiresAt,
+			};
+		if (env.status === "input-required") {
+			pending.inputRequired = env;
+			pending.resumeInFlight = false;
+		}
+		await pending.onTaskStatus?.(update);
 		pending.lastStatusSeq = env.seq;
 	}
 

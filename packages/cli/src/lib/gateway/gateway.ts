@@ -26,12 +26,13 @@ import { createTransport } from "../transport.js";
 import { AGX_CLI_VERSION } from "../version.js";
 import { DeliveryQueue, deliver } from "./delivery.js";
 import { messageEvent, receiptEvent, taskEvent } from "./events.js";
-import { ApiError, readJson, sendError, sendJson } from "./http.js";
+import { ApiError, isRecord, readJson, sendError, sendJson } from "./http.js";
 import { parseIdempotencyKey, TaskOperationStore } from "./idempotency.js";
 import { verifyGatewayKey } from "./keys.js";
 import { type OperationDeps, parseTaskRequest, readCard, runTaskRequest, sendMessage } from "./operations.js";
 import { Requester } from "./requester.js";
 import { KeyedSlots } from "./slots.js";
+import { FileSuspensionStore } from "./suspensions.js";
 import { TaskEventStream, TaskEventStreams } from "./task-events.js";
 import {
 	assertWebhookHost,
@@ -256,6 +257,16 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			maxBackgroundInFlight: options.maxBackgroundTasksInFlight,
 		});
 		const taskEvents = new TaskEventStreams();
+		const taskResumeIds = new Map<string, string>();
+		const rememberTaskResume = (publicId: string, agxTaskId: string) => {
+			if (taskResumeIds.size >= 1000 && !taskResumeIds.has(publicId)) {
+				const oldest = taskResumeIds.keys().next().value as string | undefined;
+				if (oldest !== undefined) {
+					taskResumeIds.delete(oldest);
+				}
+			}
+			taskResumeIds.set(publicId, agxTaskId);
+		};
 		const queue = new DeliveryQueue({
 			retryDelaysMs: options.deliveryRetryDelaysMs,
 			onFailure: (subscription, eventId, detail) =>
@@ -381,6 +392,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 		const client = new AgxClient({
 			transport,
 			seen,
+			suspensions: new FileSuspensionStore(name),
 			logger: options.logger,
 			identity: { org: profile.org ?? undefined, nip05: profile.nip05 },
 			// First run: from now. The poll still reaches back the full lookback,
@@ -589,6 +601,42 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				});
 				return;
 			}
+			const resumeRoute = /^\/v1\/tasks\/([^/]+)\/resume$/.exec(path);
+			if (method === "POST" && resumeRoute) {
+				const publicId = decodeURIComponent(resumeRoute[1]);
+				const view = taskOperations.get(bearer(req), publicId);
+				if (view === null) {
+					throw new ApiError(404, "not_found", "No background task with that ID for this credential");
+				}
+				if (view.status !== "running") {
+					throw new ApiError(409, "task_not_running", "This task already has a terminal result");
+				}
+				const agxTaskId = taskResumeIds.get(publicId);
+				if (!agxTaskId) {
+					throw new ApiError(409, "input_not_required", "This task is not waiting for input");
+				}
+				const input = await readJson(req);
+				if (!isRecord(input)) {
+					throw new ApiError(400, "invalid_request", "The resume body must be a JSON object");
+				}
+				try {
+					await deps.requester.resume(agxTaskId, input.payload);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					if (message.includes("invalid_resume_input")) {
+						throw new ApiError(422, "invalid_resume_input", message);
+					}
+					if (message.includes("expired")) {
+						throw new ApiError(410, "input_required_expired", message);
+					}
+					if (message.includes("unknown") || message.includes("not waiting") || message.includes("already published")) {
+						throw new ApiError(409, "resume_conflict", message);
+					}
+					throw new ApiError(502, "resume_failed", message);
+				}
+				sendJson(res, 202, { id: publicId, status: "running" });
+				return;
+			}
 			const eventRoute = /^\/v1\/tasks\/([^/]+)\/events$/.exec(path);
 			if (method === "GET" && eventRoute) {
 				serveTaskEvents(
@@ -603,9 +651,13 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			}
 			const task = /^\/v1\/tasks\/([^/]+)$/.exec(path);
 			if (method === "GET" && task) {
-				const output = taskOperations.get(bearer(req), decodeURIComponent(task[1]));
+				const publicId = decodeURIComponent(task[1]);
+				const output = taskOperations.get(bearer(req), publicId);
 				if (output === null) {
 					throw new ApiError(404, "not_found", "No background task with that ID for this credential");
+				}
+				if (output.status !== "running") {
+					taskResumeIds.delete(publicId);
 				}
 				sendJson(res, 200, output);
 				return;
@@ -646,11 +698,21 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 					const operation = () => runTaskRequest(deps, taskRequest);
 					if (taskRequest.background) {
 						const pendingEvents = new TaskEventStream();
+						let publicId: string | undefined;
+						let agxTaskId: string | undefined;
 						const backgroundOperation = () => runTaskRequest(
 							deps,
 							taskRequest,
 							undefined,
-							(update) => pendingEvents.push(update),
+							(update) => {
+								if (update.status === "input-required") {
+									agxTaskId = update.taskId;
+									if (publicId) {
+										rememberTaskResume(publicId, update.taskId);
+									}
+								}
+								pendingEvents.push(update);
+							},
 						);
 						const submitted = taskOperations.submit(
 							bearer(req),
@@ -660,6 +722,10 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 						);
 						if (typeof submitted.id !== "string") {
 							throw new Error("Background task store returned no public task ID");
+						}
+						publicId = submitted.id;
+						if (agxTaskId) {
+							rememberTaskResume(publicId, agxTaskId);
 						}
 						taskEvents.ensure(submitted.id, pendingEvents);
 						sendJson(res, 202, submitted);

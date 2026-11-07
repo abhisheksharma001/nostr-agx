@@ -408,7 +408,8 @@ proxy or tunnel, because the key and every task payload cross that connection.
 | `GET /v1/identity` | the agent's `npub`, `pubkey`, relays, organization and NIP-05 address |
 | `POST /v1/tasks` | `{ peer, capability, payload?, timeoutSec?, checkCard?, background? }`: request a task and wait for its result, up to an hour (default 30 s), or use `background: true` to get a task ID with `202` |
 | `GET /v1/tasks/<id>` | read a background task's status and stored result or failure, scoped to the API credential that submitted it |
-| `GET /v1/tasks/<id>/events` | stream ordered `working` updates and the stored terminal view as Server-Sent Events (SSE) |
+| `GET /v1/tasks/<id>/events` | stream ordered `working` / `input-required` updates and the stored terminal view as Server-Sent Events (SSE) |
+| `POST /v1/tasks/<id>/resume` | `{ payload }`: answer the current `input-required` question without changing the task ID |
 | `POST /v1/messages` | `{ peer, text, subject?, contextId?, autoDepth?, maxAutoDepth?, maxPerConversation?, maxPerHour? }`: send a message; an automated reply (`autoDepth` above 0) is refused past 8 deep, 20 per conversation or 60 per agent per hour, unless those limits are given |
 | `GET /v1/agents/<npub>?capability=&verifyNip05=` | read an agent's card, and whether it advertises a capability |
 | `GET` / `POST /v1/subscriptions`, `GET` / `DELETE /v1/subscriptions/<id>` | the webhooks the gateway delivers to |
@@ -496,6 +497,24 @@ replay is bounded and does not survive restart; the stored terminal view is auth
 always available without rerunning the task. Closing an SSE connection does not cancel remote work.
 Responses include `Cache-Control: no-store, no-transform` and `X-Accel-Buffering: no`; proxies must
 also be configured not to buffer SSE.
+
+### Input-required resume
+
+An `input-required` SSE event includes the public `question`, `resumeSchema`, and `expiresAt`. Answer it
+with the same API credential:
+
+```bash
+curl -X POST -H "Authorization: Bearer $AGX_GATEWAY_KEY" \
+  -H "content-type: application/json" \
+  -d '{"payload":{"approved":true}}' \
+  http://127.0.0.1:8787/v1/tasks/task_…/resume
+```
+
+The route returns `202` and keeps the same task ID. Invalid input gets `422`, an expired question gets
+`410`, and an unknown, terminal, or not-waiting task gets `404` or `409`. The public-ID-to-AGX-task
+mapping is in-memory; restarting the requester gateway does not resume an HTTP task. Responders using
+`AgxClient` can inject a durable suspension store to recover from their own restart without rerunning
+initial work. Never submit secret answers through this route.
 
 ### Subscriptions
 
@@ -804,6 +823,8 @@ on their behalf.
                                       webhooks `agx gateway` delivers to, with their signing secrets
   profiles/<name>/gateway-task-operations.json
                                       idempotent and background task operations and retained outcomes
+  profiles/<name>/gateway-task-suspensions.json
+                                      input-required tasks awaiting an original-peer answer
 ```
 
 `credentials.json` and `pending-login.json` are secrets: never paste, upload or

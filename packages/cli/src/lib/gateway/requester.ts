@@ -89,6 +89,11 @@ export class Requester {
 		}
 	}
 
+	/** Answer an input-required question on the shared requester client. */
+	async resume(taskId: string, payload: unknown): Promise<void> {
+		await this.client.resume(taskId, payload);
+	}
+
 	stop(): void {
 		this.stopped = true;
 	}

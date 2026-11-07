@@ -2,7 +2,7 @@ import type { TaskStatusUpdate } from "@nostr-agx/core";
 
 export interface TaskStreamEvent {
 	id: number;
-	event: "working" | "completed" | "failed";
+	event: "working" | "input-required" | "completed" | "failed";
 	data: Record<string, unknown>;
 }
 
@@ -20,10 +20,18 @@ export class TaskEventStream {
 		if (this.terminal) {
 			return;
 		}
-		this.append("working", {
+		this.append(update.status, {
 			status: update.status,
 			seq: update.seq,
-			...(update.message === undefined ? {} : { message: update.message }),
+			...(update.status === "working"
+				? update.message === undefined
+					? {}
+					: { message: update.message }
+				: {
+					question: update.question,
+					resumeSchema: update.resumeSchema,
+					expiresAt: update.expiresAt,
+				}),
 		});
 	}
 

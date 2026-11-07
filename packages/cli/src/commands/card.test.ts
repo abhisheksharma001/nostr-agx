@@ -1,4 +1,4 @@
-import { AgxClient } from "@nostr-agx/core";
+import { AgxClient, InMemorySeenStore } from "@nostr-agx/core";
 import {
 	type AgentCard,
 	type AgentSkill,
@@ -15,6 +15,7 @@ import {
 import WebSocket from "ws";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { updateProfile } from "../lib/config.js";
+import { FileSuspensionStore } from "../lib/gateway/suspensions.js";
 import { type RunningRelay, startRelay } from "../relay/server.js";
 import { agx, jsonDocuments, sandbox } from "../test/helpers.js";
 
@@ -303,6 +304,108 @@ describe("agx typed task validation over a real local relay", () => {
 			expect(handler).toHaveBeenCalledTimes(2);
 		} finally {
 			await Promise.all([responder.stop(), requester.stop()]);
+		}
+	}, 30_000);
+});
+
+
+describe("agx durable resume over a real local relay", () => {
+	it("restores a suspended task from disk and resumes only the resume handler", async () => {
+		const responderKeys = generateKeypair();
+		const requesterKeys = generateKeypair();
+		const seen = new InMemorySeenStore();
+		const resumeSchema = {
+			type: "object",
+			required: ["answer"],
+			properties: { answer: { type: "string" } },
+			additionalProperties: false,
+		};
+		const initial = vi.fn(async (task: {
+			requireInput?: (options: {
+				question: { kind: "text"; prompt: string };
+				resumeSchema: typeof resumeSchema;
+				state: { invoice: number };
+			}) => Promise<unknown>;
+		}) => task.requireInput?.({
+			question: { kind: "text", prompt: "Approve invoice?" },
+			resumeSchema,
+			state: { invoice: 42 },
+		}));
+		const resume = vi.fn((task: { state?: unknown }, input: unknown) => ({
+			answer: (input as { answer: string }).answer,
+			state: task.state,
+		}));
+		const firstTransport = await NostrTransport.create({
+			signer: localSigner(responderKeys.secretKey),
+			relays: [relayUrl],
+			ws: WebSocket,
+		});
+		const requesterTransport = await NostrTransport.create({
+			signer: localSigner(requesterKeys.secretKey),
+			relays: [relayUrl],
+			ws: WebSocket,
+		});
+		const first = new AgxClient({
+			transport: firstTransport,
+			seen,
+			suspensions: new FileSuspensionStore("restart"),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+		});
+		const requester = new AgxClient({ transport: requesterTransport });
+		first.handle("invoice.approve", initial, undefined, resume);
+		let second: AgxClient | undefined;
+
+		try {
+			await first.start({ pollIntervalMs: 0, advertise: false });
+			let taskId = "";
+			let questionArrived: () => void = () => undefined;
+			const question = new Promise<void>((resolve) => {
+				questionArrived = resolve;
+			});
+			const onTaskStatus = vi.fn((update: { taskId: string; status: string }) => {
+				if (update.status === "input-required") {
+					taskId = update.taskId;
+					questionArrived();
+				}
+			});
+			const pending = requester.request(
+				responderKeys.publicKey,
+				"invoice.approve",
+				{},
+				{ timeoutMs: 20_000, onTaskStatus },
+			);
+			await pumpUntil(question, [first, requester]);
+			expect(taskId).not.toBe("");
+			expect(await new FileSuspensionStore("restart").list()).toHaveLength(1);
+			await first.stop();
+
+			const secondTransport = await NostrTransport.create({
+				signer: localSigner(responderKeys.secretKey),
+				relays: [relayUrl],
+				ws: WebSocket,
+			});
+			const restartedInitial = vi.fn(() => "must not run");
+			second = new AgxClient({
+				transport: secondTransport,
+				seen,
+				suspensions: new FileSuspensionStore("restart"),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+			});
+			second.handle("invoice.approve", restartedInitial, undefined, resume);
+			await second.start({ pollIntervalMs: 0, advertise: false });
+			await requester.resume(taskId, { answer: "yes" });
+			await expect(pumpUntil(pending, [second, requester])).resolves.toEqual({
+				answer: "yes",
+				state: { invoice: 42 },
+			});
+			expect(initial).toHaveBeenCalledTimes(1);
+			expect(restartedInitial).not.toHaveBeenCalled();
+			expect(resume).toHaveBeenCalledTimes(1);
+			expect(await new FileSuspensionStore("restart").list()).toEqual([]);
+		} finally {
+			await Promise.all([first.stop(), second?.stop(), requester.stop()]);
 		}
 	}, 30_000);
 });

@@ -18,6 +18,8 @@ export * from "./id";
 export * from "./json-schema";
 export * from "./logger";
 export * from "./seen-store";
+export * from "./suspension";
+export * from "./suspension-store";
 export * from "./task";
 export * from "./transport";
 export * from "./wire";

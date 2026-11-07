@@ -40,6 +40,8 @@ import { dirname, join } from "node:path";
  *                                         with their signing secrets
  *     profiles/<name>/gateway-task-operations.json
  *                                         idempotent and background task operations and outcomes
+ *     profiles/<name>/gateway-task-suspensions.json
+ *                                         input-required tasks awaiting an original-peer answer
  */
 
 export function agxHome(): string {
@@ -95,6 +97,11 @@ export function gatewaySubscriptionsPath(profile: string): string {
 /** Idempotent task submissions and their retained outcomes. */
 export function gatewayTaskOperationsPath(profile: string): string {
 	return join(profileDir(profile), "gateway-task-operations.json");
+}
+
+/** Suspended input-required tasks awaiting an original-peer answer. */
+export function gatewayTaskSuspensionsPath(profile: string): string {
+	return join(profileDir(profile), "gateway-task-suspensions.json");
 }
 
 export function ensureDir(dir: string): void {

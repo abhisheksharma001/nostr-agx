@@ -2,9 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgxClient } from "./client";
 import { AgxPublicError, AgxTaskDeclined } from "./errors";
 import { randomId } from "./id";
+import { InMemorySeenStore } from "./seen-store";
+import { InMemorySuspensionStore } from "./suspension-store";
 import {
 	encodeTaskEnvelope,
 	parseTaskEnvelope,
+	type Task,
 	type TaskEnvelope,
 	type TaskRequestEnvelope,
 } from "./task";
@@ -500,6 +503,27 @@ describe("AgxClient task request/response", () => {
 					inputSchema: { type: "object" },
 					features: ["working"],
 				}],
+			}),
+		);
+	});
+
+	it("advertises input-required for resume-capable typed handlers", async () => {
+		const advertise = vi.fn(async () => ({ ok: true }));
+		const bob = new AgxClient({
+			transport: { ...bus.transport(BOB), advertise },
+		});
+		bob.handle("invoice.approval", () => null, {
+			description: "Approve an invoice",
+		}, () => null);
+
+		await bob.start({ pollIntervalMs: 0 });
+		expect(advertise).toHaveBeenCalledWith(
+			["invoice.approval"],
+			expect.objectContaining({
+				skills: [expect.objectContaining({
+					id: "invoice.approval",
+					features: ["working", "input-required"],
+				})],
 			}),
 		);
 	});
@@ -1587,5 +1611,371 @@ describe("AgxClient request while its publish is slow", () => {
 		await new Promise((r) => setTimeout(r, 50));
 		finishPublish();
 		await expect(pending).rejects.toThrow(/timed out/);
+	});
+});
+
+
+describe("AgxClient durable input-required resume", () => {
+	const resumeSchema = {
+		type: "object",
+		required: ["answer"],
+		properties: { answer: { type: "string" } },
+		additionalProperties: false,
+	};
+	const question = { kind: "text" as const, prompt: "What is your answer?" };
+
+	function suspendedHandler(state: unknown = { saved: true }) {
+		return vi.fn(async (task: Task) => task.requireInput?.({
+			question,
+			resumeSchema,
+			state,
+			timeoutSec: 300,
+		}));
+	}
+
+	async function pumpUntilResult<T>(
+		promise: Promise<T>,
+		alice: AgxClient,
+		bob: AgxClient,
+	): Promise<T> {
+		let settled = false;
+		const watched = promise.finally(() => {
+			settled = true;
+		});
+		watched.catch(() => undefined);
+		for (let attempt = 0; attempt < 100 && !settled; attempt += 1) {
+			await bob.pump();
+			await alice.pump();
+			await Promise.resolve();
+		}
+		if (!settled) {
+			throw new Error("task did not settle");
+		}
+		return watched;
+	}
+
+	async function pumpUntilStatus(
+		onTaskStatus: ReturnType<typeof vi.fn>,
+		seq: number,
+		alice: AgxClient,
+		bob: AgxClient,
+	): Promise<void> {
+		for (let attempt = 0; attempt < 100; attempt += 1) {
+			if (onTaskStatus.mock.calls.some(([update]) => update.seq === seq)) {
+				return;
+			}
+			await bob.pump();
+			await alice.pump();
+			await Promise.resolve();
+		}
+		throw new Error(`status ${seq} did not arrive`);
+	}
+
+	it("resumes the original task with typed input and stored state", async () => {
+		const store = new InMemorySuspensionStore();
+		const initial = suspendedHandler({ invoice: 42 });
+		const resume = vi.fn((task: Task, input: unknown) => ({
+			answer: (input as { answer: string }).answer,
+			state: task.state,
+		}));
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			suspensions: store,
+		});
+		bob.handle("approval", initial, undefined, resume);
+		const onTaskStatus = vi.fn((update: { taskId: string; status: string }) => {
+			if (update.status === "input-required") {
+				void alice.resume(update.taskId, { answer: "yes" });
+			}
+		});
+		const pending = alice.request(BOB, "approval", {}, { onTaskStatus });
+		const taskId = outboundRequest().taskId;
+
+		await bob.pump();
+		await alice.pump();
+		expect(onTaskStatus).toHaveBeenCalledWith(expect.objectContaining({
+			taskId,
+			status: "input-required",
+			seq: 1,
+			question,
+		}));
+		await bob.pump();
+		await alice.pump();
+
+		expect(await pending).toEqual({ answer: "yes", state: { invoice: 42 } });
+		expect(initial).toHaveBeenCalledTimes(1);
+		expect(resume).toHaveBeenCalledTimes(1);
+		expect(await store.list()).toEqual([]);
+	});
+
+	it("supports repeated questions with increasing sequence numbers", async () => {
+		const store = new InMemorySuspensionStore();
+		const initial = suspendedHandler();
+		const resume = vi.fn(async (task: Task, input: unknown) => {
+			const answer = (input as { answer: string }).answer;
+			if (answer === "first") {
+				return task.requireInput?.({
+					question: { kind: "confirmation", prompt: "Confirm second answer" },
+					resumeSchema,
+					state: { first: answer },
+				});
+			}
+			return { answer, state: task.state };
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			suspensions: store,
+		});
+		bob.handle("approval", initial, undefined, resume);
+		const onTaskStatus = vi.fn();
+		const pending = alice.request(BOB, "approval", {}, { onTaskStatus });
+		const taskId = outboundRequest().taskId;
+		await bob.pump();
+		await alice.pump();
+
+		await alice.resume(taskId, { answer: "first" });
+		await pumpUntilStatus(onTaskStatus, 2, alice, bob);
+		expect(onTaskStatus).toHaveBeenLastCalledWith(expect.objectContaining({
+			status: "input-required",
+			seq: 2,
+			question: { kind: "confirmation", prompt: "Confirm second answer" },
+		}));
+		await alice.resume(taskId, { answer: "second" });
+
+		expect(await pumpUntilResult(pending, alice, bob)).toEqual({ answer: "second", state: { first: "first" } });
+		expect(resume).toHaveBeenCalledTimes(2);
+		expect(await store.list()).toEqual([]);
+	});
+
+	it("drops a wrong-peer resume without invoking the handler", async () => {
+		const store = new InMemorySuspensionStore();
+		const initial = suspendedHandler();
+		const resume = vi.fn(() => "done");
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			suspensions: store,
+		});
+		bob.handle("approval", initial, undefined, resume);
+		const pending = alice.request(BOB, "approval", {});
+		const taskId = outboundRequest().taskId;
+		await bob.pump();
+		await alice.pump();
+
+		pushTaskEnvelope(BOB, "mallory", {
+			t: "resume",
+			taskId,
+			seq: 1,
+			payload: { answer: "forged" },
+		});
+		await bob.pump();
+		expect(resume).not.toHaveBeenCalled();
+		expect(bus.inbox.get("mallory") ?? []).toHaveLength(0);
+
+		await alice.resume(taskId, { answer: "yes" });
+		await bob.pump();
+		await alice.pump();
+		expect(await pending).toBe("done");
+	});
+
+	it("rejects invalid input locally and terminates a direct invalid resume", async () => {
+		const store = new InMemorySuspensionStore();
+		const initial = suspendedHandler();
+		const resume = vi.fn(() => "done");
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			suspensions: store,
+		});
+		bob.handle("approval", initial, undefined, resume);
+		const pending = alice.request(BOB, "approval", {});
+		const taskId = outboundRequest().taskId;
+		await bob.pump();
+		await alice.pump();
+
+		await expect(alice.resume(taskId, { answer: 1 })).rejects.toThrow(
+			/invalid_resume_input/,
+		);
+		expect(resume).not.toHaveBeenCalled();
+		pushTaskEnvelope(BOB, ALICE, {
+			t: "resume",
+			taskId,
+			seq: 1,
+			payload: { answer: 1 },
+		});
+		await bob.pump();
+		await alice.pump();
+		await expect(pending).rejects.toThrow("invalid_resume_input");
+		expect(resume).not.toHaveBeenCalled();
+		expect(await store.list()).toEqual([]);
+	});
+
+	it("prevents duplicate answers and does not rerun after a duplicate event", async () => {
+		const store = new InMemorySuspensionStore();
+		const initial = suspendedHandler();
+		const resume = vi.fn(() => "done");
+		const onMessage = vi.fn();
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			suspensions: store,
+			onMessage,
+		});
+		bob.handle("approval", initial, undefined, resume);
+		const pending = alice.request(BOB, "approval", {});
+		const taskId = outboundRequest().taskId;
+		await bob.pump();
+		await alice.pump();
+
+		await alice.resume(taskId, { answer: "yes" });
+		await expect(alice.resume(taskId, { answer: "yes" })).rejects.toThrow(
+			/already published/,
+		);
+		await bob.pump();
+		await alice.pump();
+		expect(await pending).toBe("done");
+		pushTaskEnvelope(BOB, ALICE, {
+			t: "resume",
+			taskId,
+			seq: 1,
+			payload: { answer: "yes" },
+		});
+		await bob.pump();
+		expect(resume).toHaveBeenCalledTimes(1);
+		expect(onMessage).toHaveBeenCalledTimes(1);
+	});
+
+	it("expires a suspended question without invoking the resume handler", async () => {
+		vi.useFakeTimers();
+		try {
+			const store = new InMemorySuspensionStore();
+			const initial = vi.fn(async (task: Task) => task.requireInput?.({
+				question,
+				resumeSchema,
+				timeoutSec: 1,
+			}));
+			const resume = vi.fn(() => "done");
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+				suspensions: store,
+			});
+			bob.handle("approval", initial, undefined, resume);
+			const pending = alice.request(BOB, "approval", {}, { timeoutMs: 5_000 });
+			await bob.pump();
+			await alice.pump();
+			const rejection = expect(pending).rejects.toThrow("input_required_expired");
+			await vi.advanceTimersByTimeAsync(1_000);
+			await alice.pump();
+			await rejection;
+			expect(resume).not.toHaveBeenCalled();
+			expect(await store.list()).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("resumes from a shared store after client restart without rerunning initial work", async () => {
+		const store = new InMemorySuspensionStore();
+		const seen = new InMemorySeenStore();
+		const initial = suspendedHandler({ durable: true });
+		const resume = vi.fn((task: Task) => ({ state: task.state }));
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const firstBob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			seen,
+			suspensions: store,
+		});
+		firstBob.handle("approval", initial, undefined, resume);
+		const pending = alice.request(BOB, "approval", {});
+		const taskId = outboundRequest().taskId;
+		await firstBob.pump();
+		await alice.pump();
+		await firstBob.stop();
+
+		const restartedInitial = vi.fn(() => "must not run");
+		const secondBob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			seen,
+			suspensions: store,
+		});
+		secondBob.handle("approval", restartedInitial, undefined, resume);
+		await secondBob.start({ pollIntervalMs: 0, advertise: false });
+		await alice.resume(taskId, { answer: "yes" });
+		await secondBob.pump();
+		await alice.pump();
+
+		expect(await pending).toEqual({ state: { durable: true } });
+		expect(initial).toHaveBeenCalledTimes(1);
+		expect(restartedInitial).not.toHaveBeenCalled();
+		expect(resume).toHaveBeenCalledTimes(1);
+		expect(await store.list()).toEqual([]);
+	});
+
+	it("marks an interrupted resume failed instead of executing it again", async () => {
+		const store = new InMemorySuspensionStore();
+		const initial = suspendedHandler();
+		const resume = vi.fn(() => "done");
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const firstBob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			suspensions: store,
+		});
+		firstBob.handle("approval", initial, undefined, resume);
+		const pending = alice.request(BOB, "approval", {});
+		await firstBob.pump();
+		await alice.pump();
+		await firstBob.stop();
+		const [record] = await store.list();
+		await store.put({ ...record, resuming: true });
+
+		const secondBob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			suspensions: store,
+		});
+		secondBob.handle("approval", vi.fn(), undefined, resume);
+		await secondBob.start({ pollIntervalMs: 0, advertise: false });
+		await alice.pump();
+		await expect(pending).rejects.toThrow("resume_interrupted");
+		expect(resume).not.toHaveBeenCalled();
+		expect(await store.list()).toEqual([]);
+	});
+
+	it("routes unknown resume traffic to onMessage and rejects unknown local tasks", async () => {
+		const onMessage = vi.fn();
+		const bob = new AgxClient({ transport: bus.transport(BOB), onMessage });
+		pushTaskEnvelope(BOB, ALICE, {
+			t: "resume",
+			taskId: "unknown",
+			seq: 1,
+			payload: {},
+		});
+		await bob.pump();
+		expect(onMessage).toHaveBeenCalledTimes(1);
+		expect(bus.inbox.get(ALICE) ?? []).toHaveLength(0);
+
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		await expect(alice.resume("unknown", {})).rejects.toThrow(/unknown/);
 	});
 });
