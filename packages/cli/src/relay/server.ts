@@ -1,25 +1,13 @@
-import {
-	MessageType,
-	type Event,
-	type Filter,
-	type BeforeHandleEventResult,
-	type BeforeHandleEventPlugin,
-	createOutgoingNoticeMessage
-} from "@nostr-relay/common";
-import { NostrRelay } from "@nostr-relay/core";
-import { Validator } from "@nostr-relay/validator";
 import { createServer, type Server } from "node:http";
 import {
 	createServer as createTlsServer,
 	type Server as TlsServer,
 } from "node:https";
 import type { AddressInfo } from "node:net";
-import { WebSocketServer } from "ws";
-import { isExpired } from "./utils";
-import { InMemoryEventRepository } from "./in-memory-repository";
+import WebSocket, { WebSocketServer } from "ws";
 
 /**
- * An in-process Nostr relay for local development.
+ * A minimal in-process NIP-01 relay for local development.
  *
  * Why not a real relay in Docker: a client that dials `wss://` only needs TLS,
  * and neither nostr-rs-relay nor strfry terminates it, so a real relay drags in a
@@ -29,17 +17,87 @@ import { InMemoryEventRepository } from "./in-memory-repository";
  * WebSocket implementation that downgrades `wss://localhost` (localhost only, so
  * it cannot mask a scheme bug against a real host).
  *
- * Protocol handling and live subscriptions are provided by `@nostr-relay/core`.
- * Events remain in memory. NIP-40 expiration is enforced locally because the
- * relay packages do not apply that policy.
+ * Implements only what `@nostr-agx/nostr`'s relay pool uses: EVENT publish with an OK
+ * reply, REQ with filters + EOSE and live matching events, CLOSE, and NIP-40
+ * (expired events are not served). It is a permissive fake: no kind allow-list,
+ * no NIP-13 proof-of-work or expiration-required check — those belong to a
+ * production relay's write policy. Notably it does NOT implement
+ * replaceable-event semantics for kind 11337, nor does it apply kind-5
+ * deletions — whether a given relay honours a deletion is not ours to decide,
+ * which is exactly why a de-list is reported as "requested".
  */
+
+export interface RelayEvent {
+	id: string;
+	pubkey: string;
+	created_at: number;
+	kind: number;
+	tags: string[][];
+	content: string;
+	sig: string;
+}
+
+interface Filter {
+	ids?: string[];
+	kinds?: number[];
+	authors?: string[];
+	since?: number;
+	until?: number;
+	limit?: number;
+	[tagFilter: string]: unknown;
+}
+
+/** NIP-40: a relay must not serve an event past its `expiration`. Every AGX
+ * gift wrap carries one, so without this a local run would keep delivering
+ * what production has already purged. */
+function isExpired(ev: RelayEvent): boolean {
+	const tag = ev.tags.find((t) => t[0] === "expiration");
+	const at = tag ? Number(tag[1]) : Number.NaN;
+	return Number.isFinite(at) && at <= Math.floor(Date.now() / 1000);
+}
+
+function matches(filter: Filter, ev: RelayEvent): boolean {
+	if (isExpired(ev)) {
+		return false;
+	}
+	if (filter.ids && !filter.ids.includes(ev.id)) {
+		return false;
+	}
+	if (filter.kinds && !filter.kinds.includes(ev.kind)) {
+		return false;
+	}
+	if (filter.authors && !filter.authors.includes(ev.pubkey)) {
+		return false;
+	}
+	if (typeof filter.since === "number" && ev.created_at < filter.since) {
+		return false;
+	}
+	if (typeof filter.until === "number" && ev.created_at > filter.until) {
+		return false;
+	}
+	// Tag filters (`#p`, `#e`, …) — the exchange polls its inbox by `#p`, so this
+	// is not optional decoration.
+	for (const [key, value] of Object.entries(filter)) {
+		if (!key.startsWith("#") || !Array.isArray(value)) {
+			continue;
+		}
+		const tagName = key.slice(1);
+		const hit = ev.tags.some(
+			(t) => t[0] === tagName && (value as string[]).includes(t[1] ?? ""),
+		);
+		if (!hit) {
+			return false;
+		}
+	}
+	return true;
+}
 
 export interface RelayOptions {
 	port?: number;
 	/** Also serve `wss://` on `tlsPort` using this key pair. */
 	tls?: { cert: string; key: string; port: number };
 	/** Called for every accepted event — powers `agx relay --verbose`. */
-	onEvent?: (event: Event) => void;
+	onEvent?: (event: RelayEvent) => void;
 	onRequest?: (filters: Filter[], matched: number) => void;
 }
 
@@ -49,57 +107,99 @@ export interface RunningRelay {
 	tlsPort: number | null;
 	/** Addresses actually bound (127.0.0.1 always; ::1 when available). */
 	addresses: string[];
-	events: () => Event[];
-	byAuthor: (pubkey: string, kind: number) => Event[];
+	events: () => RelayEvent[];
+	byAuthor: (pubkey: string, kind: number) => RelayEvent[];
 	clear: () => void;
 	close: () => Promise<void>;
 }
 
+interface RelaySubscription {
+	socket: WebSocket;
+	id: string;
+	filters: Filter[];
+}
+
 function attach(
 	server: Server | TlsServer,
-	relay: NostrRelay,
-	validator: Validator,
+	stored: RelayEvent[],
+	subscriptions: Set<RelaySubscription>,
 	options: RelayOptions,
 ): WebSocketServer {
 	const wss = new WebSocketServer({ server });
 	wss.on("connection", (socket) => {
-		relay.handleConnection(socket);
-		socket.on("close", () => relay.handleDisconnect(socket));
+		const connectionSubscriptions = new Map<string, RelaySubscription>();
+		socket.on("close", () => {
+			for (const subscription of connectionSubscriptions.values()) {
+				subscriptions.delete(subscription);
+			}
+			connectionSubscriptions.clear();
+		});
 		socket.on("message", (raw) => {
-			void (async () => {
-				let message;
-				try {
-					message = await validator.validateIncomingMessage(raw);
-				} catch (error) {
-					const reason =
-						error instanceof Error ? error.message : "invalid message";
-					socket.send(JSON.stringify(createOutgoingNoticeMessage(reason)));
-					return;
-				}
+			let msg: unknown;
+			try {
+				msg = JSON.parse(raw.toString());
+			} catch {
+				return;
+			}
+			if (!Array.isArray(msg)) {
+				return;
+			}
+			const [verb] = msg;
 
-				try {
-					const result = await relay.handleMessage(socket, message);
+			if (verb === "EVENT") {
+				const ev = msg[1] as RelayEvent;
+				stored.unshift(ev);
+				socket.send(JSON.stringify(["OK", ev.id, true, ""]));
+				options.onEvent?.(ev);
+				for (const subscription of subscriptions) {
 					if (
-						message[0] === MessageType.EVENT &&
-						result?.messageType === MessageType.EVENT &&
-						result.success
+						subscription.socket.readyState === WebSocket.OPEN &&
+						subscription.filters.some((filter) => matches(filter, ev))
 					) {
-						options.onEvent?.(message[1]);
-					} else if (
-						message[0] === MessageType.REQ &&
-						result?.messageType === MessageType.REQ
-					) {
-						options.onRequest?.(
-							message.slice(2) as Filter[],
-							result.events.length,
+						subscription.socket.send(
+							JSON.stringify(["EVENT", subscription.id, ev]),
 						);
 					}
-				} catch (error) {
-					const reason =
-						error instanceof Error ? error.message : "internal relay error";
-					socket.send(JSON.stringify(createOutgoingNoticeMessage(reason)));
 				}
-			})();
+				return;
+			}
+
+			if (verb === "REQ") {
+				const subId = msg[1] as string;
+				const filters = msg.slice(2) as Filter[];
+				const previous = connectionSubscriptions.get(subId);
+				if (previous) {
+					subscriptions.delete(previous);
+				}
+				const subscription = { socket, id: subId, filters };
+				connectionSubscriptions.set(subId, subscription);
+				subscriptions.add(subscription);
+				let matched = 0;
+				for (const filter of filters) {
+					const limit = filter.limit ?? 500;
+					const hits = stored
+						.filter((ev) => matches(filter, ev))
+						.sort((a, b) => b.created_at - a.created_at)
+						.slice(0, limit);
+					matched += hits.length;
+					for (const ev of hits) {
+						socket.send(JSON.stringify(["EVENT", subId, ev]));
+					}
+				}
+				socket.send(JSON.stringify(["EOSE", subId]));
+				options.onRequest?.(filters, matched);
+				return;
+			}
+
+			if (verb === "CLOSE") {
+				const subId = msg[1] as string;
+				const subscription = connectionSubscriptions.get(subId);
+				if (subscription) {
+					subscriptions.delete(subscription);
+					connectionSubscriptions.delete(subId);
+				}
+				socket.send(JSON.stringify(["CLOSED", subId, ""]));
+			}
 		});
 	});
 	return wss;
@@ -119,14 +219,14 @@ async function bindRelay(
 	server: Server | TlsServer,
 	port: number,
 	host: string,
-	relay: NostrRelay,
-	validator: Validator,
+	stored: RelayEvent[],
+	subscriptions: Set<RelaySubscription>,
 	options: RelayOptions,
 ): Promise<WebSocketServer | null> {
 	if (!(await listen(server, port, host))) {
 		return null;
 	}
-	return attach(server, relay, validator, options);
+	return attach(server, stored, subscriptions, options);
 }
 
 function listen(
@@ -147,19 +247,6 @@ function listen(
 	});
 }
 
-/** A plugin that blocks expired events from being handled. */
-class ExpirationPlugin implements BeforeHandleEventPlugin {
-	beforeHandleEvent(event: Event): Promise<BeforeHandleEventResult> | BeforeHandleEventResult {
-		if (isExpired(event)) {
-			return {
-				canHandle: false,
-				message: "blocked: event expiration has passed",
-			};
-		}
-		return { canHandle: true };
-	}
-}
-
 /**
  * Start the relay on both loopback families.
  *
@@ -172,10 +259,8 @@ class ExpirationPlugin implements BeforeHandleEventPlugin {
 export async function startRelay(
 	options: RelayOptions = {},
 ): Promise<RunningRelay> {
-	const repository = new InMemoryEventRepository();
-	const relay = new NostrRelay(repository);
-	relay.register(new ExpirationPlugin());
-	const validator = new Validator();
+	const stored: RelayEvent[] = [];
+	const subscriptions = new Set<RelaySubscription>();
 	const requested = options.port ?? 7447;
 	const addresses: string[] = [];
 
@@ -184,8 +269,8 @@ export async function startRelay(
 		v4,
 		requested,
 		"127.0.0.1",
-		relay,
-		validator,
+		stored,
+		subscriptions,
 		options,
 	);
 	if (!wssV4) {
@@ -197,7 +282,7 @@ export async function startRelay(
 	addresses.push(`127.0.0.1:${port}`);
 
 	const v6 = createServer();
-	const wssV6 = await bindRelay(v6, port, "::1", relay, validator, options);
+	const wssV6 = await bindRelay(v6, port, "::1", stored, subscriptions, options);
 	if (wssV6) {
 		addresses.push(`[::1]:${port}`);
 	}
@@ -219,8 +304,8 @@ export async function startRelay(
 			tlsV4,
 			options.tls.port,
 			"127.0.0.1",
-			relay,
-			validator,
+			stored,
+			subscriptions,
 			options,
 		);
 		if (!tlsWss) {
@@ -244,8 +329,8 @@ export async function startRelay(
 			tlsV6,
 			tlsPort,
 			"::1",
-			relay,
-			validator,
+			stored,
+			subscriptions,
 			options,
 		);
 		if (tlsWssV6) {
@@ -257,13 +342,13 @@ export async function startRelay(
 		port,
 		tlsPort,
 		addresses,
-		events: () => [...repository.stored],
+		events: () => [...stored],
 		byAuthor: (pubkey, kind) =>
-			repository.stored
+			stored
 				.filter((e) => e.pubkey === pubkey && e.kind === kind)
 				.sort((a, b) => b.created_at - a.created_at),
 		clear: () => {
-			repository.stored.length = 0;
+			stored.length = 0;
 		},
 		close: async () => {
 			// A null WebSocketServer is a listener whose bind failed — nothing to shut.
@@ -287,7 +372,6 @@ export async function startRelay(
 				shut(tlsWss, tlsV4),
 				shut(tlsWssV6, tlsV6),
 			]);
-			await relay.destroy();
 		},
 	};
 }
