@@ -425,11 +425,21 @@ For one API credential, the same key and canonically identical JSON body share o
 request and return the same stored outcome. Object-key order does not matter. A key reused with a
 different body gets `409 idempotency_key_reused`; another credential has an independent key scope.
 
-Outcomes are kept for up to 24 hours, with at most 100 retained operations per API credential and
-1,000 per profile. At either cap, the gateway evicts the oldest settled outcome. Reusing an evicted
-key starts new work, and an evicted public ID returns `404`. If every operation at the cap is still
-running, a new submission gets `503 idempotency_store_full`. The complete operation store is also capped at
-16 MiB, with the same oldest-settled eviction policy.
+Outcomes are kept for up to 24 hours. Operations that carry an idempotency key (every keyed
+synchronous request and every keyed background task) have at most 100 retained per API credential
+and 1,000 per profile. Background tasks submitted without a key keep their results in a separate
+pool with the same two caps, so a burst of unkeyed tasks never evicts or blocks keyed operations
+through those caps. When a credential hits its own cap, it gives up its own oldest settled outcome.
+When the profile cap is reached, the credential holding the most outcomes in that pool gives up its
+oldest settled one. Reusing an evicted key starts new work, and an evicted public ID returns `404`.
+If every operation at a cap is still running, a new submission gets `503 idempotency_store_full`.
+
+The complete operation store is also capped at 16 MiB, shared by every outcome. When it is over the
+cap, the gateway evicts the oldest settled outcome of the API credential that stores the most bytes,
+whichever credential just finished a task. One credential's large results therefore push out its
+own older outcomes first, keyed or not. Another credential can lose outcomes through either profile
+limit only when it is the one holding the most bytes (or, for the 1,000-outcome cap, the most
+outcomes) among credentials that have a settled outcome to give up.
 
 At most 256 keyed synchronous operations and 64 background operations run at once, including
 operations whose callers disconnected. Further distinct submissions get `503 busy`; a retry of a
