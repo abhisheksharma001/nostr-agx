@@ -105,9 +105,17 @@ function liveTransport(id: string) {
 			...base,
 			onMessage(handler) {
 				messageHandlers.push(handler);
+				return () => {
+					const index = messageHandlers.indexOf(handler);
+					if (index >= 0) messageHandlers.splice(index, 1);
+				};
 			},
 			onReceipt(handler) {
 				receiptHandlers.push(handler);
+				return () => {
+					const index = receiptHandlers.indexOf(handler);
+					if (index >= 0) receiptHandlers.splice(index, 1);
+				};
 			},
 		} satisfies AgxTransport,
 		async deliverMessage(msg: AgxIncomingMessage) {
@@ -115,6 +123,12 @@ function liveTransport(id: string) {
 		},
 		async deliverReceipt(receipt: AgxIncomingReceipt) {
 			await Promise.all(receiptHandlers.map((handler) => handler(receipt)));
+		},
+		listenerCounts() {
+			return {
+				messages: messageHandlers.length,
+				receipts: receiptHandlers.length,
+			};
 		},
 	};
 }
@@ -125,6 +139,57 @@ const BOB = "bob";
 
 beforeEach(() => {
 	bus = new MemoryBus();
+});
+
+describe("AgxClient listener lifecycle", () => {
+	it("registers listeners on start and removes only its own listeners on stop", async () => {
+		const live = liveTransport(BOB);
+		const externalMessage = vi.fn();
+		const removeExternalMessage = live.transport.onMessage!(externalMessage);
+		const onMessage = vi.fn();
+		const client = new AgxClient({ transport: live.transport, onMessage });
+
+		expect(live.listenerCounts()).toEqual({ messages: 1, receipts: 0 });
+		await live.deliverMessage({
+			from: ALICE,
+			eventId: "before-start",
+			createdAt: 1,
+			text: "before start",
+			contextId: "ctx",
+			messageId: "before-start",
+			subject: null,
+			autoDepth: null,
+			contentType: "application/a2a+json",
+		});
+		expect(onMessage).not.toHaveBeenCalled();
+		expect(externalMessage).toHaveBeenCalledOnce();
+
+		await client.start({ pollIntervalMs: 0, advertise: false });
+		expect(live.listenerCounts()).toEqual({ messages: 2, receipts: 1 });
+		await client.stop();
+		expect(live.listenerCounts()).toEqual({ messages: 1, receipts: 0 });
+
+		await client.start({ pollIntervalMs: 0, advertise: false });
+		expect(live.listenerCounts()).toEqual({ messages: 2, receipts: 1 });
+		await live.deliverMessage({
+			from: ALICE,
+			eventId: "after-restart",
+			createdAt: 1,
+			text: "after restart",
+			contextId: "ctx",
+			messageId: "after-restart",
+			subject: null,
+			autoDepth: null,
+			contentType: "application/a2a+json",
+		});
+		expect(onMessage).toHaveBeenCalledTimes(1);
+		expect(externalMessage).toHaveBeenCalledTimes(2);
+		await client.stop();
+		if (typeof removeExternalMessage === "function") {
+			removeExternalMessage();
+		}
+		expect(live.listenerCounts()).toEqual({ messages: 0, receipts: 0 });
+	});
 });
 
 describe("AgxClient task request/response", () => {
@@ -552,6 +617,7 @@ describe("AgxClient task request/response", () => {
 			await dispatchGate;
 		});
 		const bob = new AgxClient({ transport, onMessage });
+		await bob.start({ pollIntervalMs: 0, advertise: false });
 		bus.pushMessage(BOB, {
 			from: ALICE,
 			text: "live and polled",
@@ -586,6 +652,7 @@ describe("AgxClient streamRequest", () => {
 	it("reports delivery and completion while an asynchronous handler is processing", async () => {
 		const aliceLive = liveTransport(ALICE);
 		const alice = new AgxClient({ transport: aliceLive.transport });
+		await alice.start({ pollIntervalMs: 0, advertise: false });
 		const bob = new AgxClient({
 			transport: bus.transport(BOB),
 			authorize: "accept-all",
@@ -753,6 +820,7 @@ describe("AgxClient streamRequest", () => {
 			},
 		};
 		const alice = new AgxClient({ transport });
+		await alice.start({ pollIntervalMs: 0, advertise: false });
 		const stream = await alice.streamRequest(BOB, "early", {}, {
 			timeoutMs: 0,
 		});
@@ -772,6 +840,7 @@ describe("AgxClient streamRequest", () => {
 	it("reports failed task status and the peer's error", async () => {
 		const aliceLive = liveTransport(ALICE);
 		const alice = new AgxClient({ transport: aliceLive.transport });
+		await alice.start({ pollIntervalMs: 0, advertise: false });
 		const stream = await alice.streamRequest(BOB, "fails", {}, {
 			timeoutMs: 0,
 		});
@@ -811,6 +880,7 @@ describe("AgxClient streamRequest", () => {
 	it("emits TaskNotFoundError for a message that is not a task result", async () => {
 		const aliceLive = liveTransport(ALICE);
 		const alice = new AgxClient({ transport: aliceLive.transport });
+		await alice.start({ pollIntervalMs: 0, advertise: false });
 		const stream = await alice.streamRequest(BOB, "unknown", {}, {
 			timeoutMs: 0,
 		});

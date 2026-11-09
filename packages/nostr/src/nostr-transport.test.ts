@@ -84,6 +84,7 @@ describe("transport lifecycle", () => {
 		const closeFirstRelay = vi.fn();
 		const closeSecondSubscription = vi.fn();
 		const closeSecondRelay = vi.fn();
+		const externalHandler = vi.fn();
 		listenEvents
 			.mockResolvedValueOnce([
 				{
@@ -99,15 +100,28 @@ describe("transport lifecycle", () => {
 			]);
 
 		const instance = await transport();
+		instance.onMessage(externalHandler);
 		expect(listenEvents).not.toHaveBeenCalled();
 
 		await instance.start();
 		expect(closeFirstSubscription).not.toHaveBeenCalled();
 		await instance.start();
-		expect(listenEvents).toHaveBeenCalledTimes(2);
+		expect(listenEvents).toHaveBeenCalledOnce();
 
+		expect(closeFirstSubscription).not.toHaveBeenCalled();
+		expect(closeFirstRelay).not.toHaveBeenCalled();
+
+		await instance.stop();
 		expect(closeFirstSubscription).toHaveBeenCalledOnce();
 		expect(closeFirstRelay).toHaveBeenCalledOnce();
+
+		await instance.start();
+		expect(listenEvents).toHaveBeenCalledTimes(2);
+		const onEvent = listenEvents.mock.calls[1]?.[3] as
+			| ((data: never) => void)
+			| undefined;
+		onEvent?.({} as never);
+		expect(externalHandler).toHaveBeenCalledOnce();
 
 		await instance.stop();
 		expect(closeSecondSubscription).toHaveBeenCalledOnce();

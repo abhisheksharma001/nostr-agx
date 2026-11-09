@@ -5,6 +5,9 @@ import type {
 	ReceiptStatus,
 } from "./wire";
 
+/** Removes one listener registered with an {@link AgxTransport} listener hook. */
+export type Unsubscribe = () => void;
+
 /**
  * The transport seam. A binding (e.g. `@nostr-agx/nostr`) implements confidential,
  * authenticated delivery between agent identities; `@nostr-agx/core` layers task
@@ -142,9 +145,17 @@ export interface AgxTransport {
 	start?(): Promise<void>;
 	stop?(): Promise<void>;
 
-	/** Optional messages hooks for listening subscriptions. */
-	onMessage?(handler: (msg: AgxIncomingMessage) => void | Promise<void>): void | Promise<void>;
-	onReceipt?(handler: (receipt: AgxIncomingReceipt) => void | Promise<void>): void | Promise<void>;
+	/**
+	 * Optional live-listener hooks. The returned function unsubscribes only the
+	 * handler passed to that call. It may be returned asynchronously by a binding
+	 * whose listener registration is asynchronous.
+	 */
+	onMessage?(
+		handler: (msg: AgxIncomingMessage) => void | Promise<void>,
+	): void | Unsubscribe | Promise<void | Unsubscribe>;
+	onReceipt?(
+		handler: (receipt: AgxIncomingReceipt) => void | Promise<void>,
+	): void | Unsubscribe | Promise<void | Unsubscribe>;
 }
 
 export interface AgxIncomingMessage extends ParsedExchangeMessage {

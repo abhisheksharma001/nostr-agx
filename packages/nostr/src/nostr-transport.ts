@@ -6,6 +6,7 @@ import {
 	type AgxResolvedPeer,
 	type AgxTransport,
 	type ExchangeEvidence,
+	type Unsubscribe,
 	exchangeEvidenceProblem,
 	MAX_BODY,
 	MAX_EVIDENCE_FIELDS,
@@ -132,6 +133,8 @@ export class NostrTransport implements AgxTransport {
 	private onMessageHandlers = new Set<(msg: AgxIncomingMessage) => void | Promise<void>>();
 	private onReceiptHandlers = new Set<(receipt: AgxIncomingReceipt) => void | Promise<void>>();
 	private subscriptions: Subscription[] = [];
+	private started = false;
+	private startPromise?: Promise<void>;
 
 	/** Resolves the signer's public key once, up front, so `whoami()` stays
 	 * synchronous (the `AgxTransport` contract) even for a remote signer. */
@@ -798,7 +801,24 @@ export class NostrTransport implements AgxTransport {
 	}
 
 	async start(): Promise<void> {
-		await this.listenMessages()
+		if (this.started) {
+			return;
+		}
+		if (this.startPromise) {
+			await this.startPromise;
+			return;
+		}
+
+		const startPromise = this.listenMessages();
+		this.startPromise = startPromise;
+		try {
+			await startPromise;
+			this.started = true;
+		} finally {
+			if (this.startPromise === startPromise) {
+				this.startPromise = undefined;
+			}
+		}
 	}
 
 	private async listenMessages(): Promise<void> {
@@ -824,18 +844,41 @@ export class NostrTransport implements AgxTransport {
 	}
 
 	async stop(): Promise<void> {
+		const startPromise = this.startPromise;
+		let startFailed = false;
+		let startError: unknown;
+		if (startPromise) {
+			try {
+				await startPromise;
+			} catch (error) {
+				startFailed = true;
+				startError = error;
+			}
+		}
+		this.started = false;
 		const subscriptions = this.subscriptions;
 		this.subscriptions = [];
 		this.closeSubscriptions(subscriptions);
-		this.onMessageHandlers.clear();
-		this.onReceiptHandlers.clear();
+		if (startFailed) {
+			throw startError;
+		}
 	}
 
-	onMessage(handler: (msg: AgxIncomingMessage) => void | Promise<void>): void {
+	onMessage(
+		handler: (msg: AgxIncomingMessage) => void | Promise<void>,
+	): Unsubscribe {
 		this.onMessageHandlers.add(handler);
+		return () => {
+			this.onMessageHandlers.delete(handler);
+		};
 	}
 
-	onReceipt(handler: (receipt: AgxIncomingReceipt) => void | Promise<void>): void {
+	onReceipt(
+		handler: (receipt: AgxIncomingReceipt) => void | Promise<void>,
+	): Unsubscribe {
 		this.onReceiptHandlers.add(handler);
+		return () => {
+			this.onReceiptHandlers.delete(handler);
+		};
 	}
 }

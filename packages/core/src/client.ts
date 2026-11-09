@@ -16,6 +16,7 @@ import type {
 	AgxIncomingMessage,
 	AgxIncomingReceipt,
 	AgxTransport,
+	Unsubscribe,
 } from "./transport";
 import {
 	DEFAULT_CONTENT_TYPE,
@@ -179,11 +180,17 @@ export class AgxClient {
 	private readonly runningTasks = new Set<Promise<void>>();
 	private readonly queuedTaskRuns: Array<() => void> = [];
 	private activeTaskCount = 0;
+	private readonly receiptListeners = new Set<
+		(receipt: AgxIncomingReceipt) => void
+	>();
 	private readonly handlers = new Map<string, TaskHandler>();
 	private readonly pending = new Map<string, Pending>();
 	private readonly pendingTaskInputs = new Map<string, PendingTaskInput>();
 	private cursor: number;
 	private pollTimer?: ReturnType<typeof setTimeout>;
+	private started = false;
+	private startPromise?: Promise<void>;
+	private listenerUnsubscribers: Unsubscribe[] = [];
 	/** True while a pump() is in flight — prevents overlapping pumps from
 	 * double-running a handler (the seen-add happens only after dispatch). */
 	private pumping = false;
@@ -211,7 +218,6 @@ export class AgxClient {
 		this.maxConcurrentTasks =
 			Number.isFinite(concurrent) && concurrent > 1 ? concurrent : 1;
 		this.cursor = opts.startCursor ?? 0;
-		this.startMessageListener()
 	}
 
 	/** This agent's identity (from the transport). */
@@ -284,23 +290,26 @@ export class AgxClient {
 	): Promise<StreamResponse<Output>> {
 		const taskId = randomId();
 		const stream = new StreamResponse<Output>(
-			this.transport,
 			taskId,
+			(listener) => {
+				this.receiptListeners.add(listener);
+				return () => this.receiptListeners.delete(listener);
+			},
 			(inputRequestId, input) =>
 				this.sendTaskInput(peer, taskId, inputRequestId, input),
 			this.log,
 		);
-		await this.sendRequest<Output>(
-			peer,
-			capability,
-			payload,
-			{
+		try {
+			await this.sendRequest<Output>(peer, capability, payload, {
 				...opts,
 				taskId,
 				onUpdate: (update) => stream.handleUpdate(update),
 				onError: (error) => stream.handleError(error),
-			},
-		);
+			});
+		} catch (error) {
+			stream.handleError(error instanceof Error ? error : new Error(String(error)));
+			throw error;
+		}
 
 		return stream;
 	}
@@ -645,7 +654,7 @@ export class AgxClient {
 			try {
 				await this.dispatchOnce(receipt, async () => {
 					if (this.ignore?.(receipt) !== true) {
-						await this.onReceipt?.(receipt);
+						await this.dispatchReceipt(receipt);
 					}
 				});
 			} catch (err) {
@@ -695,6 +704,34 @@ export class AgxClient {
 		pollIntervalMs?: number;
 		advertise?: boolean;
 	}): Promise<void> {
+		if (this.started) {
+			return;
+		}
+		if (this.startPromise) {
+			await this.startPromise;
+			return;
+		}
+
+		const startPromise = this.startClient(opts);
+		this.startPromise = startPromise;
+		try {
+			await startPromise;
+			this.started = true;
+		} catch (error) {
+			this.unsubscribeTransportListeners();
+			throw error;
+		} finally {
+			if (this.startPromise === startPromise) {
+				this.startPromise = undefined;
+			}
+		}
+	}
+
+	private async startClient(opts?: {
+		pollIntervalMs?: number;
+		advertise?: boolean;
+	}): Promise<void> {
+		await this.startMessageListener();
 		await this.transport.start?.();
 		if (opts?.advertise !== false && this.transport.advertise) {
 			await this.transport
@@ -740,6 +777,17 @@ export class AgxClient {
 			clearTimeout(this.pollTimer);
 			this.pollTimer = undefined;
 		}
+		const startPromise = this.startPromise;
+		if (startPromise) {
+			try {
+				await startPromise;
+			} catch {
+				// start() reports its own failure; still release its resources here.
+			}
+		}
+		this.started = false;
+		this.unsubscribeTransportListeners();
+		this.receiptListeners.clear();
 		for (const p of this.pending.values()) {
 			if (p.timer) {
 				clearTimeout(p.timer);
@@ -799,6 +847,11 @@ export class AgxClient {
 		await this.onMessage?.(msg);
 	}
 
+	private async dispatchReceipt(receipt: AgxIncomingReceipt): Promise<void> {
+		this.receiptListeners.forEach((listener) => listener(receipt));
+		await this.onReceipt?.(receipt);
+	}
+
 	private async dispatchLiveEvent(
 		kind: "message" | "receipt",
 		event: AgxIncomingMessage | AgxIncomingReceipt,
@@ -812,7 +865,7 @@ export class AgxClient {
 					return;
 				}
 				if ("receipt" in event) {
-					await this.onReceipt?.(event);
+					await this.dispatchReceipt(event);
 				} else {
 					await this.dispatchMessage(event);
 				}
@@ -1249,13 +1302,39 @@ export class AgxClient {
 	}
 
 	private async startMessageListener(): Promise<void> {
-		await this.transport.onMessage?.(async (msg: AgxIncomingMessage) => {
-			await this.dispatchLiveEvent("message", msg);
-		});
+		const unsubscribers: Unsubscribe[] = [];
+		try {
+			const unsubscribeMessage = await this.transport.onMessage?.(
+				async (msg: AgxIncomingMessage) => {
+					await this.dispatchLiveEvent("message", msg);
+				},
+			);
+			if (typeof unsubscribeMessage === "function") {
+				unsubscribers.push(unsubscribeMessage);
+			}
+			const unsubscribeReceipt = await this.transport.onReceipt?.(
+				async (receipt: AgxIncomingReceipt) => {
+					await this.dispatchLiveEvent("receipt", receipt);
+				},
+			);
+			if (typeof unsubscribeReceipt === "function") {
+				unsubscribers.push(unsubscribeReceipt);
+			}
+			this.listenerUnsubscribers = unsubscribers;
+		} catch (error) {
+			for (const unsubscribe of unsubscribers) {
+				unsubscribe();
+			}
+			throw error;
+		}
+	}
 
-		await this.transport.onReceipt?.(async (receipt: AgxIncomingReceipt) => {
-			await this.dispatchLiveEvent("receipt", receipt);
-		})
+	private unsubscribeTransportListeners(): void {
+		const unsubscribers = this.listenerUnsubscribers;
+		this.listenerUnsubscribers = [];
+		for (const unsubscribe of unsubscribers) {
+			unsubscribe();
+		}
 	}
 }
 
@@ -1284,20 +1363,23 @@ class StreamResponse<Output> {
 	private readonly pendingInputs = new Set<string>();
 
 	constructor(
-		transport: AgxTransport,
 		taskId: string,
+		subscribeToReceipts: (
+			listener: (receipt: AgxIncomingReceipt) => void,
+		) => () => void,
 		private readonly sendInput: (
 			inputRequestId: string,
 			input: unknown,
 		) => Promise<void>,
 		private readonly log: AgxLogger,
 	) {
-		transport.onReceipt?.(async (receipt: AgxIncomingReceipt) => {
+		this.unsubscribeReceipt = subscribeToReceipts((receipt) => {
 			if (receipt.receipt.contextId === taskId) {
 				this.emit('statusUpdate', 'delivered');
 			}
 		});
 	}
+	private readonly unsubscribeReceipt: () => void;
 
 	on<Event extends keyof StreamEventData<Output>>(
 		event: Event,
@@ -1385,16 +1467,19 @@ class StreamResponse<Output> {
 			case "completed":
 				this.pendingInputs.clear();
 				this.emit("completed", update.output as Output);
+				this.unsubscribeReceipt();
 				break;
 			case "failed":
 				this.pendingInputs.clear();
 				this.emit("error", update.error ?? "task failed");
+				this.unsubscribeReceipt();
 				break;
 		}
 	}
 
 	handleError(error: Error): void {
 		this.emit("error", error.message);
+		this.unsubscribeReceipt();
 	}
 
 	/** Send an answer for an input requirement reported by this task. */

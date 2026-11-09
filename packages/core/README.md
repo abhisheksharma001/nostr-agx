@@ -28,6 +28,12 @@ agx.handle("invoice.review", async (task) => paperclip.run(task.payload));
 await agx.start();
 ```
 
+Live transport listeners are registered by `start()` and removed by `stop()`.
+Transport `onMessage` and `onReceipt` hooks return an `Unsubscribe` function;
+calling it removes only that registration.
+Hosts that only call `pump()` from their own scheduler can leave the client unstarted
+and will dispatch messages only during those pump calls.
+
 For human-in-the-loop work, a handler can await `ctx.requestInput(requirement)`.
 The requester uses `streamRequest()` to observe `inputRequired`, obtains an answer
 through its own UI or policy, and sends it with `stream.provideInput(inputRequestId, answer)`.
