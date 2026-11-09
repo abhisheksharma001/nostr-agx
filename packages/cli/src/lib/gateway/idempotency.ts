@@ -59,6 +59,7 @@ export interface TaskIdempotencyOptions {
 	now?: () => number;
 	retentionMs?: number;
 	maxOperationsPerCredential?: number;
+	maxOperations?: number;
 	maxInFlight?: number;
 	maxBackgroundInFlight?: number;
 	maxStoreBytes?: number;
@@ -112,7 +113,8 @@ function hash(value: string): string {
 }
 
 /** Keyed requests and background tasks with a key need their record for replay. Unkeyed background
- * results do not, so they live in a separate pool and never evict or block the first kind. */
+ * results do not, so they live in a separate pool for the count limits: filling one pool never
+ * evicts or blocks the other. The byte budget is shared by every record. */
 function holdsIdempotencyKey(operation: Operation): boolean {
 	return !operation.background || operation.keyed;
 }
@@ -159,6 +161,7 @@ export class TaskOperationStore {
 	private readonly now: () => number;
 	private readonly retentionMs: number;
 	private readonly maxOperationsPerCredential: number;
+	private readonly maxOperations: number;
 	private readonly maxInFlight: number;
 	private readonly maxBackgroundInFlight: number;
 	private readonly maxStoreBytes: number;
@@ -178,6 +181,7 @@ export class TaskOperationStore {
 		this.now = options.now ?? Date.now;
 		this.retentionMs = options.retentionMs ?? TASK_IDEMPOTENCY_RETENTION_MS;
 		this.maxOperationsPerCredential = options.maxOperationsPerCredential ?? MAX_TASK_OPERATIONS_PER_CREDENTIAL;
+		this.maxOperations = options.maxOperations ?? MAX_TASK_OPERATIONS;
 		this.maxInFlight = options.maxInFlight ?? MAX_TASK_OPERATIONS_IN_FLIGHT;
 		this.maxBackgroundInFlight = options.maxBackgroundInFlight ?? MAX_BACKGROUND_TASKS_IN_FLIGHT;
 		this.maxStoreBytes = options.maxStoreBytes ?? MAX_TASK_OPERATION_STORE_BYTES;
@@ -429,9 +433,11 @@ export class TaskOperationStore {
 		const samePool = (record: Operation) => holdsIdempotencyKey(record) === idempotency;
 		let credentialOperations = 0;
 		let poolOperations = 0;
+		const poolCounts = new Map<string, number>();
 		for (const record of this.records.values()) {
 			if (samePool(record)) {
 				poolOperations += 1;
+				poolCounts.set(record.credential ?? "", (poolCounts.get(record.credential ?? "") ?? 0) + 1);
 				if (record.credential === credentialHash) {
 					credentialOperations += 1;
 				}
@@ -453,19 +459,23 @@ export class TaskOperationStore {
 				credentialOperations -= 1;
 				poolOperations -= 1;
 			}
-			while (poolOperations >= MAX_TASK_OPERATIONS) {
-				const oldest = this.oldestSettled(samePool);
+			while (poolOperations >= this.maxOperations) {
+				const oldest = this.oldestOfHeaviest(
+					(record) => samePool(record),
+					(credential) => poolCounts.get(credential) ?? 0,
+				);
 				if (!oldest) {
 					throw new ApiError(
 						503,
 						"idempotency_store_full",
-						`The gateway already has ${MAX_TASK_OPERATIONS} task operations running`,
+						`The gateway already has ${this.maxOperations} task operations running`,
 						"Retry when an operation finishes.",
 					);
 				}
 				this.drop(oldest);
 				evicted.push(oldest);
 				poolOperations -= 1;
+				poolCounts.set(oldest.credential ?? "", (poolCounts.get(oldest.credential ?? "") ?? 1) - 1);
 			}
 		} catch (error) {
 			for (const operation of evicted) {
@@ -495,7 +505,10 @@ export class TaskOperationStore {
 	private enforceByteBudget(protectedId?: string): Operation[] {
 		const evicted: Operation[] = [];
 		while (this.totalBytes > this.maxStoreBytes) {
-			const victim = this.oldestOfHeaviestCredential(protectedId);
+			const victim = this.oldestOfHeaviest(
+				(record) => record.id !== protectedId,
+				(credential) => this.credentialBytes.get(credential) ?? 0,
+			);
 			if (!victim) {
 				break;
 			}
@@ -505,17 +518,22 @@ export class TaskOperationStore {
 		return evicted;
 	}
 
-	private oldestOfHeaviestCredential(protectedId?: string): Operation | undefined {
+	/** The oldest settled record of the credential with the largest `weight`, among records that
+	 * `match`. Ties go to the oldest record overall. */
+	private oldestOfHeaviest(
+		match: (operation: Operation) => boolean,
+		weight: (credential: string) => number,
+	): Operation | undefined {
 		let chosen: Operation | undefined;
-		let chosenBytes = 0;
+		let chosenWeight = 0;
 		for (const operation of this.records.values()) {
-			if (operation.outcome === null || operation.id === protectedId) {
+			if (operation.outcome === null || !match(operation)) {
 				continue;
 			}
-			const bytes = this.credentialBytes.get(operation.credential ?? "") ?? 0;
-			if (!chosen || bytes > chosenBytes || (bytes === chosenBytes && isOlder(operation, chosen))) {
+			const candidateWeight = weight(operation.credential ?? "");
+			if (!chosen || candidateWeight > chosenWeight || (candidateWeight === chosenWeight && isOlder(operation, chosen))) {
 				chosen = operation;
-				chosenBytes = bytes;
+				chosenWeight = candidateWeight;
 			}
 		}
 		return chosen;

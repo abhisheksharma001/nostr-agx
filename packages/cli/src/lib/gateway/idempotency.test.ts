@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sandbox } from "../../test/helpers.js";
 import { gatewayTaskOperationsPath, writePrivateJson, writePrivateText } from "../paths.js";
@@ -587,6 +588,56 @@ describe("TaskOperationStore storage fairness", () => {
 		store.close();
 	});
 
+	it("evicts from the credential holding the most records when the profile cap is reached", async () => {
+		let clock = 1_000;
+		const store = new TaskOperationStore("test", { maxOperations: 4, now: () => (clock += 1) });
+		let runs = 0;
+		const work = async () => ({ run: ++runs });
+		await store.execute("credential-b", "keyed", {}, work);
+		for (const key of ["one", "two", "three"]) {
+			await store.execute("credential-a", key, {}, work);
+		}
+		await store.execute("credential-a", "four", {}, work);
+		expect(runs).toBe(5);
+
+		await expect(store.execute("credential-b", "keyed", {}, work)).resolves.toEqual({ run: 1 });
+		expect(runs).toBe(5);
+		await store.execute("credential-a", "one", {}, work);
+		expect(runs).toBe(6);
+		store.close();
+	});
+
+	it("keeps the byte counts exact across failed writes and key release", async () => {
+		const path = gatewayTaskOperationsPath("test");
+		const store = new TaskOperationStore("test");
+		const work = async () => ({ output: "x".repeat(500) });
+		await store.execute("credential-a", "first", {}, work);
+		const done = store.submit("credential-b", null, { background: true }, work);
+		await waitForStatus(store, "credential-b", done.id as string, "completed");
+
+		rmSync(path, { force: true });
+		mkdirSync(path);
+		writeFileSync(join(path, "keep"), "blocks the final rename");
+		await expect(store.execute("credential-a", "second", {}, work)).rejects.toThrow();
+		expect(() => store.submit("credential-a", "third", { background: true }, work)).toThrow();
+		rmSync(path, { recursive: true });
+
+		const retry = store.submit("credential-a", "retry", { background: true }, async () => {
+			throw new ApiError(400, "invalid_request", "bad request");
+		});
+		await waitForStatus(store, "credential-a", retry.id as string, "failed");
+		await store.execute("credential-b", "last", {}, work);
+
+		const live = store as unknown as { totalBytes: number; credentialBytes: Map<string, number> };
+		const reloaded = new TaskOperationStore("test");
+		const fresh = reloaded as unknown as { totalBytes: number; credentialBytes: Map<string, number> };
+		expect(live.totalBytes).toBe(fresh.totalBytes);
+		expect([...live.credentialBytes].sort()).toEqual([...fresh.credentialBytes].sort());
+		expect(live.totalBytes).toBeGreaterThanOrEqual(Buffer.byteLength(readFileSync(path, "utf8")));
+		reloaded.close();
+		store.close();
+	});
+
 	it("tracks stored bytes instead of re-serializing the whole store for each eviction", async () => {
 		const store = new TaskOperationStore("test", { maxStoreBytes: 60_000 });
 		for (let index = 0; index < 30; index++) {
@@ -596,14 +647,18 @@ describe("TaskOperationStore storage fairness", () => {
 			await waitForStatus(store, "credential-a", accepted.id as string, "completed");
 		}
 		const stringify = vi.spyOn(JSON, "stringify");
-		const big = store.submit("credential-a", null, { background: true }, async () => ({
-			output: "y".repeat(40_000),
-		}));
-		await waitForStatus(store, "credential-a", big.id as string, "completed");
-		const wholeStoreCalls = stringify.mock.calls.filter(
-			([value]) => typeof value === "object" && value !== null && "operations" in value,
-		).length;
-		stringify.mockRestore();
+		let wholeStoreCalls = 0;
+		try {
+			const big = store.submit("credential-a", null, { background: true }, async () => ({
+				output: "y".repeat(40_000),
+			}));
+			await waitForStatus(store, "credential-a", big.id as string, "completed");
+			wholeStoreCalls = stringify.mock.calls.filter(
+				([value]) => typeof value === "object" && value !== null && "operations" in value,
+			).length;
+		} finally {
+			stringify.mockRestore();
+		}
 		expect(wholeStoreCalls).toBeLessThanOrEqual(3);
 		expect(Buffer.byteLength(readFileSync(gatewayTaskOperationsPath("test"), "utf8"))).toBeLessThanOrEqual(60_000);
 		store.close();
