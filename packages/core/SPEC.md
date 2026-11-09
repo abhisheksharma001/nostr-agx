@@ -126,8 +126,9 @@ them like any message:
 
 - **request** — `{ t: "req", taskId, capability, payload }`. `payload` is arbitrary JSON the handler
   interprets (payload-agnostic).
-- **result** — `{ t: "res", taskId, status: "completed" | "failed", output?, error? }`, correlated to
-  the request by `taskId`.
+- **result** — `{ t: "res", taskId, status: "completed" | "failed", output?, error?, code?, retryable?, details? }`,
+  correlated to the request by `taskId`. `code`, `retryable` and `details` are optional, appear only on
+  a `failed` result, and are described under **Error boundary**.
 
 States: `submitted → working → input-required → completed | failed | canceled`. A handler returning a
 value transitions the task to `completed` (its return is `output`); a handler that throws transitions
@@ -137,7 +138,19 @@ to `failed`. `working` / `input-required` are reserved for status updates.
 the peer **generically** (`handler failed`) and the real message is logged locally — an internal
 driver/ORM/HTTP error must not leak hostnames, table names, or credentials to another org. To send a
 message that is part of the protocol contract (`invoice not found`, `amount exceeds limit`), throw an
-`AgxPublicError`, whose message is forwarded verbatim. Both the request and result envelopes are
+`AgxPublicError`, whose message is forwarded verbatim.
+
+An `AgxPublicError` may also carry three optional fields so a workflow can branch without parsing
+the message. `code` is one of the closed set `busy`, `timeout`, `invalid_input`, `unavailable`,
+`input_invalid`, or a dotted namespaced code of the sender's own (`acme.rate_limited`), at most 64
+characters. `retryable` says whether the same request may succeed if sent again. `details` is at most
+8 short scalar entries (keys up to 64 characters, string values up to 200). The sender refuses an
+invalid value when it builds the error. A receiver treats all three as claims by the peer: a value
+outside these limits is ignored and the failure is still delivered with its `error` text. Only an
+`AgxPublicError` ever sets them; an ordinary exception is still reported as `handler failed` with no
+code, `retryable` or `details`, whatever properties the exception itself has. A requester sees them on
+`AgxTaskFailedError`, an `Error` whose message is the peer's `error` text. A receiver that predates
+these fields ignores them. Both the request and result envelopes are
 size-checked before sending; an oversize payload fails fast (request) or is replaced with a
 `result too large` failure (result) rather than truncated into unparseable JSON.
 
