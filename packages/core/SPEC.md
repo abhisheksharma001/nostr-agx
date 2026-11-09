@@ -143,9 +143,11 @@ message that is part of the protocol contract (`invoice not found`, `amount exce
 An `AgxPublicError` may also carry three optional fields so a workflow can branch without parsing
 the message. `code` is one of the closed set `busy`, `timeout`, `invalid_input`, `unavailable`,
 `input_invalid`, or a dotted namespaced code of the sender's own (`acme.rate_limited`), at most 64
-characters. `retryable` says whether the same request may succeed if sent again. `details` is at most
-8 short scalar entries (keys up to 64 characters, string values up to 200). The sender refuses an
-invalid value when it builds the error. A receiver treats all three as claims by the peer: a value
+characters. A namespaced code uses lowercase letters, digits, `_` and `-` in each dotted segment, and
+its first segment may not be one of the closed-set words. `retryable` says whether the same request may succeed if sent again. `details` is at most
+8 short scalar entries (keys up to 64 characters, string values up to 200, no `__proto__` key). The
+sender refuses an invalid value when it builds the error, keeps a frozen copy, and checks the fields
+again just before it sends them. A receiver treats all three as claims by the peer: a value
 outside these limits is ignored and the failure is still delivered with its `error` text. Only an
 `AgxPublicError` ever sets them; an ordinary exception is still reported as `handler failed` with no
 code, `retryable` or `details`, whatever properties the exception itself has. A requester sees them on
