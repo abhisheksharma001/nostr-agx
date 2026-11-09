@@ -8,8 +8,7 @@ import { z } from "zod";
  * while `AgxClient` interprets the lifecycle + correlation.
  */
 
-/** Task lifecycle states (A2A-aligned). v1 drives the terminal states via the
- * result envelope; `working` / `input-required` are reserved for status updates. */
+/** Task lifecycle states (A2A-aligned). */
 export type TaskState =
 	| "submitted"
 	| "working"
@@ -18,8 +17,22 @@ export type TaskState =
 	| "failed"
 	| "canceled";
 
-/** Terminal states a result envelope can carry. */
+/** Terminal task states. */
 export type TaskTerminalStatus = "completed" | "failed";
+
+export const inputRequirementSchema = z.object({
+	id: z.string().min(1).max(200).optional(),
+	prompt: z.string().min(1).max(2000),
+	inputSchema: z.unknown().optional(),
+	timeoutMs: z.number().int().min(0).optional(),
+});
+export type InputRequirement = z.infer<typeof inputRequirementSchema>;
+
+export const inputRequiredUpdateSchema = z.object({
+	inputRequestId: z.string().min(1).max(200),
+	requirement: inputRequirementSchema,
+});
+export type InputRequiredUpdate = z.infer<typeof inputRequiredUpdateSchema>;
 
 /** Wire envelope for a task request. `payload` is arbitrary JSON the handler
  * interprets (payload-agnostic). */
@@ -31,19 +44,43 @@ export const taskRequestSchema = z.object({
 });
 export type TaskRequestEnvelope = z.infer<typeof taskRequestSchema>;
 
-/** Wire envelope for a task result. */
-export const taskResultSchema = z.object({
-	t: z.literal("res"),
-	taskId: z.string().min(1).max(200),
-	status: z.enum(["completed", "failed"]),
-	output: z.unknown().optional(),
-	error: z.string().max(2000).optional(),
-});
+/** Wire envelope for a task status update or terminal result. */
+export const taskResultSchema = z.discriminatedUnion("status", [
+	z.object({
+		t: z.literal("res"),
+		taskId: z.string().min(1).max(200),
+		status: z.literal("input-required"),
+		inputRequestId: z.string().min(1).max(200),
+		requirement: inputRequirementSchema,
+	}),
+	z.object({
+		t: z.literal("res"),
+		taskId: z.string().min(1).max(200),
+		status: z.literal("completed"),
+		output: z.unknown().optional(),
+	}),
+	z.object({
+		t: z.literal("res"),
+		taskId: z.string().min(1).max(200),
+		status: z.literal("failed"),
+		error: z.string().max(2000).optional(),
+	}),
+]);
 export type TaskResultEnvelope = z.infer<typeof taskResultSchema>;
+
+/** A continuation carrying an answer to a task's input requirement. */
+export const taskInputSchema = z.object({
+	t: z.literal("input"),
+	taskId: z.string().min(1).max(200),
+	inputRequestId: z.string().min(1).max(200),
+	input: z.unknown(),
+});
+export type TaskInputEnvelope = z.infer<typeof taskInputSchema>;
 
 export const taskEnvelopeSchema = z.discriminatedUnion("t", [
 	taskRequestSchema,
 	taskResultSchema,
+	taskInputSchema,
 ]);
 export type TaskEnvelope = z.infer<typeof taskEnvelopeSchema>;
 

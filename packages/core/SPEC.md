@@ -126,12 +126,24 @@ them like any message:
 
 - **request** — `{ t: "req", taskId, capability, payload }`. `payload` is arbitrary JSON the handler
   interprets (payload-agnostic).
-- **result** — `{ t: "res", taskId, status: "completed" | "failed", output?, error? }`, correlated to
-  the request by `taskId`.
+- **result/update** — `{ t: "res", taskId, status: "input-required", inputRequestId, requirement }`
+  is a nonterminal update; `{ t: "res", taskId, status: "completed", output? }` and
+  `{ t: "res", taskId, status: "failed", error? }` are terminal results.
+- **input continuation** — `{ t: "input", taskId, inputRequestId, input }` supplies the answer to an
+  outstanding input requirement. It is a new message/event, but continues the same task and uses
+  the same `taskId` as its transport `contextId`.
 
-States: `submitted → working → input-required → completed | failed | canceled`. A handler returning a
-value transitions the task to `completed` (its return is `output`); a handler that throws transitions
-to `failed`. `working` / `input-required` are reserved for status updates.
+States: `submitted → working ↔ input-required → completed | failed | canceled`. A handler may call
+`requestInput(requirement)` to publish an `input-required` update and await the continuation. A
+completed handler transitions the task to `completed`; a thrown handler error transitions it to
+`failed`. An input continuation **MUST** match the pending task and `inputRequestId` and come from
+the peer that initiated the task. An `input-required` update is nonterminal: the initiator keeps its
+pending request open and may provide input through `streamRequest()`. A plain `request()` caller,
+which has no input callback, rejects with an instruction to use `streamRequest()`.
+
+The current in-process handler API waits for input in memory; it does not persist suspended handler
+state across process restarts. A runtime requiring restart recovery must persist and restore that
+state itself.
 
 **Error boundary.** A `failed` result crosses trust domains, so a thrown handler error is reported to
 the peer **generically** (`handler failed`) and the real message is logged locally — an internal

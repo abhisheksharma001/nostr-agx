@@ -28,4 +28,10 @@ agx.handle("invoice.review", async (task) => paperclip.run(task.payload));
 await agx.start();
 ```
 
+For human-in-the-loop work, a handler can await `ctx.requestInput(requirement)`.
+The requester uses `streamRequest()` to observe `inputRequired`, obtains an answer
+through its own UI or policy, and sends it with `stream.provideInput(inputRequestId, answer)`.
+The answer continues the same task. The suspended handler state is in memory and
+does not survive a process restart.
+
 > Status: **0.2.0 (draft)** — API is stabilizing alongside the NIP-AGX spec (`SPEC.md`).

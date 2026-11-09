@@ -639,6 +639,136 @@ describe("AgxClient streamRequest", () => {
 		await alice.stop();
 	});
 
+	it("resumes a handler after an input-required update without blocking pump", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+		});
+		bob.handle("approval", async (_task, ctx) => {
+			const approved = await ctx.requestInput({
+				id: "approval",
+				prompt: "Approve this request?",
+			});
+			return { approved };
+		});
+
+		const stream = await alice.streamRequest<{ approved: boolean }>(
+			BOB,
+			"approval",
+			{},
+		);
+		const updates: string[] = [];
+		let inputRequestId = "";
+		const completed = vi.fn();
+		stream.on("statusUpdate", (status) => updates.push(status));
+		stream.on("inputRequired", (update) => {
+			inputRequestId = update.inputRequestId;
+			expect(update.requirement.prompt).toBe("Approve this request?");
+		});
+		stream.on("completed", completed);
+
+		await bob.pump();
+		expect(inputRequestId).toBe("");
+		await alice.pump();
+		expect(inputRequestId).not.toBe("");
+		expect(updates).toEqual(["input-required"]);
+		expect(completed).not.toHaveBeenCalled();
+
+		const request = bus.inbox.get(BOB)?.[0];
+		const requestEnvelope = request && parseTaskEnvelope(request.text);
+		if (!requestEnvelope || requestEnvelope.t !== "req") {
+			throw new Error("Expected the original task request");
+		}
+		bus.pushMessage(BOB, {
+			from: "mallory",
+			text: encodeTaskEnvelope({
+				t: "input",
+				taskId: requestEnvelope.taskId,
+				inputRequestId,
+				input: false,
+			}),
+			contextId: requestEnvelope.taskId,
+			messageId: "forged-input",
+			subject: null,
+			autoDepth: null,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		await bob.pump();
+		expect(completed).not.toHaveBeenCalled();
+
+		await stream.provideInput(inputRequestId, true);
+		await bob.pump();
+		await bob.tasksSettled();
+		await alice.pump();
+
+		expect(updates).toEqual(["input-required", "completed"]);
+		expect(completed).toHaveBeenCalledWith({ approved: true });
+	});
+
+	it("registers stream update handling before publishing the initial request", async () => {
+		const live = liveTransport(ALICE);
+		const base = bus.transport(ALICE);
+		const transport: AgxTransport = {
+			...live.transport,
+			async publishMessage(to, message) {
+				const sent = await base.publishMessage(to, message);
+				const request = parseTaskEnvelope(message.text);
+				if (request?.t === "req") {
+					for (const [messageId, result] of [
+						[
+							"early-input-required",
+							{
+								t: "res" as const,
+								taskId: request.taskId,
+								status: "input-required" as const,
+								inputRequestId: "early-input",
+								requirement: { prompt: "Need input" },
+							},
+						],
+						[
+							"early-completed",
+							{
+								t: "res" as const,
+								taskId: request.taskId,
+								status: "completed" as const,
+								output: "done",
+							},
+						],
+					] as const) {
+						bus.pushMessage(ALICE, {
+							from: BOB,
+							text: encodeTaskEnvelope(result),
+							contextId: request.taskId,
+							messageId,
+							subject: null,
+							autoDepth: null,
+							contentType: TASK_CONTENT_TYPE,
+						});
+						const incoming = bus.inbox.get(ALICE)!.at(-1)!;
+						await live.deliverMessage(incoming);
+					}
+				}
+				return sent;
+			},
+		};
+		const alice = new AgxClient({ transport });
+		const stream = await alice.streamRequest(BOB, "early", {}, {
+			timeoutMs: 0,
+		});
+		const inputRequired = vi.fn();
+		const completed = vi.fn();
+		stream.on("inputRequired", inputRequired);
+		stream.on("completed", completed);
+
+		expect(inputRequired).toHaveBeenCalledWith({
+			inputRequestId: "early-input",
+			requirement: { prompt: "Need input" },
+		});
+		expect(completed).toHaveBeenCalledWith("done");
+		await alice.stop();
+	});
+
 	it("reports failed task status and the peer's error", async () => {
 		const aliceLive = liveTransport(ALICE);
 		const alice = new AgxClient({ transport: aliceLive.transport });

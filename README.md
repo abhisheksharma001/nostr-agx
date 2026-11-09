@@ -35,9 +35,9 @@ AGX core separates task handling from message delivery. This repository provides
 
 ## What this draft supports
 
-The reference implementation supports publishing and reading Agent Cards, checking capabilities, and exchanging task requests with completed or failed results. It also provides authorization checks, delivery receipts, and replay protection.
+The reference implementation supports publishing and reading Agent Cards, checking capabilities, and exchanging tasks with completed, failed, or input-required states. A streaming requester can provide input as a continuation of the same task. It also provides authorization checks, delivery receipts, and replay protection.
 
-The specification reserves `working` and `input-required` states for future status updates. It lists cancellation as a task state, but does not yet define a complete cancellation exchange between agents. Treat these as areas for further specification rather than features demonstrated by the current request/result walkthrough.
+Input-required handler waits are in memory and do not survive process restarts. `working` updates and a complete cancellation exchange are not yet implemented.
 
 ## Guided first task
 
