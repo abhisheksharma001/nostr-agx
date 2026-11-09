@@ -3,6 +3,7 @@ import {
 	type AgxPublicErrorOptions,
 	AgxTaskDeclined,
 	AgxTaskFailedError,
+	publicErrorFieldsToSend,
 	readPublicErrorFields,
 } from "./errors";
 import { randomId } from "./id";
@@ -790,8 +791,9 @@ export class AgxClient {
 			// Only a deliberately public error carries a code, `retryable` or
 			// `details`: an ordinary exception's own `code` (ECONNREFUSED, a SQL
 			// state) is exactly the internal detail this boundary keeps back.
-			// The fields are checked again here, not only when the error was built:
-			// a subclass or a later assignment must not get an unchecked value out.
+			// The fields sent are the copy the constructor checked, never the
+			// error's own properties: a subclass field, a later assignment or a
+			// getter must not get an unchecked value out.
 			await this.sendResult(
 				msg.from,
 				env.taskId,
@@ -799,7 +801,7 @@ export class AgxClient {
 					? {
 							status: "failed",
 							error: (err as AgxPublicError).message,
-							...readPublicErrorFields(err as AgxPublicError),
+							...publicErrorFieldsToSend(err as AgxPublicError),
 						}
 					: { status: "failed", error: "handler failed" },
 			);

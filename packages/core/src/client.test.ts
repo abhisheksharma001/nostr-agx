@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgxClient } from "./client";
-import { AgxPublicError, AgxTaskDeclined, AgxTaskFailedError } from "./errors";
+import {
+	AgxPublicError,
+	type AgxPublicErrorCode,
+	type AgxPublicErrorOptions,
+	AgxTaskDeclined,
+	AgxTaskFailedError,
+	readPublicErrorFields,
+} from "./errors";
 import { randomId } from "./id";
 import { encodeTaskEnvelope, parseTaskEnvelope } from "./task";
 import type {
@@ -1359,7 +1366,7 @@ describe("AgxClient structured public errors", () => {
 		expect(failure.details).toBeUndefined();
 	});
 
-	it("sends a frozen copy of details, so a change after construction cannot widen it", async () => {
+	it("keeps a frozen copy of details, so a change after construction cannot widen it", () => {
 		const given: Record<string, string | number | boolean> = { queue: "invoices" };
 		const error = new AgxPublicError("queue is full", { code: "busy", details: given });
 		given.password = "hunter2";
@@ -1368,7 +1375,7 @@ describe("AgxClient structured public errors", () => {
 		expect(Object.isFrozen(error.details)).toBe(true);
 	});
 
-	it("re-checks a subclass that smuggles an internal code past the constructor", async () => {
+	it("keeps a subclass getter from smuggling an internal code onto the wire", async () => {
 		class SneakyError extends AgxPublicError {
 			constructor(message: string) {
 				super(message);
@@ -1424,5 +1431,144 @@ describe("AgxClient structured public errors", () => {
 		for (const key of ["code", "retryable", "details"]) {
 			expect(key in failure).toBe(false);
 		}
+	});
+
+	it("sends only what the constructor accepted, never fields set later or by a subclass", async () => {
+		// A subclass written before these fields existed, keeping them for local logs.
+		class InvoiceError extends AgxPublicError {
+			code = "acme.invoice_db_down" as const;
+			details = { customerEmail: "jane@client.example", dbHost: "db-7.internal" };
+		}
+		const assigned = Object.assign(new AgxPublicError("lookup failed"), {
+			retryable: false,
+			details: { sqlState: "42P01", table: "invoices_eu" },
+		});
+		const viaGetters = new AgxPublicError("queue is full", { code: "busy" });
+		Object.defineProperty(viaGetters, "details", { get: () => ({ dbHost: "db-7.internal" }) });
+		Object.defineProperty(viaGetters, "retryable", { get: () => true });
+		const thrown: Error[] = [new InvoiceError("invoice service down"), assigned, viaGetters];
+		const bob = bobWith(() => {
+			throw thrown.shift();
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+
+		const wire: Record<string, unknown>[] = [];
+		for (let i = 0; i < 3; i++) {
+			alice.request(BOB, "work", {}).catch(() => undefined);
+			await bob.pump();
+			wire.push(resultOnWire());
+		}
+
+		expect(wire[0]).toEqual({
+			t: "res",
+			taskId: expect.any(String),
+			status: "failed",
+			error: "invoice service down",
+		});
+		expect(wire[1]).toEqual({
+			t: "res",
+			taskId: expect.any(String),
+			status: "failed",
+			error: "lookup failed",
+		});
+		expect(wire[2]).toEqual({
+			t: "res",
+			taskId: expect.any(String),
+			status: "failed",
+			error: "queue is full",
+			code: "busy",
+		});
+	});
+
+	it("reads each option once, so a getter cannot pass the check and then swap the value", async () => {
+		let codeReads = 0;
+		let retryableReads = 0;
+		const options = {
+			get code() {
+				codeReads++;
+				return (codeReads === 1 ? "busy" : "ECONNREFUSED postgres://admin@10.0.0.5") as "busy";
+			},
+			get retryable() {
+				retryableReads++;
+				return (retryableReads === 1 ? true : { secret: "hunter2" }) as boolean;
+			},
+		};
+		const bob = bobWith(() => {
+			throw new AgxPublicError("queue is full", options);
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		alice.request(BOB, "work", {}).catch(() => undefined);
+		await bob.pump();
+
+		expect(resultOnWire()).toEqual({
+			t: "res",
+			taskId: expect.any(String),
+			status: "failed",
+			error: "queue is full",
+			code: "busy",
+			retryable: true,
+		});
+		expect(codeReads).toBe(1);
+		expect(retryableReads).toBe(1);
+
+		// The receiver's reader also reads each field once.
+		let peerCodeReads = 0;
+		const fromPeer = readPublicErrorFields({
+			get code() {
+				peerCodeReads++;
+				return peerCodeReads === 1 ? "busy" : "not a code";
+			},
+		});
+		expect(fromPeer).toEqual({ code: "busy" });
+		expect(peerCodeReads).toBe(1);
+	});
+
+	it("sends exactly the old bytes when a public error carries no options", async () => {
+		const bob = bobWith(() => {
+			throw new AgxPublicError("invoice not found");
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		alice.request(BOB, "work", {}).catch(() => undefined);
+		await bob.pump();
+
+		const sent = bus.inbox.get(ALICE) ?? [];
+		const text = sent[sent.length - 1].text;
+		const taskId = (JSON.parse(text) as { taskId: string }).taskId;
+		expect(text).toBe(
+			JSON.stringify({ t: "res", taskId, status: "failed", error: "invoice not found" }),
+		);
+	});
+
+	it("holds each limit at its exact edge", () => {
+		const ok = (options: AgxPublicErrorOptions) => () => new AgxPublicError("x", options);
+		const bad = (options: unknown) => () =>
+			new AgxPublicError("x", options as AgxPublicErrorOptions);
+
+		// code: 64 characters is the most.
+		const code64 = `acme.${"a".repeat(59)}` as AgxPublicErrorCode;
+		expect(code64.length).toBe(64);
+		expect(ok({ code: code64 })).not.toThrow();
+		expect(bad({ code: `${code64}a` })).toThrow(TypeError);
+
+		// details: 8 keys, keys 1 to 64 characters, strings up to 200.
+		const eight = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`k${i}`, i]));
+		expect(ok({ details: eight })).not.toThrow();
+		expect(ok({ details: { ["k".repeat(64)]: 1 } })).not.toThrow();
+		expect(bad({ details: { ["k".repeat(65)]: 1 } })).toThrow(TypeError);
+		expect(bad({ details: { "": 1 } })).toThrow(TypeError);
+		expect(ok({ details: { long: "y".repeat(200) } })).not.toThrow();
+
+		// numbers must be finite.
+		expect(bad({ details: { n: Number.NaN } })).toThrow(TypeError);
+		expect(bad({ details: { n: Number.POSITIVE_INFINITY } })).toThrow(TypeError);
+
+		// details must be a plain object: not a string, an array, a Date or a class instance.
+		expect(bad({ details: "queue=invoices" })).toThrow(TypeError);
+		expect(bad({ details: ["invoices"] })).toThrow(TypeError);
+		expect(bad({ details: new Date(0) })).toThrow(TypeError);
+		class Row {
+			queue = "invoices";
+		}
+		expect(bad({ details: new Row() })).toThrow(TypeError);
 	});
 });

@@ -14,7 +14,9 @@
  */
 export class AgxPublicError extends Error {
 	// `declare` so no empty `code`/`retryable`/`details` keys appear on an error
-	// that was not given them.
+	// that was not given them. These are for reading locally; what is SENT is
+	// the copy the constructor kept (see `publicErrorFieldsToSend`), so setting
+	// one of these later, or in a subclass, does not change what the peer gets.
 	/** A machine-readable reason a workflow can branch on, when one was given. */
 	declare readonly code?: AgxPublicErrorCode;
 	/** Whether the same request may succeed if sent again, when stated. */
@@ -25,35 +27,58 @@ export class AgxPublicError extends Error {
 	/**
 	 * `options` is optional and everything in it crosses the trust boundary, so
 	 * it is checked here: a bad `code` or `details` throws a `TypeError` in the
-	 * handler, which the peer sees only as the generic `handler failed`. It is
-	 * checked again just before sending, so a later change cannot get past it.
+	 * handler, which the peer sees only as the generic `handler failed`. Only
+	 * what passes this check is ever sent.
 	 */
 	constructor(message: string, options?: AgxPublicErrorOptions | null) {
 		super(message);
 		this.name = "AgxPublicError";
-		const given = options ?? {};
-		if (given.code !== undefined) {
-			if (!isAgxPublicErrorCode(given.code)) {
+		// Read each option once, so a getter cannot pass the check with one value
+		// and then hand over another.
+		const { code, retryable, details } = options ?? {};
+		const accepted: AgxPublicErrorOptions = {};
+		if (code !== undefined) {
+			if (!isAgxPublicErrorCode(code)) {
 				throw new TypeError(
 					`AgxPublicError code must be one of ${AGX_ERROR_CODES.join(", ")} or a namespaced code such as "acme.rate_limited"`,
 				);
 			}
-			this.code = given.code;
+			accepted.code = code;
+			this.code = code;
 		}
-		if (given.retryable !== undefined) {
-			if (typeof given.retryable !== "boolean") {
+		if (retryable !== undefined) {
+			if (typeof retryable !== "boolean") {
 				throw new TypeError("AgxPublicError retryable must be a boolean");
 			}
-			this.retryable = given.retryable;
+			accepted.retryable = retryable;
+			this.retryable = retryable;
 		}
-		if (given.details !== undefined) {
-			const checked = checkedErrorDetails(given.details);
+		if (details !== undefined) {
+			const checked = checkedErrorDetails(details);
 			if ("problem" in checked) {
 				throw new TypeError(`AgxPublicError details ${checked.problem}`);
 			}
+			accepted.details = checked.value;
 			this.details = checked.value;
 		}
+		fieldsToSend.set(this, Object.freeze(accepted));
 	}
+}
+
+/**
+ * What each `AgxPublicError` constructor accepted. Kept outside the error
+ * object, and written only by the constructor, so a subclass field, a later
+ * assignment or a getter on the error cannot change what crosses the trust
+ * boundary.
+ */
+const fieldsToSend = new WeakMap<AgxPublicError, Readonly<AgxPublicErrorOptions>>();
+
+/** The structured fields to send for `error`: only what its constructor
+ * checked and accepted, or none. */
+export function publicErrorFieldsToSend(
+	error: AgxPublicError,
+): Readonly<AgxPublicErrorOptions> {
+	return fieldsToSend.get(error) ?? {};
 }
 
 /** The reasons a task can fail that every AGX implementation understands. */
@@ -158,15 +183,17 @@ export function readPublicErrorFields(raw: {
 	retryable?: unknown;
 	details?: unknown;
 }): AgxPublicErrorOptions {
+	// Read each field once: the check and the copy must see the same value.
+	const { code, retryable, details } = raw;
 	const out: AgxPublicErrorOptions = {};
-	if (isAgxPublicErrorCode(raw.code)) {
-		out.code = raw.code;
+	if (isAgxPublicErrorCode(code)) {
+		out.code = code;
 	}
-	if (typeof raw.retryable === "boolean") {
-		out.retryable = raw.retryable;
+	if (typeof retryable === "boolean") {
+		out.retryable = retryable;
 	}
-	if (raw.details !== undefined) {
-		const checked = checkedErrorDetails(raw.details);
+	if (details !== undefined) {
+		const checked = checkedErrorDetails(details);
 		if ("value" in checked) {
 			out.details = checked.value;
 		}
