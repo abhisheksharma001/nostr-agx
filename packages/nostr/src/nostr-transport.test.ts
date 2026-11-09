@@ -11,11 +11,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const publishToRelays = vi.fn();
 const resolvePeerRelays = vi.fn();
+const listenEvents = vi.fn(
+	async (..._args: unknown[]): Promise<
+		Array<{ close(): void; relay: { close(): void } }>
+	> => [],
+);
 
 vi.mock("./relay-pool", () => ({
 	publishToRelays: (...args: unknown[]) => publishToRelays(...args),
 	pollInbox: vi.fn(async () => ({ events: [], complete: true })),
-	listenEvents: vi.fn(async () => []),
+	listenEvents: (...args: unknown[]) => listenEvents(...args),
 }));
 vi.mock("./discovery", async (importOriginal) => ({
 	...(await importOriginal<typeof import("./discovery")>()),
@@ -71,6 +76,29 @@ beforeEach(() => {
 	resolvePeerRelays.mockResolvedValue([]);
 	// Module-scoped cache outlives each transport() — clear between cases.
 	__resetPeerRelayCacheForTests();
+});
+
+describe("transport lifecycle", () => {
+	it("starts listening explicitly and closes relay connections on stop", async () => {
+		const closeSubscription = vi.fn();
+		const closeRelay = vi.fn();
+		listenEvents.mockResolvedValueOnce([
+			{
+				close: closeSubscription,
+				relay: { close: closeRelay },
+			},
+		]);
+
+		const instance = await transport();
+		expect(listenEvents).not.toHaveBeenCalled();
+
+		await instance.start();
+		expect(listenEvents).toHaveBeenCalledOnce();
+
+		await instance.stop();
+		expect(closeSubscription).toHaveBeenCalledOnce();
+		expect(closeRelay).toHaveBeenCalledOnce();
+	});
 });
 
 describe("publishMessage derives deliveredToPeer", () => {

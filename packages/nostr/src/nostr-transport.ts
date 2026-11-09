@@ -137,9 +137,7 @@ export class NostrTransport implements AgxTransport {
 	 * synchronous (the `AgxTransport` contract) even for a remote signer. */
 	static async create(config: NostrTransportConfig): Promise<NostrTransport> {
 		const publicKey = await config.signer.getPublicKey();
-		const transport = new NostrTransport(config, publicKey);
-		await transport.start()
-		return transport;
+		return new NostrTransport(config, publicKey);
 	}
 
 	private constructor(config: NostrTransportConfig, publicKey: string) {
@@ -816,8 +814,12 @@ export class NostrTransport implements AgxTransport {
 	}
 
 	async stop(): Promise<void> {
-		this.subscriptions.forEach((sub) => sub.close());
+		const subscriptions = this.subscriptions;
 		this.subscriptions = [];
+		subscriptions.forEach((sub) => sub.close());
+		new Set(subscriptions.map((sub) => sub.relay)).forEach((relay) =>
+			relay.close(),
+		);
 		this.onMessageHandlers.clear();
 		this.onReceiptHandlers.clear();
 	}

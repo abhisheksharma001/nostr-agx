@@ -25,6 +25,9 @@ agx.handle("invoice.review", async (task) => paperclip.run(task.payload));
 await agx.start();
 ```
 
+`NostrTransport.create()` only constructs the transport. `AgxClient.start()` opens its relay
+subscriptions, and `AgxClient.stop()` closes both those subscriptions and their relay connections.
+
 **Runtime:** Node. The transport dials WebSockets and the SSRF guard uses `node:dns` to vet
 peer-supplied relay / NIP-05 hosts before connecting. `node:dns`/`node:net` are imported lazily so a
 non-Node bundle doesn't fail to resolve them, but where DNS is unavailable (browser/edge) the guard
