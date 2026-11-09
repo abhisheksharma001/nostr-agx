@@ -1,5 +1,6 @@
 import {
 	AgxPublicError,
+	type AgxPublicErrorOptions,
 	AgxTaskDeclined,
 	AgxTaskFailedError,
 	readPublicErrorFields,
@@ -789,6 +790,8 @@ export class AgxClient {
 			// Only a deliberately public error carries a code, `retryable` or
 			// `details`: an ordinary exception's own `code` (ECONNREFUSED, a SQL
 			// state) is exactly the internal detail this boundary keeps back.
+			// The fields are checked again here, not only when the error was built:
+			// a subclass or a later assignment must not get an unchecked value out.
 			await this.sendResult(
 				msg.from,
 				env.taskId,
@@ -796,9 +799,7 @@ export class AgxClient {
 					? {
 							status: "failed",
 							error: (err as AgxPublicError).message,
-							code: (err as AgxPublicError).code,
-							retryable: (err as AgxPublicError).retryable,
-							details: (err as AgxPublicError).details,
+							...readPublicErrorFields(err as AgxPublicError),
 						}
 					: { status: "failed", error: "handler failed" },
 			);
@@ -812,10 +813,7 @@ export class AgxClient {
 			status: "completed" | "failed";
 			output?: unknown;
 			error?: string;
-			code?: string;
-			retryable?: boolean;
-			details?: Record<string, string | number | boolean>;
-		},
+		} & AgxPublicErrorOptions,
 	): Promise<void> {
 		let env: TaskEnvelope = {
 			t: "res",

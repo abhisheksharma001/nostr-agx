@@ -13,41 +13,45 @@
  *   });
  */
 export class AgxPublicError extends Error {
+	// `declare` so no empty `code`/`retryable`/`details` keys appear on an error
+	// that was not given them.
 	/** A machine-readable reason a workflow can branch on, when one was given. */
-	readonly code?: AgxPublicErrorCode;
+	declare readonly code?: AgxPublicErrorCode;
 	/** Whether the same request may succeed if sent again, when stated. */
-	readonly retryable?: boolean;
-	/** Small public facts about the failure, when given. */
-	readonly details?: AgxErrorDetails;
+	declare readonly retryable?: boolean;
+	/** Small public facts about the failure: a frozen copy of what was given. */
+	declare readonly details?: AgxErrorDetails;
 
 	/**
 	 * `options` is optional and everything in it crosses the trust boundary, so
 	 * it is checked here: a bad `code` or `details` throws a `TypeError` in the
-	 * handler, which the peer sees only as the generic `handler failed`.
+	 * handler, which the peer sees only as the generic `handler failed`. It is
+	 * checked again just before sending, so a later change cannot get past it.
 	 */
-	constructor(message: string, options: AgxPublicErrorOptions = {}) {
+	constructor(message: string, options?: AgxPublicErrorOptions | null) {
 		super(message);
 		this.name = "AgxPublicError";
-		if (options.code !== undefined) {
-			if (!isAgxPublicErrorCode(options.code)) {
+		const given = options ?? {};
+		if (given.code !== undefined) {
+			if (!isAgxPublicErrorCode(given.code)) {
 				throw new TypeError(
 					`AgxPublicError code must be one of ${AGX_ERROR_CODES.join(", ")} or a namespaced code such as "acme.rate_limited"`,
 				);
 			}
-			this.code = options.code;
+			this.code = given.code;
 		}
-		if (options.retryable !== undefined) {
-			if (typeof options.retryable !== "boolean") {
+		if (given.retryable !== undefined) {
+			if (typeof given.retryable !== "boolean") {
 				throw new TypeError("AgxPublicError retryable must be a boolean");
 			}
-			this.retryable = options.retryable;
+			this.retryable = given.retryable;
 		}
-		if (options.details !== undefined) {
-			const problem = agxErrorDetailsProblem(options.details);
-			if (problem) {
-				throw new TypeError(`AgxPublicError details ${problem}`);
+		if (given.details !== undefined) {
+			const checked = checkedErrorDetails(given.details);
+			if ("problem" in checked) {
+				throw new TypeError(`AgxPublicError details ${checked.problem}`);
 			}
-			this.details = options.details;
+			this.details = checked.value;
 		}
 	}
 }
@@ -84,48 +88,64 @@ export const MAX_ERROR_DETAIL_VALUE_CHARS = 200;
 
 const NAMESPACED_CODE = /^[a-z0-9][a-z0-9_-]*(\.[a-z0-9][a-z0-9_-]*)+$/;
 
-/** True for a code in the closed set or a well-formed namespaced code. */
+/** True for a code in the closed set or a well-formed namespaced code. A
+ * namespace may not be a closed-set word, so `busy.later` is refused: it would
+ * read as `busy` to anything that looks only at the first segment. */
 export function isAgxPublicErrorCode(code: unknown): code is AgxPublicErrorCode {
 	if (typeof code !== "string" || code.length > MAX_ERROR_CODE_CHARS) {
 		return false;
 	}
+	if ((AGX_ERROR_CODES as readonly string[]).includes(code)) {
+		return true;
+	}
 	return (
-		(AGX_ERROR_CODES as readonly string[]).includes(code) ||
-		NAMESPACED_CODE.test(code)
+		NAMESPACED_CODE.test(code) &&
+		!(AGX_ERROR_CODES as readonly string[]).includes(code.split(".")[0])
 	);
 }
 
-/** Why `details` cannot cross the trust boundary, or null when it can. */
-export function agxErrorDetailsProblem(details: unknown): string | null {
-	if (
-		typeof details !== "object" ||
-		details === null ||
-		Array.isArray(details) ||
-		Object.getPrototypeOf(details) !== Object.prototype
-	) {
-		return "must be a plain object";
+/**
+ * A validated, frozen copy of `details`, or the reason it cannot cross the
+ * trust boundary. The copy is what gets checked and what gets used, so an
+ * object changed after the check, or one with getters that answer differently
+ * the second time, cannot get past it.
+ */
+export function checkedErrorDetails(
+	details: unknown,
+): { value: AgxErrorDetails } | { problem: string } {
+	if (typeof details !== "object" || details === null || Array.isArray(details)) {
+		return { problem: "must be a plain object" };
+	}
+	const proto = Object.getPrototypeOf(details);
+	if (proto !== Object.prototype && proto !== null) {
+		return { problem: "must be a plain object" };
 	}
 	const entries = Object.entries(details);
 	if (entries.length > MAX_ERROR_DETAIL_KEYS) {
-		return `may have at most ${MAX_ERROR_DETAIL_KEYS} keys`;
+		return { problem: `may have at most ${MAX_ERROR_DETAIL_KEYS} keys` };
 	}
 	for (const [key, value] of entries) {
 		if (key.length === 0 || key.length > MAX_ERROR_DETAIL_KEY_CHARS) {
-			return `keys must be 1 to ${MAX_ERROR_DETAIL_KEY_CHARS} characters`;
+			return { problem: `keys must be 1 to ${MAX_ERROR_DETAIL_KEY_CHARS} characters` };
+		}
+		if (key === "__proto__") {
+			return { problem: 'may not use the key "__proto__"' };
 		}
 		if (typeof value === "string") {
 			if (value.length > MAX_ERROR_DETAIL_VALUE_CHARS) {
-				return `string values may be at most ${MAX_ERROR_DETAIL_VALUE_CHARS} characters`;
+				return {
+					problem: `string values may be at most ${MAX_ERROR_DETAIL_VALUE_CHARS} characters`,
+				};
 			}
 		} else if (typeof value === "number") {
 			if (!Number.isFinite(value)) {
-				return "numbers must be finite";
+				return { problem: "numbers must be finite" };
 			}
 		} else if (typeof value !== "boolean") {
-			return "values must be strings, numbers or booleans";
+			return { problem: "values must be strings, numbers or booleans" };
 		}
 	}
-	return null;
+	return { value: Object.freeze(Object.fromEntries(entries)) as AgxErrorDetails };
 }
 
 /**
@@ -145,8 +165,11 @@ export function readPublicErrorFields(raw: {
 	if (typeof raw.retryable === "boolean") {
 		out.retryable = raw.retryable;
 	}
-	if (raw.details !== undefined && agxErrorDetailsProblem(raw.details) === null) {
-		out.details = raw.details as AgxErrorDetails;
+	if (raw.details !== undefined) {
+		const checked = checkedErrorDetails(raw.details);
+		if ("value" in checked) {
+			out.details = checked.value;
+		}
 	}
 	return out;
 }
@@ -158,16 +181,22 @@ export function readPublicErrorFields(raw: {
  * `code` and `retryable`. All three are claims the peer made, not facts.
  */
 export class AgxTaskFailedError extends Error {
-	readonly code?: AgxPublicErrorCode;
-	readonly retryable?: boolean;
-	readonly details?: AgxErrorDetails;
+	declare readonly code?: AgxPublicErrorCode;
+	declare readonly retryable?: boolean;
+	declare readonly details?: AgxErrorDetails;
 
 	constructor(message: string, fields: AgxPublicErrorOptions = {}) {
 		super(message);
 		this.name = "AgxTaskFailedError";
-		this.code = fields.code;
-		this.retryable = fields.retryable;
-		this.details = fields.details;
+		if (fields.code !== undefined) {
+			this.code = fields.code;
+		}
+		if (fields.retryable !== undefined) {
+			this.retryable = fields.retryable;
+		}
+		if (fields.details !== undefined) {
+			this.details = fields.details;
+		}
 	}
 }
 

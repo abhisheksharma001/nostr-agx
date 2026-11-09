@@ -1358,4 +1358,71 @@ describe("AgxClient structured public errors", () => {
 		expect(failure.retryable).toBeUndefined();
 		expect(failure.details).toBeUndefined();
 	});
+
+	it("sends a frozen copy of details, so a change after construction cannot widen it", async () => {
+		const given: Record<string, string | number | boolean> = { queue: "invoices" };
+		const error = new AgxPublicError("queue is full", { code: "busy", details: given });
+		given.password = "hunter2";
+		given.extra = 1;
+		expect(error.details).toEqual({ queue: "invoices" });
+		expect(Object.isFrozen(error.details)).toBe(true);
+	});
+
+	it("re-checks a subclass that smuggles an internal code past the constructor", async () => {
+		class SneakyError extends AgxPublicError {
+			constructor(message: string) {
+				super(message);
+				Object.defineProperty(this, "code", { get: () => "ECONNREFUSED" });
+			}
+		}
+		const bob = bobWith(() => {
+			throw new SneakyError("backend unreachable");
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "work", {});
+		const settled = pending.catch((e: unknown) => e);
+		await bob.pump();
+		await alice.pump();
+
+		expect(resultOnWire().code).toBeUndefined();
+		const failure = (await settled) as AgxTaskFailedError;
+		expect(failure.message).toBe("backend unreachable");
+		expect(failure.code).toBeUndefined();
+	});
+
+	it("keeps a namespace from being a closed-set word", () => {
+		expect(() => new AgxPublicError("x", { code: "busy.later" as never })).toThrow(TypeError);
+		expect(() => new AgxPublicError("x", { code: "acme.busy" })).not.toThrow();
+	});
+
+	it("refuses a __proto__ key in details and accepts a null-prototype object", () => {
+		const hostile = JSON.parse('{"__proto__": 1}') as Record<string, number>;
+		expect(() => new AgxPublicError("x", { details: hostile })).toThrow(TypeError);
+		const bare = Object.assign(Object.create(null), { queue: "invoices" });
+		expect(new AgxPublicError("x", { details: bare }).details).toEqual({ queue: "invoices" });
+	});
+
+	it("tolerates null options from untyped callers", () => {
+		expect(() => new AgxPublicError("x", null)).not.toThrow();
+	});
+
+	it("leaves no empty code, retryable or details keys on errors that have none", async () => {
+		const error = new AgxPublicError("plain");
+		for (const key of ["code", "retryable", "details"]) {
+			expect(key in error).toBe(false);
+		}
+
+		const bob = bobWith(() => {
+			throw new AgxPublicError("plain");
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "work", {});
+		const settled = pending.catch((e: unknown) => e);
+		await bob.pump();
+		await alice.pump();
+		const failure = (await settled) as AgxTaskFailedError;
+		for (const key of ["code", "retryable", "details"]) {
+			expect(key in failure).toBe(false);
+		}
+	});
 });
