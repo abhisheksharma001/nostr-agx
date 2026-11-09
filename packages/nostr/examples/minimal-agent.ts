@@ -58,38 +58,54 @@ async function main() {
 		}),
 	});
 
-	// A real runtime would `await responder.start()` (advertise + poll on an
-	// interval). Here we drive `pump()` manually so the example exits cleanly.
-	// const pending = initiator.request<{ approved: boolean }>(
-	// 	responder.whoami(),
-	// 	"invoice.review",
-	// 	{ amount: 4200, vendor: "Globex" },
-	// );
+	try {
+		// Poll-only request: neither client is started; the host controls dispatch
+		// by calling pump() itself.
+		let pollOnlySettled = false;
+		const pollOnlyResult = initiator
+			.request<{ approved: boolean }>(
+				responder.whoami(),
+				"invoice.review",
+				{ amount: 4200, vendor: "Globex" },
+			)
+			.finally(() => {
+				pollOnlySettled = true;
+			});
+		while (!pollOnlySettled) {
+			await responder.pump();
+			await initiator.pump();
+			if (!pollOnlySettled) {
+				await sleep(100);
+			}
+		}
+		console.info("poll-only invoice.review →", await pollOnlyResult);
 
-	// const result = await pending;
-	// console.info("invoice.review →", result); // { approved: true }
+		// Managed lifecycle: start() enables live delivery and scheduled polling;
+		// streamRequest() exposes progress events and the final result promise.
+		await Promise.all([
+			responder.start({ pollIntervalMs: 100 }),
+			initiator.start({ pollIntervalMs: 100 }),
+		]);
 
-	const stream = await initiator.streamRequest<{ approved: boolean }>(
-		responder.whoami(),
-		"invoice.review",
-		{ amount: 4200, vendor: "Globex" },
-	);
+		const stream = await initiator.streamRequest<{ approved: boolean }>(
+			responder.whoami(),
+			"invoice.review",
+			{ amount: 4200, vendor: "Globex" },
+		);
 
-	await new Promise((resolve, reject) => {
 		stream.on("error", (err) => {
 			console.error("invoice.review error →", err);
-			reject(err);
 		});
-
-		stream.on("statusUpdate", status => {
+		stream.on("statusUpdate", (status) => {
 			console.log("invoice.review status →", status);
-		})
-
-		stream.on("completed", (output: { approved: boolean }) => {
-			console.log("invoice.review →", output);
-			resolve(undefined);
-		})
-	})
+		});
+		stream.on("completed", (output) => {
+			console.log("streamed invoice.review →", output);
+		});
+		console.info("streamed result →", await stream.result);
+	} finally {
+		await Promise.all([initiator.stop(), responder.stop()]);
+	}
 }
 
 main().then(
