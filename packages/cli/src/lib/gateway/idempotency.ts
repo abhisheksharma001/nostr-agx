@@ -111,6 +111,28 @@ function hash(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+/** Keyed requests and background tasks with a key need their record for replay. Unkeyed background
+ * results do not, so they live in a separate pool and never evict or block the first kind. */
+function holdsIdempotencyKey(operation: Operation): boolean {
+	return !operation.background || operation.keyed;
+}
+
+// The file is pretty-printed and each operation sits one level inside "operations": four more
+// spaces per line, plus the ",\n" between operations. The constant covers the surrounding wrapper.
+const STORE_FILE_OVERHEAD_BYTES = 64;
+function operationFileBytes(operation: Operation): number {
+	const text = JSON.stringify(operation, null, 2);
+	let lines = 1;
+	for (let at = text.indexOf("\n"); at !== -1; at = text.indexOf("\n", at + 1)) {
+		lines += 1;
+	}
+	return Buffer.byteLength(text, "utf8") + lines * 4 + 2;
+}
+
+function isOlder(a: Operation, b: Operation): boolean {
+	return a.updatedAt < b.updatedAt || (a.updatedAt === b.updatedAt && a.id < b.id);
+}
+
 export function parseIdempotencyKey(value: string | string[] | undefined): string | null {
 	if (value === undefined) {
 		return null;
@@ -142,6 +164,10 @@ export class TaskOperationStore {
 	private readonly maxStoreBytes: number;
 	private readonly log: (line: string) => void;
 	private readonly records: Map<string, Operation>;
+	// Size of each stored record, kept in step with `records` so the byte budget never re-serializes.
+	private readonly recordBytes = new Map<Operation, number>();
+	private readonly credentialBytes = new Map<string, number>();
+	private totalBytes = STORE_FILE_OVERHEAD_BYTES;
 	private readonly inFlight = new Map<string, Promise<Record<string, unknown>>>();
 	private readonly synchronousInFlight = new Set<string>();
 	private readonly backgroundInFlight = new Set<string>();
@@ -157,17 +183,18 @@ export class TaskOperationStore {
 		this.maxStoreBytes = options.maxStoreBytes ?? MAX_TASK_OPERATION_STORE_BYTES;
 		this.log = options.log ?? (() => undefined);
 		this.records = new Map(this.readOperations().map((operation) => [operation.id, operation]));
+		for (const operation of this.records.values()) {
+			this.track(operation);
+		}
 		let changed = this.prune();
 		for (const operation of this.records.values()) {
 			if (operation.outcome === null) {
-				operation.outcome = unknownOutcome();
-				operation.updatedAt = this.now();
+				this.setOutcome(operation, unknownOutcome());
 				changed = true;
 			} else {
 				const retained = this.retainedOutcome(operation.outcome, operation.background);
 				if (retained !== operation.outcome) {
-					operation.outcome = retained;
-					operation.updatedAt = this.now();
+					this.setOutcome(operation, retained);
 					changed = true;
 				}
 			}
@@ -204,8 +231,7 @@ export class TaskOperationStore {
 				return running;
 			}
 			if (existing.outcome === null) {
-				existing.outcome = unknownOutcome();
-				existing.updatedAt = this.now();
+				this.setOutcome(existing, unknownOutcome());
 				this.persist();
 			}
 			return this.replay(existing);
@@ -218,7 +244,7 @@ export class TaskOperationStore {
 				"Try again when an operation finishes.",
 			);
 		}
-		const evicted = this.makeStorageRoom(credentialHash);
+		const evicted = this.makeStorageRoom(credentialHash, true);
 		const created = {
 			id,
 			credential: credentialHash,
@@ -229,13 +255,13 @@ export class TaskOperationStore {
 			updatedAt: this.now(),
 			outcome: null,
 		} satisfies Operation;
-		this.records.set(id, created);
+		this.put(created);
 		try {
 			this.persist();
 		} catch (error) {
-			this.records.delete(id);
+			this.drop(created);
 			for (const operation of evicted) {
-				this.records.set(operation.id, operation);
+				this.put(operation);
 			}
 			throw error;
 		}
@@ -273,8 +299,7 @@ export class TaskOperationStore {
 				throw new ApiError(409, "idempotency_key_reused", "This idempotency key belongs to a synchronous task");
 			}
 			if (existing.outcome === null && !this.inFlight.has(id)) {
-				existing.outcome = unknownOutcome();
-				existing.updatedAt = this.now();
+				this.setOutcome(existing, unknownOutcome());
 				this.persist();
 			}
 			return this.view(existing);
@@ -287,7 +312,7 @@ export class TaskOperationStore {
 				"Try again when a background task finishes.",
 			);
 		}
-		const evicted = this.makeStorageRoom(credentialHash);
+		const evicted = this.makeStorageRoom(credentialHash, key !== null);
 		const created = {
 			id,
 			publicId,
@@ -299,13 +324,13 @@ export class TaskOperationStore {
 			updatedAt: this.now(),
 			outcome: null,
 		} satisfies Operation;
-		this.records.set(id, created);
+		this.put(created);
 		try {
 			this.persist();
 		} catch (error) {
-			this.records.delete(id);
+			this.drop(created);
 			for (const operation of evicted) {
-				this.records.set(operation.id, operation);
+				this.put(operation);
 			}
 			throw error;
 		}
@@ -337,8 +362,7 @@ export class TaskOperationStore {
 			return null;
 		}
 		if (operation.outcome === null && !this.inFlight.has(operation.id)) {
-			operation.outcome = unknownOutcome();
-			operation.updatedAt = this.now();
+			this.setOutcome(operation, unknownOutcome());
 			this.persist();
 		}
 		return this.view(operation);
@@ -352,8 +376,7 @@ export class TaskOperationStore {
 		let changed = false;
 		for (const operation of this.records.values()) {
 			if (operation.outcome === null) {
-				operation.outcome = unknownOutcome();
-				operation.updatedAt = this.now();
+				this.setOutcome(operation, unknownOutcome());
 				changed = true;
 			}
 		}
@@ -401,17 +424,22 @@ export class TaskOperationStore {
 		}
 	}
 
-	private makeStorageRoom(credentialHash: string): Operation[] {
+	private makeStorageRoom(credentialHash: string, idempotency: boolean): Operation[] {
 		const evicted: Operation[] = [];
+		const samePool = (record: Operation) => holdsIdempotencyKey(record) === idempotency;
 		let credentialOperations = 0;
+		let poolOperations = 0;
 		for (const record of this.records.values()) {
-			if (record.credential === credentialHash) {
-				credentialOperations += 1;
+			if (samePool(record)) {
+				poolOperations += 1;
+				if (record.credential === credentialHash) {
+					credentialOperations += 1;
+				}
 			}
 		}
 		try {
 			while (credentialOperations >= this.maxOperationsPerCredential) {
-				const oldest = this.oldestSettled(credentialHash);
+				const oldest = this.oldestSettled((record) => samePool(record) && record.credential === credentialHash);
 				if (!oldest) {
 					throw new ApiError(
 						503,
@@ -420,12 +448,13 @@ export class TaskOperationStore {
 						"Retry when an operation finishes.",
 					);
 				}
-				this.records.delete(oldest.id);
+				this.drop(oldest);
 				evicted.push(oldest);
 				credentialOperations -= 1;
+				poolOperations -= 1;
 			}
-			while (this.records.size >= MAX_TASK_OPERATIONS) {
-				const oldest = this.oldestSettled();
+			while (poolOperations >= MAX_TASK_OPERATIONS) {
+				const oldest = this.oldestSettled(samePool);
 				if (!oldest) {
 					throw new ApiError(
 						503,
@@ -434,60 +463,109 @@ export class TaskOperationStore {
 						"Retry when an operation finishes.",
 					);
 				}
-				this.records.delete(oldest.id);
+				this.drop(oldest);
 				evicted.push(oldest);
+				poolOperations -= 1;
 			}
 		} catch (error) {
 			for (const operation of evicted) {
-				this.records.set(operation.id, operation);
+				this.put(operation);
 			}
 			throw error;
 		}
 		return evicted;
 	}
 
-	private oldestSettled(credentialHash?: string, excludeId?: string): Operation | undefined {
+	private oldestSettled(match: (operation: Operation) => boolean): Operation | undefined {
 		let oldest: Operation | undefined;
 		for (const operation of this.records.values()) {
-			if (
-				operation.outcome === null ||
-				operation.id === excludeId ||
-				(credentialHash !== undefined && operation.credential !== credentialHash)
-			) {
+			if (operation.outcome === null || !match(operation)) {
 				continue;
 			}
-			if (
-				!oldest ||
-				operation.updatedAt < oldest.updatedAt ||
-				(operation.updatedAt === oldest.updatedAt && operation.id < oldest.id)
-			) {
+			if (!oldest || isOlder(operation, oldest)) {
 				oldest = operation;
 			}
 		}
 		return oldest;
 	}
 
+	/** Evicts settled records until the store fits its byte budget. The credential that holds the
+	 * most bytes gives up its oldest settled record first, so one credential's large results never
+	 * push out the records of a credential that stores less. */
 	private enforceByteBudget(protectedId?: string): Operation[] {
 		const evicted: Operation[] = [];
-		while (this.storeBytes() > this.maxStoreBytes) {
-			const oldest = this.oldestSettled(undefined, protectedId);
-			if (!oldest) {
+		while (this.totalBytes > this.maxStoreBytes) {
+			const victim = this.oldestOfHeaviestCredential(protectedId);
+			if (!victim) {
 				break;
 			}
-			this.records.delete(oldest.id);
-			evicted.push(oldest);
+			this.drop(victim);
+			evicted.push(victim);
 		}
 		return evicted;
 	}
 
-	private storeBytes(): number {
-		try {
-			return Buffer.byteLength(JSON.stringify({
-				version: 1,
-				operations: Array.from(this.records.values()),
-			}, null, 2), "utf8");
-		} catch {
-			return Number.POSITIVE_INFINITY;
+	private oldestOfHeaviestCredential(protectedId?: string): Operation | undefined {
+		let chosen: Operation | undefined;
+		let chosenBytes = 0;
+		for (const operation of this.records.values()) {
+			if (operation.outcome === null || operation.id === protectedId) {
+				continue;
+			}
+			const bytes = this.credentialBytes.get(operation.credential ?? "") ?? 0;
+			if (!chosen || bytes > chosenBytes || (bytes === chosenBytes && isOlder(operation, chosen))) {
+				chosen = operation;
+				chosenBytes = bytes;
+			}
+		}
+		return chosen;
+	}
+
+	/** Every change to `records` goes through put/drop/setOutcome so the byte counts stay exact. */
+	private put(operation: Operation): void {
+		this.untrack(operation);
+		this.records.set(operation.id, operation);
+		this.track(operation);
+	}
+
+	private drop(operation: Operation): void {
+		this.records.delete(operation.id);
+		this.untrack(operation);
+	}
+
+	private setOutcome(operation: Operation, outcome: Outcome | null): void {
+		const tracked = this.recordBytes.has(operation);
+		if (tracked) {
+			this.untrack(operation);
+		}
+		operation.outcome = outcome;
+		operation.updatedAt = this.now();
+		if (tracked) {
+			this.track(operation);
+		}
+	}
+
+	private track(operation: Operation): void {
+		const bytes = operationFileBytes(operation);
+		const owner = operation.credential ?? "";
+		this.recordBytes.set(operation, bytes);
+		this.totalBytes += bytes;
+		this.credentialBytes.set(owner, (this.credentialBytes.get(owner) ?? 0) + bytes);
+	}
+
+	private untrack(operation: Operation): void {
+		const bytes = this.recordBytes.get(operation);
+		if (bytes === undefined) {
+			return;
+		}
+		const owner = operation.credential ?? "";
+		const remaining = (this.credentialBytes.get(owner) ?? 0) - bytes;
+		this.recordBytes.delete(operation);
+		this.totalBytes -= bytes;
+		if (remaining > 0) {
+			this.credentialBytes.set(owner, remaining);
+		} else {
+			this.credentialBytes.delete(owner);
 		}
 	}
 
@@ -517,8 +595,7 @@ export class TaskOperationStore {
 			outcome = errorOutcome(error);
 		}
 		const retryable = failed && unexpected instanceof ApiError && RETRYABLE_TASK_ERROR_CODES.has(unexpected.code);
-		operation.outcome = retryable && !operation.background ? null : this.retainedOutcome(outcome, operation.background);
-		operation.updatedAt = this.now();
+		this.setOutcome(operation, retryable && !operation.background ? null : this.retainedOutcome(outcome, operation.background));
 		if (!this.closed && this.records.get(operation.id) === operation) {
 			let evicted: Operation[] = [];
 			try {
@@ -526,18 +603,18 @@ export class TaskOperationStore {
 					if (operation.background) {
 						this.releaseBackgroundKey(operation);
 					} else {
-						this.records.delete(operation.id);
+						this.drop(operation);
 					}
 				}
 				evicted = this.enforceByteBudget(operation.id);
 				this.persist();
 			} catch {
 				for (const settled of evicted) {
-					this.records.set(settled.id, settled);
+					this.put(settled);
 				}
 				operation.outcome = unknownOutcome();
 				operation.updatedAt = this.now();
-				this.records.set(operation.id, operation);
+				this.put(operation);
 				throw new ApiError(
 					500,
 					"idempotency_store_failed",
@@ -556,10 +633,10 @@ export class TaskOperationStore {
 		if (!operation.keyed || !operation.publicId) {
 			return;
 		}
-		this.records.delete(operation.id);
+		this.drop(operation);
 		operation.id = hash(`background task\0${operation.publicId}`);
 		operation.keyed = false;
-		this.records.set(operation.id, operation);
+		this.put(operation);
 	}
 
 	private retainedOutcome(outcome: Outcome, background: boolean): Outcome {
@@ -616,9 +693,9 @@ export class TaskOperationStore {
 	private prune(): boolean {
 		const cutoff = this.now() - this.retentionMs;
 		let changed = false;
-		for (const [id, operation] of this.records) {
+		for (const operation of this.records.values()) {
 			if (operation.updatedAt <= cutoff) {
-				this.records.delete(id);
+				this.drop(operation);
 				changed = true;
 			}
 		}

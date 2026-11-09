@@ -423,11 +423,19 @@ For one API credential, the same key and canonically identical JSON body share o
 request and return the same stored outcome. Object-key order does not matter. A key reused with a
 different body gets `409 idempotency_key_reused`; another credential has an independent key scope.
 
-Outcomes are kept for up to 24 hours, with at most 100 retained operations per API credential and
-1,000 per profile. At either cap, the gateway evicts the oldest settled outcome. Reusing an evicted
-key starts new work, and an evicted public ID returns `404`. If every operation at the cap is still
-running, a new submission gets `503 idempotency_store_full`. The complete operation store is also capped at
-16 MiB, with the same oldest-settled eviction policy.
+Outcomes are kept for up to 24 hours. Operations that carry an idempotency key (every keyed
+synchronous request and every keyed background task) have at most 100 retained per API credential
+and 1,000 per profile. Background tasks submitted without a key keep their results in a separate
+pool with the same two caps, so they never evict or block keyed operations. At any cap, the gateway
+evicts the oldest settled outcome in that pool. Reusing an evicted key starts new work, and an
+evicted public ID returns `404`. If every operation at the cap is still running, a new submission
+gets `503 idempotency_store_full`.
+
+The complete operation store is also capped at 16 MiB. When it is over the cap, the gateway evicts
+the oldest settled outcome of the API credential that stores the most bytes, whichever credential
+just finished a task. One credential's large results therefore push out its own older outcomes
+first. Another credential loses outcomes only if it stores at least as much, or if the credential
+that needs room has no older outcomes left to give up.
 
 At most 256 keyed synchronous operations and 64 background operations run at once, including
 operations whose callers disconnected. Further distinct submissions get `503 busy`; a retry of a
