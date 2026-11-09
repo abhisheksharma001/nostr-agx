@@ -38,6 +38,13 @@ export const taskResultSchema = z.object({
 	status: z.enum(["completed", "failed"]),
 	output: z.unknown().optional(),
 	error: z.string().max(2000).optional(),
+	/** Optional structured failure fields (`code`, `retryable`, `details`). They
+	 * are typed `unknown` here on purpose: a peer controls them, so the client
+	 * checks each against its limits and drops a bad one instead of failing the
+	 * whole envelope, which would turn a clear failure into a timeout. */
+	code: z.unknown().optional(),
+	retryable: z.unknown().optional(),
+	details: z.unknown().optional(),
 });
 export type TaskResultEnvelope = z.infer<typeof taskResultSchema>;
 

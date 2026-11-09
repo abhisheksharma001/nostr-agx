@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgxClient } from "./client";
-import { AgxPublicError, AgxTaskDeclined } from "./errors";
+import { AgxPublicError, AgxTaskDeclined, AgxTaskFailedError } from "./errors";
 import { randomId } from "./id";
 import { encodeTaskEnvelope, parseTaskEnvelope } from "./task";
 import type {
@@ -1201,5 +1201,161 @@ describe("AgxClient request while its publish is slow", () => {
 		await new Promise((r) => setTimeout(r, 50));
 		finishPublish();
 		await expect(pending).rejects.toThrow(/timed out/);
+	});
+});
+
+describe("AgxClient structured public errors", () => {
+	function bobWith(handler: () => unknown): AgxClient {
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+		});
+		bob.handle("work", handler);
+		return bob;
+	}
+
+	/** The `res` envelope Bob put on the wire for Alice. */
+	function resultOnWire(): Record<string, unknown> {
+		const sent = bus.inbox.get(ALICE) ?? [];
+		return JSON.parse(sent[sent.length - 1].text) as Record<string, unknown>;
+	}
+
+	it("delivers a public error's code, retryable and details to the requester", async () => {
+		const bob = bobWith(() => {
+			throw new AgxPublicError("queue is full", {
+				code: "busy",
+				retryable: true,
+				details: { retryAfterSeconds: 30, queue: "invoices" },
+			});
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "work", {});
+		await bob.pump();
+		await alice.pump();
+
+		const failure = await pending.catch((e: unknown) => e);
+		expect(failure).toBeInstanceOf(AgxTaskFailedError);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as AgxTaskFailedError).message).toBe("queue is full");
+		expect((failure as AgxTaskFailedError).code).toBe("busy");
+		expect((failure as AgxTaskFailedError).retryable).toBe(true);
+		expect((failure as AgxTaskFailedError).details).toEqual({
+			retryAfterSeconds: 30,
+			queue: "invoices",
+		});
+	});
+
+	it("accepts a namespaced code of its own", async () => {
+		const bob = bobWith(() => {
+			throw new AgxPublicError("slow down", { code: "acme.rate_limited" });
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "work", {});
+		await bob.pump();
+		await alice.pump();
+		await expect(pending).rejects.toMatchObject({ code: "acme.rate_limited" });
+	});
+
+	it("sends the old result shape when a public error carries no options", async () => {
+		const bob = bobWith(() => {
+			throw new AgxPublicError("invoice not found");
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "work", {});
+		pending.catch(() => undefined);
+		await bob.pump();
+
+		expect(Object.keys(resultOnWire()).sort()).toEqual(
+			["error", "status", "t", "taskId"].sort(),
+		);
+	});
+
+	it("keeps an ordinary exception's own code and details off the wire", async () => {
+		const bob = bobWith(() => {
+			const leaky = Object.assign(
+				new Error("connection to db-host:5432 (user=admin) failed"),
+				{
+					code: "busy",
+					retryable: true,
+					details: { host: "db-host", password: "hunter2" },
+				},
+			);
+			throw leaky;
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "work", {});
+		const settled = pending.catch((e: unknown) => e);
+		await bob.pump();
+		await alice.pump();
+
+		expect(resultOnWire()).toEqual({
+			t: "res",
+			taskId: expect.any(String),
+			status: "failed",
+			error: "handler failed",
+		});
+		const failure = (await settled) as AgxTaskFailedError;
+		expect(failure.message).toBe("handler failed");
+		expect(failure.code).toBeUndefined();
+		expect(failure.retryable).toBeUndefined();
+		expect(failure.details).toBeUndefined();
+	});
+
+	it("refuses an unknown code, a non-boolean retryable and bad details at the sender", () => {
+		expect(() => new AgxPublicError("x", { code: "Not A Code" as never })).toThrow(TypeError);
+		expect(() => new AgxPublicError("x", { code: "teapot" as never })).toThrow(TypeError);
+		expect(() => new AgxPublicError("x", { retryable: "yes" as never })).toThrow(TypeError);
+		expect(
+			() => new AgxPublicError("x", { details: { nested: { a: 1 } } as never }),
+		).toThrow(TypeError);
+		expect(
+			() => new AgxPublicError("x", { details: { long: "y".repeat(201) } }),
+		).toThrow(TypeError);
+		const nine = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, i]));
+		expect(() => new AgxPublicError("x", { details: nine })).toThrow(TypeError);
+	});
+
+	it("shows the peer only the generic message when the options are invalid", async () => {
+		const bob = bobWith(() => {
+			throw new AgxPublicError("secret detail", { code: "teapot" as never });
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "work", {});
+		await bob.pump();
+		await alice.pump();
+		await expect(pending).rejects.toThrow("handler failed");
+	});
+
+	it("ignores bad structured fields from a peer but still delivers the failure", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "work", {});
+		const settled = pending.catch((e: unknown) => e);
+		const sent = bus.inbox.get(BOB) ?? [];
+		const taskId = (JSON.parse(sent[0].text) as { taskId: string }).taskId;
+		bus.pushMessage(ALICE, {
+			from: BOB,
+			text: JSON.stringify({
+				t: "res",
+				taskId,
+				status: "failed",
+				error: "declined",
+				code: "X Y\nZ",
+				retryable: "yes",
+				details: { nested: { deep: true } },
+			}),
+			contextId: taskId,
+			messageId: "m-bad",
+			subject: null,
+			autoDepth: null,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		await alice.pump();
+
+		const failure = (await settled) as AgxTaskFailedError;
+		expect(failure).toBeInstanceOf(AgxTaskFailedError);
+		expect(failure.message).toBe("declined");
+		expect(failure.code).toBeUndefined();
+		expect(failure.retryable).toBeUndefined();
+		expect(failure.details).toBeUndefined();
 	});
 });

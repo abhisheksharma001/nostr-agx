@@ -1,4 +1,9 @@
-import { AgxPublicError, AgxTaskDeclined } from "./errors";
+import {
+	AgxPublicError,
+	AgxTaskDeclined,
+	AgxTaskFailedError,
+	readPublicErrorFields,
+} from "./errors";
 import { randomId } from "./id";
 import { type AgxLogger, noopLogger } from "./logger";
 import { InMemorySeenStore, type SeenStore } from "./seen-store";
@@ -781,12 +786,22 @@ export class AgxClient {
 					error: err instanceof Error ? err.message : String(err),
 				});
 			}
-			await this.sendResult(msg.from, env.taskId, {
-				status: "failed",
-				error: isPublic
-					? (err as AgxPublicError).message
-					: "handler failed",
-			});
+			// Only a deliberately public error carries a code, `retryable` or
+			// `details`: an ordinary exception's own `code` (ECONNREFUSED, a SQL
+			// state) is exactly the internal detail this boundary keeps back.
+			await this.sendResult(
+				msg.from,
+				env.taskId,
+				isPublic
+					? {
+							status: "failed",
+							error: (err as AgxPublicError).message,
+							code: (err as AgxPublicError).code,
+							retryable: (err as AgxPublicError).retryable,
+							details: (err as AgxPublicError).details,
+						}
+					: { status: "failed", error: "handler failed" },
+			);
 		}
 	}
 
@@ -797,6 +812,9 @@ export class AgxClient {
 			status: "completed" | "failed";
 			output?: unknown;
 			error?: string;
+			code?: string;
+			retryable?: boolean;
+			details?: Record<string, string | number | boolean>;
 		},
 	): Promise<void> {
 		let env: TaskEnvelope = {
@@ -805,6 +823,9 @@ export class AgxClient {
 			status: result.status,
 			output: result.output,
 			error: result.error,
+			code: result.code,
+			retryable: result.retryable,
+			details: result.details,
 		};
 		let text = encodeTaskEnvelope(env);
 		// A too-large result would be truncated into an unparseable envelope, so the
@@ -862,7 +883,9 @@ export class AgxClient {
 		if (env.status === "completed") {
 			p.resolve(env.output);
 		} else {
-			p.reject(new Error(env.error ?? "task failed"));
+			p.reject(
+				new AgxTaskFailedError(env.error ?? "task failed", readPublicErrorFields(env)),
+			);
 		}
 	}
 
