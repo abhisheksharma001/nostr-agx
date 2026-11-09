@@ -1,5 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sandbox } from "../../test/helpers.js";
 import { gatewayTaskOperationsPath, writePrivateJson, writePrivateText } from "../paths.js";
 import { ApiError } from "./http.js";
@@ -556,6 +557,146 @@ describe("TaskOperationStore background tasks", () => {
 		expect(store.get("credential-a", first.id as string)).toBeNull();
 		expect(store.get("credential-a", second.id as string)).toMatchObject({ status: "completed" });
 		expect(Buffer.byteLength(readFileSync(gatewayTaskOperationsPath("test"), "utf8"))).toBeLessThanOrEqual(4097);
+		store.close();
+	});
+});
+
+describe("TaskOperationStore storage fairness", () => {
+	it("evicts the credential holding the most bytes, not another credential's records", async () => {
+		let clock = 1_000;
+		const store = new TaskOperationStore("test", { maxStoreBytes: 9_000, now: () => (clock += 1) });
+		let runs = 0;
+		const small = async () => ({ run: ++runs });
+		await store.execute("credential-b", "keyed", {}, small);
+		const bystander = store.submit("credential-b", null, { background: true }, async () => ({ owner: "b" }));
+		await waitForStatus(store, "credential-b", bystander.id as string, "completed");
+
+		const heavy: string[] = [];
+		for (let index = 0; index < 6; index++) {
+			const accepted = store.submit("credential-a", null, { background: true }, async () => ({
+				output: "x".repeat(3000),
+			}));
+			heavy.push(accepted.id as string);
+			await waitForStatus(store, "credential-a", accepted.id as string, "completed");
+		}
+
+		expect(store.get("credential-b", bystander.id as string)).toMatchObject({ status: "completed" });
+		await expect(store.execute("credential-b", "keyed", {}, small)).resolves.toEqual({ run: 1 });
+		expect(runs).toBe(1);
+		expect(store.get("credential-a", heavy[0] as string)).toBeNull();
+		expect(store.get("credential-a", heavy[5] as string)).toMatchObject({ status: "completed" });
+		store.close();
+	});
+
+	it("evicts from the credential holding the most records when the profile cap is reached", async () => {
+		let clock = 1_000;
+		const store = new TaskOperationStore("test", { maxOperations: 4, now: () => (clock += 1) });
+		let runs = 0;
+		const work = async () => ({ run: ++runs });
+		await store.execute("credential-b", "keyed", {}, work);
+		for (const key of ["one", "two", "three"]) {
+			await store.execute("credential-a", key, {}, work);
+		}
+		await store.execute("credential-a", "four", {}, work);
+		expect(runs).toBe(5);
+
+		await expect(store.execute("credential-b", "keyed", {}, work)).resolves.toEqual({ run: 1 });
+		expect(runs).toBe(5);
+		await store.execute("credential-a", "one", {}, work);
+		expect(runs).toBe(6);
+		store.close();
+	});
+
+	it("keeps the byte counts exact across failed writes and key release", async () => {
+		const path = gatewayTaskOperationsPath("test");
+		const store = new TaskOperationStore("test");
+		const work = async () => ({ output: "x".repeat(500) });
+		await store.execute("credential-a", "first", {}, work);
+		const done = store.submit("credential-b", null, { background: true }, work);
+		await waitForStatus(store, "credential-b", done.id as string, "completed");
+
+		rmSync(path, { force: true });
+		mkdirSync(path);
+		writeFileSync(join(path, "keep"), "blocks the final rename");
+		await expect(store.execute("credential-a", "second", {}, work)).rejects.toThrow();
+		expect(() => store.submit("credential-a", "third", { background: true }, work)).toThrow();
+		rmSync(path, { recursive: true });
+
+		const retry = store.submit("credential-a", "retry", { background: true }, async () => {
+			throw new ApiError(400, "invalid_request", "bad request");
+		});
+		await waitForStatus(store, "credential-a", retry.id as string, "failed");
+		await store.execute("credential-b", "last", {}, work);
+
+		const live = store as unknown as { totalBytes: number; credentialBytes: Map<string, number> };
+		const reloaded = new TaskOperationStore("test");
+		const fresh = reloaded as unknown as { totalBytes: number; credentialBytes: Map<string, number> };
+		expect(live.totalBytes).toBe(fresh.totalBytes);
+		expect([...live.credentialBytes].sort()).toEqual([...fresh.credentialBytes].sort());
+		expect(live.totalBytes).toBeGreaterThanOrEqual(Buffer.byteLength(readFileSync(path, "utf8")));
+		reloaded.close();
+		store.close();
+	});
+
+	it("tracks stored bytes instead of re-serializing the whole store for each eviction", async () => {
+		const store = new TaskOperationStore("test", { maxStoreBytes: 60_000 });
+		for (let index = 0; index < 30; index++) {
+			const accepted = store.submit("credential-a", null, { background: true }, async () => ({
+				output: "x".repeat(1500),
+			}));
+			await waitForStatus(store, "credential-a", accepted.id as string, "completed");
+		}
+		const stringify = vi.spyOn(JSON, "stringify");
+		let wholeStoreCalls = 0;
+		try {
+			const big = store.submit("credential-a", null, { background: true }, async () => ({
+				output: "y".repeat(40_000),
+			}));
+			await waitForStatus(store, "credential-a", big.id as string, "completed");
+			wholeStoreCalls = stringify.mock.calls.filter(
+				([value]) => typeof value === "object" && value !== null && "operations" in value,
+			).length;
+		} finally {
+			stringify.mockRestore();
+		}
+		expect(wholeStoreCalls).toBeLessThanOrEqual(3);
+		expect(Buffer.byteLength(readFileSync(gatewayTaskOperationsPath("test"), "utf8"))).toBeLessThanOrEqual(60_000);
+		store.close();
+	});
+
+	it("keeps unkeyed background results out of the idempotency pool", async () => {
+		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 2 });
+		let runs = 0;
+		const keyed = async () => ({ run: ++runs });
+		await store.execute("credential-a", "one", {}, keyed);
+		await store.execute("credential-a", "two", {}, keyed);
+		const results: string[] = [];
+		for (let index = 0; index < 5; index++) {
+			const accepted = store.submit("credential-a", null, { background: true }, async () => ({ index }));
+			results.push(accepted.id as string);
+			await waitForStatus(store, "credential-a", accepted.id as string, "completed");
+		}
+		await expect(store.execute("credential-a", "one", {}, keyed)).resolves.toEqual({ run: 1 });
+		await expect(store.execute("credential-a", "two", {}, keyed)).resolves.toEqual({ run: 2 });
+		expect(runs).toBe(2);
+		expect(store.get("credential-a", results[0] as string)).toBeNull();
+		expect(store.get("credential-a", results[4] as string)).toMatchObject({ status: "completed" });
+		store.close();
+	});
+
+	it("does not let running unkeyed background tasks block keyed requests", async () => {
+		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 1 });
+		let release: (() => void) | undefined;
+		store.submit("credential-a", null, { background: true }, async () => {
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return {};
+		});
+		await expect(store.execute("credential-a", "key", {}, async () => ({ ok: true }))).resolves.toEqual({
+			ok: true,
+		});
+		release?.();
 		store.close();
 	});
 });
