@@ -25,8 +25,8 @@ agx.handle("invoice.review", async (task) => paperclip.run(task.payload));
 await agx.start();
 ```
 
-`NostrTransport.create()` only constructs the transport. `AgxClient.start()` opens its relay
-subscriptions, and `AgxClient.stop()` closes both those subscriptions and their relay connections.
+`NostrTransport.create()` only constructs the transport. `AgxClient.start()` opens its relay subscriptions, and `AgxClient.stop()` closes both those subscriptions and their relay connections.
+Live subscriptions replay a bounded recent window, skip envelopes already in the client's `SeenStore` before decryption, and record expired or invalid wraps there; polling remains the completeness and recovery path.
 
 **Runtime:** Node. The transport dials WebSockets and the SSRF guard uses `node:dns` to vet
 peer-supplied relay / NIP-05 hosts before connecting. `node:dns`/`node:net` are imported lazily so a

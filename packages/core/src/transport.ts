@@ -9,6 +9,16 @@ import type {
 export type Unsubscribe = () => void;
 
 /**
+ * Optional replay-protection hooks for live transport listeners. `isKnown`
+ * checks transport envelope IDs before the binding does expensive decoding;
+ * rejected or expired envelopes are reported through `onDiscarded`.
+ */
+export interface AgxTransportListenerOptions {
+	isKnown?(transportIds: string[]): Promise<Set<string>>;
+	onDiscarded?(transportIds: string[]): void | Promise<void>;
+}
+
+/**
  * The transport seam. A binding (e.g. `@nostr-agx/nostr`) implements confidential,
  * authenticated delivery between agent identities; `@nostr-agx/core` layers task
  * lifecycle, correlation, receipts, replay protection, and capability matching on
@@ -152,9 +162,11 @@ export interface AgxTransport {
 	 */
 	onMessage?(
 		handler: (msg: AgxIncomingMessage) => void | Promise<void>,
+		options?: AgxTransportListenerOptions,
 	): void | Unsubscribe | Promise<void | Unsubscribe>;
 	onReceipt?(
 		handler: (receipt: AgxIncomingReceipt) => void | Promise<void>,
+		options?: AgxTransportListenerOptions,
 	): void | Unsubscribe | Promise<void | Unsubscribe>;
 }
 

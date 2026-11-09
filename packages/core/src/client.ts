@@ -15,6 +15,7 @@ import {
 import type {
 	AgxIncomingMessage,
 	AgxIncomingReceipt,
+	AgxTransportListenerOptions,
 	AgxTransport,
 	Unsubscribe,
 } from "./transport";
@@ -1303,11 +1304,35 @@ export class AgxClient {
 
 	private async startMessageListener(): Promise<void> {
 		const unsubscribers: Unsubscribe[] = [];
+		const listenerOptions: AgxTransportListenerOptions = {
+			isKnown: async (transportIds) => {
+				if (this.seen.hasMany) {
+					return this.seen.hasMany(transportIds);
+				}
+				const known = new Set<string>();
+				for (const id of transportIds) {
+					if (await this.seen.has(id)) {
+						known.add(id);
+					}
+				}
+				return known;
+			},
+			onDiscarded: async (transportIds) => {
+				if (this.seen.addMany) {
+					await this.seen.addMany(transportIds);
+					return;
+				}
+				for (const id of transportIds) {
+					await this.seen.add(id);
+				}
+			},
+		};
 		try {
 			const unsubscribeMessage = await this.transport.onMessage?.(
 				async (msg: AgxIncomingMessage) => {
 					await this.dispatchLiveEvent("message", msg);
 				},
+				listenerOptions,
 			);
 			if (typeof unsubscribeMessage === "function") {
 				unsubscribers.push(unsubscribeMessage);
@@ -1316,6 +1341,7 @@ export class AgxClient {
 				async (receipt: AgxIncomingReceipt) => {
 					await this.dispatchLiveEvent("receipt", receipt);
 				},
+				listenerOptions,
 			);
 			if (typeof unsubscribeReceipt === "function") {
 				unsubscribers.push(unsubscribeReceipt);

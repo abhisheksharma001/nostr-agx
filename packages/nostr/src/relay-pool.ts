@@ -1,10 +1,21 @@
-import { type AgxIncomingMessage, type AgxIncomingReceipt, type AgxLogger, noopLogger } from "@nostr-agx/core";
+import {
+	type AgxIncomingMessage,
+	type AgxIncomingReceipt,
+	type AgxLogger,
+	type AgxTransportListenerOptions,
+	noopLogger,
+} from "@nostr-agx/core";
 import { type Event, type Filter, getEventHash, verifyEvent } from "nostr-tools";
 import { Relay, Subscription } from "nostr-tools/relay";
 import { GIFT_WRAP_KIND } from "./kinds";
 import { isSignerUnavailable, type AgxSigner } from "./signer";
 import { isIgnorableReceiptRumor, openMessageRumor, openReceiptRumor } from "./events";
-import { unwrapRumor, type UnwrappedRumor } from "./giftwrap";
+import {
+	eventExpiration,
+	MAX_WRAP_BACKDATE_SEC,
+	unwrapRumor,
+	type UnwrappedRumor,
+} from "./giftwrap";
 
 /**
  * Ids whose signature has already checked out in this process, oldest first.
@@ -786,21 +797,34 @@ export async function pollInbox(params: {
 }
 
 /**
- * Subscribe to relays for MESSAGE/RECEIPT events tagged to `pubkey`. 
- * Each relay is subscribed to once, and the callback is called for each event received. 
- * The subscription is not automatically closed; the caller must manage the lifecycle of the subscriptions.
+ * Subscribe to relays for MESSAGE/RECEIPT events tagged to `pubkey`. Each
+ * subscription replays only the bounded wrap window; polling remains the
+ * completeness mechanism if more history exists or a live connection drops.
  */
-export async function listenEvents(signer: AgxSigner, relays: string[], params: { pubkey: string }, callback: (data: AgxIncomingMessage | AgxIncomingReceipt) => void) {
+export async function listenEvents(
+	signer: AgxSigner,
+	relays: string[],
+	params: { pubkey: string } & AgxTransportListenerOptions & {
+		logger?: AgxLogger;
+	},
+	callback: (
+		data: AgxIncomingMessage | AgxIncomingReceipt,
+	) => void | Promise<void>,
+) {
 	if (relays.length === 0) {
 		return []
 	}
+	const log = params.logger ?? noopLogger;
+	const now = Math.floor(Date.now() / 1000);
+	const inFlight = new Set<string>();
 
 	const results = await Promise.allSettled(
 		relays.map(async (url) => {
 			// Bound the connect too: a relay can accept the TCP socket then stall the WS
 			// upgrade, which would otherwise hang here past any per-op budget.
 			const relay = await withTimeout(
-				Relay.connect(url),
+				// nostr-tools reconnects the socket and re-fires open subscriptions.
+				Relay.connect(url, { enableReconnect: true }),
 				RELAY_OP_TIMEOUT_MS,
 				// No URL in the label. A connect timeout surfaces as
 				// `rejected[].error` too, and every caller already renders the relay
@@ -824,64 +848,116 @@ export async function listenEvents(signer: AgxSigner, relays: string[], params: 
 
 			const filter: Filter = {
 				kinds: [GIFT_WRAP_KIND],
-				"#p": [params.pubkey]
+				"#p": [params.pubkey],
+				since: Math.max(0, now - MAX_WRAP_BACKDATE_SEC),
+				limit: DEFAULT_POLL_LIMIT,
 			};
 
 			sub = relay.subscribe([filter], {
 				async onevent(event: Event) {
-					// console.log(`Event received from relay ${url}:`, event);
-					let unwrapped: UnwrappedRumor | null = null;
+					if (inFlight.has(event.id)) {
+						return;
+					}
+					inFlight.add(event.id);
 					try {
-						unwrapped = await unwrapRumor({ signer, event });
-					} catch (err) {
-						if (!isSignerUnavailable(err)) {
-							throw err;
+						const known = params.isKnown
+							? await params.isKnown([event.id])
+							: new Set<string>();
+						if (known.has(event.id)) {
+							return;
 						}
-						// The signer is down, not the wraps bad: stop opening, discard
-						// none of the rest, and report the poll incomplete so the host holds
-						// its cursor and the next poll sees them again. What was opened
-						// before this point is still returned — safe, the cursor holds.
-					}
-					if (!unwrapped) {
-						return
-					}
+						const expiration = eventExpiration(event);
+						if (
+							expiration !== null &&
+							expiration <= Math.floor(Date.now() / 1000)
+						) {
+							await params.onDiscarded?.([event.id]);
+							return;
+						}
+						let unwrapped: UnwrappedRumor | null;
+						try {
+							unwrapped = await unwrapRumor({ signer, event });
+						} catch (err) {
+							if (!isSignerUnavailable(err)) {
+								log.warn?.("AGX: could not open live gift wrap", {
+									relay: url,
+									error: err instanceof Error ? err.message : String(err),
+								});
+								return;
+							}
+							log.warn?.(
+								"AGX: signer unavailable; live gift wrap will be retried by poll",
+								{
+									relay: url,
+									error: err.message,
+								},
+							);
+							return;
+						}
+						if (!unwrapped) {
+							await params.onDiscarded?.([event.id]);
+							return;
+						}
 
-					// A receipt with a status a newer peer added: ignored, by the spec,
-					// rather than counted and warned about as malformed. Recorded as seen
-					// so it is not reopened on the next poll.
-					if (isIgnorableReceiptRumor(unwrapped)) {
-						return;
-					}
-					const receipt = openReceiptRumor(unwrapped);
-					if (receipt) {
-						callback({
-							from: receipt.senderPubkey,
-							eventId: receipt.eventId,
-							transportId: event.id,
-							createdAt: receipt.createdAt,
-							sentAt: receipt.sentAt,
-							receipt: receipt.receipt,
+						// A receipt with a status a newer peer added: ignored, by the spec,
+						// rather than counted and warned about as malformed. Recorded as seen
+						// so it is not reopened on the next poll.
+						if (isIgnorableReceiptRumor(unwrapped)) {
+							await params.onDiscarded?.([event.id]);
+							return;
+						}
+						const receipt = openReceiptRumor(unwrapped);
+						if (receipt) {
+							await callback({
+								from: receipt.senderPubkey,
+								eventId: receipt.eventId,
+								transportId: event.id,
+								createdAt: receipt.createdAt,
+								sentAt: receipt.sentAt,
+								receipt: receipt.receipt,
+							});
+							return;
+						}
+						const opened = openMessageRumor(unwrapped);
+						if (opened) {
+							await callback({
+								from: opened.senderPubkey,
+								eventId: opened.eventId,
+								transportId: event.id,
+								createdAt: opened.createdAt,
+								sentAt: opened.sentAt,
+								text: opened.text,
+								contextId: opened.contextId,
+								messageId: opened.messageId,
+								subject: opened.subject,
+								// Forwarded, not derived. What the peer declared is what the host's
+								// loop guard reasons about; deciding here would hide the signal.
+								autoDepth: opened.autoDepth,
+								contentType: opened.contentType,
+								// Forwarded as the sender declared it; trusting it is the host's call.
+								...(opened.evidence ? { evidence: opened.evidence } : {}),
+							});
+							return;
+						}
+						await params.onDiscarded?.([event.id]);
+					} catch (error) {
+						log.error?.("AGX: live relay event processing failed", {
+							relay: url,
+							eventId: event.id,
+							error: error instanceof Error ? error.message : String(error),
 						});
-						return;
+					} finally {
+						inFlight.delete(event.id);
 					}
-					const opened = openMessageRumor(unwrapped);
-					if (opened) {
-						callback({
-							from: opened.senderPubkey,
-							eventId: opened.eventId,
-							transportId: event.id,
-							createdAt: opened.createdAt,
-							sentAt: opened.sentAt,
-							text: opened.text,
-							contextId: opened.contextId,
-							messageId: opened.messageId,
-							subject: opened.subject,
-							// Forwarded, not derived. What the peer declared is what the host's
-							// loop guard reasons about; deciding here would hide the signal.
-							autoDepth: opened.autoDepth,
-							contentType: opened.contentType,
-							// Forwarded as the sender declared it; trusting it is the host's call.
-							...(opened.evidence ? { evidence: opened.evidence } : {}),
+				},
+				onclose(reason: string) {
+					if (
+						reason !== "closed by caller" &&
+						reason !== "relay connection closed by us"
+					) {
+						log.warn?.("AGX: live relay subscription closed", {
+							relay: url,
+							reason,
 						});
 					}
 				}
@@ -901,7 +977,10 @@ export async function listenEvents(signer: AgxSigner, relays: string[], params: 
 		if (r.status === "fulfilled") {
 			subscriptions.push(r.value);
 		} else {
-			console.error(`Failed to subscribe to relay ${relays[i] ?? "unknown"}:`, r.reason);
+			log.warn?.("AGX: failed to subscribe to relay", {
+				relay: relays[i] ?? "unknown",
+				error: r.reason instanceof Error ? r.reason.message : String(r.reason),
+			});
 		}
 	}
 

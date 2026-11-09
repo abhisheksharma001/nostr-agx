@@ -5,6 +5,7 @@ import {
 	type AgxPollResult,
 	type AgxResolvedPeer,
 	type AgxTransport,
+	type AgxTransportListenerOptions,
 	type ExchangeEvidence,
 	type Unsubscribe,
 	exchangeEvidenceProblem,
@@ -132,6 +133,14 @@ export class NostrTransport implements AgxTransport {
 	private readonly ws?: WebSocketImpl | undefined;
 	private onMessageHandlers = new Set<(msg: AgxIncomingMessage) => void | Promise<void>>();
 	private onReceiptHandlers = new Set<(receipt: AgxIncomingReceipt) => void | Promise<void>>();
+	private messageListenerOptions = new Map<
+		(msg: AgxIncomingMessage) => void | Promise<void>,
+		AgxTransportListenerOptions | undefined
+	>();
+	private receiptListenerOptions = new Map<
+		(receipt: AgxIncomingReceipt) => void | Promise<void>,
+		AgxTransportListenerOptions | undefined
+	>();
 	private subscriptions: Subscription[] = [];
 	private started = false;
 	private startPromise?: Promise<void>;
@@ -824,11 +833,52 @@ export class NostrTransport implements AgxTransport {
 	private async listenMessages(): Promise<void> {
 		const subscriptions = await listenEvents(this.signer, this.relays, {
 			pubkey: this.publicKey,
-		}, (data: AgxIncomingMessage | AgxIncomingReceipt) => {
+			logger: this.logger,
+			isKnown: async (transportIds) => {
+				const registrations = [
+					...this.messageListenerOptions.values(),
+					...this.receiptListenerOptions.values(),
+				];
+				if (
+					registrations.length === 0 ||
+					registrations.some((options) => !options?.isKnown)
+				) {
+					return new Set<string>();
+				}
+				const knownByListener = await Promise.all(
+					registrations.map((options) => options!.isKnown!(transportIds)),
+				);
+				return new Set(
+					transportIds.filter((id) =>
+						knownByListener.every((known) => known.has(id)),
+					),
+				);
+			},
+			onDiscarded: async (transportIds) => {
+				const callbacks = new Set(
+					[
+						...this.messageListenerOptions.values(),
+						...this.receiptListenerOptions.values(),
+					]
+						.map((options) => options?.onDiscarded)
+						.filter(
+							(callback): callback is NonNullable<typeof callback> =>
+								callback !== undefined,
+						),
+				);
+				await Promise.all(
+					Array.from(callbacks, (callback) => callback(transportIds)),
+				);
+			},
+		}, async (data: AgxIncomingMessage | AgxIncomingReceipt) => {
 			if ('receipt' in data) {
-				this.onReceiptHandlers.forEach(handler => handler(data));
+				await Promise.all(
+					Array.from(this.onReceiptHandlers, (handler) => handler(data)),
+				);
 			} else {
-				this.onMessageHandlers.forEach(handler => handler(data));
+				await Promise.all(
+					Array.from(this.onMessageHandlers, (handler) => handler(data)),
+				);
 			}
 		});
 		const previousSubscriptions = this.subscriptions;
@@ -866,19 +916,25 @@ export class NostrTransport implements AgxTransport {
 
 	onMessage(
 		handler: (msg: AgxIncomingMessage) => void | Promise<void>,
+		options?: AgxTransportListenerOptions,
 	): Unsubscribe {
 		this.onMessageHandlers.add(handler);
+		this.messageListenerOptions.set(handler, options);
 		return () => {
 			this.onMessageHandlers.delete(handler);
+			this.messageListenerOptions.delete(handler);
 		};
 	}
 
 	onReceipt(
 		handler: (receipt: AgxIncomingReceipt) => void | Promise<void>,
+		options?: AgxTransportListenerOptions,
 	): Unsubscribe {
 		this.onReceiptHandlers.add(handler);
+		this.receiptListenerOptions.set(handler, options);
 		return () => {
 			this.onReceiptHandlers.delete(handler);
+			this.receiptListenerOptions.delete(handler);
 		};
 	}
 }
