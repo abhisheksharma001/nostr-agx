@@ -188,7 +188,11 @@ export async function requestCommand(
 		transport,
 		logger: makeLogger(options.verbose ?? false),
 	});
-	await client.start({ pollIntervalMs: 0, advertise: false });
+	await client.start({
+		pollIntervalMs: 0,
+		advertise: false,
+		liveDispatch: false,
+	});
 
 	info(`requesting ${capability} from ${toDisplayNpub(to)} …`);
 	const pending = client.request(to, capability, payload, { timeoutMs });

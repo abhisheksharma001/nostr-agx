@@ -109,10 +109,11 @@ export interface AgxClientOptions {
 	/** Task handlers that may run at once. With the default, 1, `pump()` waits for
 	 * a handler to finish unless it requests input; an input-waiting handler is
 	 * suspended outside the dispatch loop so the continuation can be received.
-	 * Additional tasks are queued without blocking message dispatch. Above 1,
-	 * handlers start in free slots and run independently. A task request is marked
-	 * handled once its handler starts, so a restart while it runs does not run it
-	 * again, and its requester's timeout covers a result it never gets. */
+	 * Above 1, handlers start in free slots and run independently; when all slots
+	 * are busy, dispatch waits for a slot before marking the task handled. A task
+	 * request is marked handled once its handler starts, so a restart while it runs
+	 * does not run it again, and its requester's timeout covers a result it never
+	 * gets. */
 	maxConcurrentTasks?: number;
 }
 
@@ -156,6 +157,69 @@ const DEFAULT_MAX_DISPATCH_ATTEMPTS = 10;
  * an event dispatched at time `t` is dated no later than `t` plus this. */
 export const MAX_FUTURE_SKEW_SEC = 300;
 
+interface TransportLifecycle {
+	clients: Set<object>;
+	started: boolean;
+	queue: Promise<void>;
+}
+
+const transportLifecycles = new WeakMap<AgxTransport, TransportLifecycle>();
+
+async function retainTransport(
+	transport: AgxTransport,
+	client: object,
+): Promise<void> {
+	let lifecycle = transportLifecycles.get(transport);
+	if (!lifecycle) {
+		lifecycle = { clients: new Set(), started: false, queue: Promise.resolve() };
+		transportLifecycles.set(transport, lifecycle);
+	}
+	lifecycle.clients.add(client);
+	const operation = lifecycle.queue.then(async () => {
+		if (!lifecycle.started) {
+			await transport.start?.();
+			lifecycle.started = true;
+		}
+	});
+	lifecycle.queue = operation.catch(() => undefined);
+	try {
+		await operation;
+	} catch (error) {
+		lifecycle.clients.delete(client);
+		if (lifecycle.clients.size === 0 && !lifecycle.started) {
+			transportLifecycles.delete(transport);
+		}
+		throw error;
+	}
+}
+
+async function releaseTransport(
+	transport: AgxTransport,
+	client: object,
+): Promise<void> {
+	const lifecycle = transportLifecycles.get(transport);
+	if (!lifecycle || !lifecycle.clients.delete(client)) {
+		return;
+	}
+	const operation = lifecycle.queue.then(async () => {
+		if (lifecycle.clients.size > 0) {
+			return;
+		}
+		if (lifecycle.started) {
+			await transport.stop?.();
+			lifecycle.started = false;
+		}
+		if (
+			lifecycle.clients.size === 0 &&
+			transportLifecycles.get(transport) === lifecycle
+		) {
+			transportLifecycles.delete(transport);
+		}
+	});
+	lifecycle.queue = operation.catch(() => undefined);
+	await operation;
+}
+
 export class AgxClient {
 	private readonly transport: AgxTransport;
 	private readonly seen: SeenStore;
@@ -179,7 +243,10 @@ export class AgxClient {
 	private readonly maxConcurrentTasks: number;
 	/** Active and queued task handler runs. */
 	private readonly runningTasks = new Set<Promise<void>>();
-	private readonly queuedTaskRuns: Array<() => void> = [];
+	private readonly queuedTaskRuns: Array<{
+		start: () => void;
+		cancel: () => void;
+	}> = [];
 	private activeTaskCount = 0;
 	private readonly receiptListeners = new Set<
 		(receipt: AgxIncomingReceipt) => void
@@ -189,6 +256,8 @@ export class AgxClient {
 	private readonly pendingTaskInputs = new Map<string, PendingTaskInput>();
 	private cursor: number;
 	private pollTimer?: ReturnType<typeof setTimeout>;
+	private transportRetained = false;
+	private stopping = false;
 	private started = false;
 	private startPromise?: Promise<void>;
 	private listenerUnsubscribers: Unsubscribe[] = [];
@@ -715,10 +784,15 @@ export class AgxClient {
 
 	/** Advertise capabilities (if the transport supports discovery) and begin
 	 * polling on an interval. Serverless hosts should skip the interval
-	 * (`pollIntervalMs: 0`) and drive `pump()` from their own scheduler. */
+	 * (`pollIntervalMs: 0`) and drive `pump()` from their own scheduler.
+	 * Hosts that drive `pump()` themselves can disable
+	 * the interval and live dispatch while retaining advertising. */
 	async start(opts?: {
 		pollIntervalMs?: number;
 		advertise?: boolean;
+		/** Set false when the host drives `pump()` and does not want live delivery.
+		 * Defaults to true. */
+		liveDispatch?: boolean;
 	}): Promise<void> {
 		if (this.started) {
 			return;
@@ -728,6 +802,7 @@ export class AgxClient {
 			return;
 		}
 
+		this.stopping = false;
 		const startPromise = this.startClient(opts);
 		this.startPromise = startPromise;
 		try {
@@ -735,6 +810,10 @@ export class AgxClient {
 			this.started = true;
 		} catch (error) {
 			this.unsubscribeTransportListeners();
+			if (this.transportRetained) {
+				this.transportRetained = false;
+				await releaseTransport(this.transport, this);
+			}
 			throw error;
 		} finally {
 			if (this.startPromise === startPromise) {
@@ -746,9 +825,13 @@ export class AgxClient {
 	private async startClient(opts?: {
 		pollIntervalMs?: number;
 		advertise?: boolean;
+		liveDispatch?: boolean;
 	}): Promise<void> {
-		await this.startMessageListener();
-		await this.transport.start?.();
+		if (opts?.liveDispatch !== false) {
+			await this.startMessageListener();
+			await retainTransport(this.transport, this);
+			this.transportRetained = true;
+		}
 		if (opts?.advertise !== false && this.transport.advertise) {
 			await this.transport
 				.advertise(this.capabilities(), {
@@ -785,10 +868,14 @@ export class AgxClient {
 		}, interval);
 	}
 
-	/** Stop the poll interval + release the transport. In-flight `request()` callers
+	/** Stop polling and this client's live listener. In-flight `request()` callers
 	 * are rejected (their result can no longer arrive) rather than left hanging. */
 	async stop(): Promise<void> {
 		this.running = false;
+		this.stopping = true;
+		for (const queued of this.queuedTaskRuns.splice(0)) {
+			queued.cancel();
+		}
 		if (this.pollTimer) {
 			clearTimeout(this.pollTimer);
 			this.pollTimer = undefined;
@@ -800,6 +887,11 @@ export class AgxClient {
 			} catch {
 				// start() reports its own failure; still release its resources here.
 			}
+		}
+		this.running = false;
+		if (this.pollTimer) {
+			clearTimeout(this.pollTimer);
+			this.pollTimer = undefined;
 		}
 		this.started = false;
 		this.unsubscribeTransportListeners();
@@ -820,7 +912,10 @@ export class AgxClient {
 			p.reject(new Error("AGX client stopped"));
 		}
 		this.pendingTaskInputs.clear();
-		await this.transport.stop?.();
+		if (this.transportRetained) {
+			this.transportRetained = false;
+			await releaseTransport(this.transport, this);
+		}
 	}
 
 	private async dispatchMessage(msg: AgxIncomingMessage): Promise<void> {
@@ -968,7 +1063,10 @@ export class AgxClient {
 				this.runTask(msg, env, handler, task, onInputRequired),
 			env.taskId,
 		);
-		if (this.maxConcurrentTasks === 1 && scheduled.started) {
+		if (!(await scheduled.started)) {
+			throw new Error("AGX client stopped before the task handler started");
+		}
+		if (this.maxConcurrentTasks === 1) {
 			await Promise.race([scheduled.completion, scheduled.inputRequired]);
 		}
 	}
@@ -983,20 +1081,28 @@ export class AgxClient {
 	private scheduleTask(
 		run: (onInputRequired: () => void) => Promise<void>,
 		taskId: string,
-	): { completion: Promise<void>; inputRequired: Promise<void>; started: boolean } {
+	): {
+		completion: Promise<void>;
+		inputRequired: Promise<void>;
+		started: Promise<boolean>;
+	} {
 		let resolveCompletion!: () => void;
 		let resolveInputRequired!: () => void;
+		let resolveStarted!: (started: boolean) => void;
 		const completion = new Promise<void>((resolve) => {
 			resolveCompletion = resolve;
 		});
 		const inputRequired = new Promise<void>((resolve) => {
 			resolveInputRequired = resolve;
 		});
-		const scheduled = { completion, inputRequired, started: false };
+		const started = new Promise<boolean>((resolve) => {
+			resolveStarted = resolve;
+		});
+		const scheduled = { completion, inputRequired, started };
 		this.runningTasks.add(completion);
 
 		const start = () => {
-			scheduled.started = true;
+			resolveStarted(true);
 			this.activeTaskCount += 1;
 			void run(resolveInputRequired)
 				.catch((err) =>
@@ -1009,14 +1115,21 @@ export class AgxClient {
 					this.activeTaskCount -= 1;
 					this.runningTasks.delete(completion);
 					resolveCompletion();
-					this.queuedTaskRuns.shift()?.();
+					this.queuedTaskRuns.shift()?.start();
 				});
 		};
+		const cancel = () => {
+			resolveStarted(false);
+			this.runningTasks.delete(completion);
+			resolveCompletion();
+		};
 
-		if (this.activeTaskCount < this.maxConcurrentTasks) {
+		if (this.stopping) {
+			cancel();
+		} else if (this.activeTaskCount < this.maxConcurrentTasks) {
 			start();
 		} else {
-			this.queuedTaskRuns.push(start);
+			this.queuedTaskRuns.push({ start, cancel });
 		}
 		return scheduled;
 	}

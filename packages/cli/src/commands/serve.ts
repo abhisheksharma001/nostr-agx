@@ -475,11 +475,10 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 		);
 	}
 
-	// `pollIntervalMs: 0` disables the library's own self-rescheduling loop so the
-	// cursor can be persisted after each poll — `start()`'s internal loop offers no
-	// per-pump hook, and an unpersisted cursor means a restart re-drains the inbox.
+	// This host drives pump() itself so it can persist the cursor after each poll;
+	// disable both library-managed polling and live dispatch.
 	const advertise = options.advertise === true;
-	await client.start({ pollIntervalMs: 0, advertise });
+	await client.start({ pollIntervalMs: 0, advertise, liveDispatch: false });
 	if (advertise) {
 		info(
 			"Published an Agent Card (kind 11337) and relay list (kind 10002). These are UNENCRYPTED.",

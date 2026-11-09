@@ -142,6 +142,57 @@ beforeEach(() => {
 });
 
 describe("AgxClient listener lifecycle", () => {
+	it("can disable live dispatch for hosts that pump explicitly", async () => {
+		const live = liveTransport(BOB);
+		const start = vi.fn(async () => undefined);
+		const stop = vi.fn(async () => undefined);
+		const client = new AgxClient({
+			transport: { ...live.transport, start, stop },
+		});
+
+		await client.start({
+			pollIntervalMs: 0,
+			advertise: false,
+			liveDispatch: false,
+		});
+		expect(live.listenerCounts()).toEqual({ messages: 0, receipts: 0 });
+		expect(start).not.toHaveBeenCalled();
+		await client.stop();
+		expect(stop).not.toHaveBeenCalled();
+	});
+
+	it("keeps a shared transport running until its last client stops", async () => {
+		const live = liveTransport(BOB);
+		const start = vi.fn(async () => undefined);
+		const stop = vi.fn(async () => undefined);
+		const transport = { ...live.transport, start, stop };
+		const first = new AgxClient({ transport });
+		const second = new AgxClient({ transport });
+
+		await first.start({ pollIntervalMs: 0, advertise: false });
+		await second.start({ pollIntervalMs: 0, advertise: false });
+		expect(start).toHaveBeenCalledOnce();
+		expect(live.listenerCounts()).toEqual({ messages: 2, receipts: 2 });
+
+		await first.stop();
+		expect(stop).not.toHaveBeenCalled();
+		expect(live.listenerCounts()).toEqual({ messages: 1, receipts: 1 });
+		await live.deliverMessage({
+			from: ALICE,
+			eventId: "still-live",
+			createdAt: 1,
+			text: "still live",
+			contextId: "ctx",
+			messageId: "still-live",
+			subject: null,
+			autoDepth: null,
+			contentType: "application/a2a+json",
+		});
+
+		await second.stop();
+		expect(stop).toHaveBeenCalledOnce();
+	});
+
 	it("registers listeners on start and removes only its own listeners on stop", async () => {
 		const live = liveTransport(BOB);
 		const externalMessage = vi.fn();
@@ -1718,6 +1769,52 @@ describe("AgxClient runs tasks side by side when asked to", () => {
 		expect(most).toBe(2);
 		await alice.pump();
 		await expect(Promise.all(results)).resolves.toEqual(["ok", "ok", "ok"]);
+	});
+
+	it("does not start or mark queued tasks handled after stop", async () => {
+		const seen = {
+			has: vi.fn(async () => false),
+			add: vi.fn(async () => undefined),
+		};
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+			seen,
+		});
+		let releaseGate: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			releaseGate = resolve;
+		});
+		let starts = 0;
+		bob.handle("slow", async () => {
+			starts += 1;
+			await gate;
+			return "ok";
+		});
+		const requests = Array.from({ length: 3 }, () =>
+			alice.request(BOB, "slow", {}, { timeoutMs: 100 }),
+		);
+		requests.forEach((request) => request.catch(() => undefined));
+		while ((bus.inbox.get(BOB) ?? []).length < 3) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+		const eventIds = (bus.inbox.get(BOB) ?? []).map((message) => message.eventId);
+
+		const pumping = bob.pump();
+		while (starts < 2) {
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
+		await bob.stop();
+		await pumping;
+		expect(starts).toBe(2);
+		expect(seen.add).not.toHaveBeenCalledWith(eventIds[2]);
+		// Releasing the active handlers must not launch the cancelled third task.
+		// Releasing the active handlers must not launch the cancelled third task.
+		releaseGate();
+		await bob.tasksSettled();
+		expect(starts).toBe(2);
 	});
 });
 

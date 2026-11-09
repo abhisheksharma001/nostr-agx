@@ -47,7 +47,11 @@ export async function createAgxSync(options: {
 		},
 		onReceipt: (receipt) => collector.onReceipt(receipt),
 	});
-	await client.start({ pollIntervalMs: 0, advertise: false });
+	await client.start({
+		pollIntervalMs: 0,
+		advertise: false,
+		liveDispatch: false,
+	});
 	let cursor = state.cursor;
 	let pulling = false;
 
