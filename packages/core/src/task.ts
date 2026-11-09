@@ -41,6 +41,8 @@ export const taskRequestSchema = z.object({
 	taskId: z.string().min(1).max(200),
 	capability: z.string().min(1).max(200),
 	payload: z.unknown(),
+	supportsInput: z.boolean().optional(),
+	timeoutMs: z.number().int().min(0).optional(),
 });
 export type TaskRequestEnvelope = z.infer<typeof taskRequestSchema>;
 
@@ -68,6 +70,13 @@ export const taskResultSchema = z.discriminatedUnion("status", [
 ]);
 export type TaskResultEnvelope = z.infer<typeof taskResultSchema>;
 
+/** Cancel a task when its requester can no longer continue the conversation. */
+export const taskCancelSchema = z.object({
+	t: z.literal("cancel"),
+	taskId: z.string().min(1).max(200),
+});
+export type TaskCancelEnvelope = z.infer<typeof taskCancelSchema>;
+
 /** A continuation carrying an answer to a task's input requirement. */
 export const taskInputSchema = z.object({
 	t: z.literal("input"),
@@ -80,6 +89,7 @@ export type TaskInputEnvelope = z.infer<typeof taskInputSchema>;
 export const taskEnvelopeSchema = z.discriminatedUnion("t", [
 	taskRequestSchema,
 	taskResultSchema,
+	taskCancelSchema,
 	taskInputSchema,
 ]);
 export type TaskEnvelope = z.infer<typeof taskEnvelopeSchema>;

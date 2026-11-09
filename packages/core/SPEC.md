@@ -124,26 +124,47 @@ A **task** is a capability-keyed request one agent asks another to perform. Task
 inside the message payload text, labelled by `application/agx-task+json`, so the transport carries
 them like any message:
 
-- **request** — `{ t: "req", taskId, capability, payload }`. `payload` is arbitrary JSON the handler
-  interprets (payload-agnostic).
+- **request** — `{ t: "req", taskId, capability, payload, supportsInput?, timeoutMs? }`. `payload` is
+  arbitrary JSON the handler interprets (payload-agnostic). `supportsInput` is an explicit opt-in to
+  interactive input; it defaults to false. `timeoutMs` is the requester's end-to-end deadline in
+  milliseconds; zero means no requester deadline.
 - **result/update** — `{ t: "res", taskId, status: "input-required", inputRequestId, requirement }`
   is a nonterminal update; `{ t: "res", taskId, status: "completed", output? }` and
   `{ t: "res", taskId, status: "failed", error? }` are terminal results.
 - **input continuation** — `{ t: "input", taskId, inputRequestId, input }` supplies the answer to an
   outstanding input requirement. It is a new message/event, but continues the same task and uses
   the same `taskId` as its transport `contextId`.
+- **cancellation** — `{ t: "cancel", taskId }` tells the responder that the requester has stopped
+  waiting or cannot continue. It uses the same `taskId` as its transport `contextId`.
 
 States: `submitted → working ↔ input-required → completed | failed | canceled`. A handler may call
 `requestInput(requirement)` to publish an `input-required` update and await the continuation. A
-completed handler transitions the task to `completed`; a thrown handler error transitions it to
-`failed`. An input continuation **MUST** match the pending task and `inputRequestId` and come from
-the peer that initiated the task. An `input-required` update is nonterminal: the initiator keeps its
-pending request open and may provide input through `streamRequest()`. A plain `request()` caller,
-which has no input callback, rejects with an instruction to use `streamRequest()`.
+responder **MUST NOT** publish that update unless the request opted in with `supportsInput: true`;
+otherwise it **MUST** fail the task promptly. A completed handler transitions the task to
+`completed`; a thrown handler error transitions it to `failed`. An input continuation **MUST** match
+the pending task and `inputRequestId` and come from the peer that initiated the task. A cancellation
+**MUST** match an active task and come from its initiating peer; the responder **MUST** stop waiting
+for input and **MUST NOT** send a later result. Cancellation cannot forcibly stop arbitrary
+application code already running.
+
+An input requirement's `id` is an optional stable, handler-chosen label for the kind of question;
+`inputRequestId` is the unique correlation id for that specific prompt and answer. `timeoutMs` is
+the maximum wait for this prompt. Missing or zero uses the responder's configured default, and the
+effective timeout is capped by the responder's client-wide maximum and any remaining end-to-end
+request deadline. The responder includes that effective timeout in the published requirement. An
+input-required update is nonterminal: an opted-in initiator keeps its request open and may provide
+input through `streamRequest()`. A plain `request()` caller rejects with a clear input-required error
+and sends cancellation. The initiator's timeout covers the whole task, not each prompt separately.
+
+`inputSchema`, when present, describes the expected answer using JSON Schema, but is advisory. The
+protocol core does not validate answers against it; the requester SHOULD validate user input, and
+the handler MUST validate input before relying on it.
 
 The current in-process handler API waits for input in memory; it does not persist suspended handler
 state across process restarts. A runtime requiring restart recovery must persist and restore that
-state itself.
+state itself. Waiting for input releases the handler's concurrency slot, so another task may run;
+the number of simultaneous pending input requirements and the duration of each wait are bounded by
+client configuration.
 
 **Error boundary.** A `failed` result crosses trust domains, so a thrown handler error is reported to
 the peer **generically** (`handler failed`) and the real message is logged locally — an internal

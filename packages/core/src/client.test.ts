@@ -824,6 +824,177 @@ describe("AgxClient streamRequest", () => {
 		expect(completed).toHaveBeenCalledWith({ approved: true });
 	});
 
+	it("releases the only task slot while a handler waits for input", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+		});
+		bob.handle("approval", async (_task, ctx) => {
+			await ctx.requestInput({ prompt: "Approve?" });
+			return "approved";
+		});
+		bob.handle("quick", () => "quick result");
+
+		const approval = await alice.streamRequest(BOB, "approval", {});
+		let inputRequestId = "";
+		approval.on("inputRequired", (update) => {
+			inputRequestId = update.inputRequestId;
+		});
+		const quick = alice.request(BOB, "quick", {});
+		await bob.pump();
+		await alice.pump();
+		await expect(quick).resolves.toBe("quick result");
+		expect(inputRequestId).not.toBe("");
+		await approval.provideInput(inputRequestId, true);
+		await bob.pump();
+		await bob.tasksSettled();
+		await alice.pump();
+		await expect(approval.result).resolves.toBe("approved");
+	});
+
+	it("uses a default for zero input timeout and caps it at the client maximum", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			requestTimeoutMs: 0,
+			maxInputTimeoutMs: 25,
+		});
+		bob.handle("approval", async (_task, ctx) =>
+			ctx.requestInput({ prompt: "Approve?", timeoutMs: 0 }),
+		);
+		const stream = await alice.streamRequest(BOB, "approval", {}, {
+			timeoutMs: 0,
+		});
+		const requirements: number[] = [];
+		stream.on("inputRequired", ({ requirement }) => {
+			requirements.push(requirement.timeoutMs ?? -1);
+		});
+
+		await bob.pump();
+		await alice.pump();
+		expect(requirements).toEqual([25]);
+		await bob.tasksSettled();
+		await alice.pump();
+		await expect(stream.result).rejects.toThrow("handler failed");
+	});
+
+	it("fails promptly and cancels input for requesters that did not opt in", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+		});
+		bob.handle("approval", async (_task, ctx) =>
+			ctx.requestInput({ prompt: "Approve?" }),
+		);
+		const result = alice.request(BOB, "approval", {}, { timeoutMs: 0 });
+
+		await bob.pump();
+		await alice.pump();
+		await expect(result).rejects.toThrow(/requires input/);
+		await bob.tasksSettled();
+		const replies = (bus.inbox.get(ALICE) ?? [])
+			.map((message) => parseTaskEnvelope(message.text))
+			.filter((envelope) => envelope?.t === "res");
+		expect(replies).toHaveLength(1);
+		expect(replies[0]).toMatchObject({
+			t: "res",
+			status: "failed",
+			error: expect.stringContaining("requires input"),
+		});
+	});
+
+	it("cancels a legacy input-required update when a plain requester cannot answer", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "legacy.input", {}, { timeoutMs: 0 });
+		const request = bus.inbox.get(BOB)?.[0];
+		const envelope = request && parseTaskEnvelope(request.text);
+		if (!envelope || envelope.t !== "req") {
+			throw new Error("Expected the task request");
+		}
+		bus.pushMessage(ALICE, {
+			from: BOB,
+			text: encodeTaskEnvelope({
+				t: "res",
+				taskId: envelope.taskId,
+				status: "input-required",
+				inputRequestId: "legacy-input",
+				requirement: { prompt: "Need input" },
+			}),
+			contextId: envelope.taskId,
+			messageId: "legacy-input-required",
+			subject: null,
+			autoDepth: null,
+			contentType: TASK_CONTENT_TYPE,
+		});
+
+		await alice.pump();
+		await expect(pending).rejects.toThrow(/requires input/);
+		expect(
+			(bus.inbox.get(BOB) ?? [])
+				.map((message) => parseTaskEnvelope(message.text))
+				.some((message) => message?.t === "cancel" && message.taskId === envelope.taskId),
+		).toBe(true);
+	});
+
+	it("caps the number of concurrent input requirements", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxPendingTaskInputs: 1,
+		});
+		bob.handle("approval", async (_task, ctx) =>
+			ctx.requestInput({ prompt: "Approve?" }),
+		);
+		const first = await alice.streamRequest(BOB, "approval", {});
+		const second = await alice.streamRequest(BOB, "approval", {});
+
+		await bob.pump();
+		await alice.pump();
+		await expect(second.result).rejects.toThrow(
+			/limit for pending input requirements/,
+		);
+		await alice.stop();
+		await bob.pump();
+		await bob.tasksSettled();
+		await expect(first.result).rejects.toThrow(/AGX client stopped/);
+	});
+
+	it("cancels the responder on requester timeout and rejects late input", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+		});
+		bob.handle("approval", async (_task, ctx) =>
+			ctx.requestInput({ prompt: "Approve?", timeoutMs: 5_000 }),
+		);
+		const stream = await alice.streamRequest(BOB, "approval", {}, {
+			timeoutMs: 30,
+		});
+		let inputRequestId = "";
+		stream.on("inputRequired", (update) => {
+			inputRequestId = update.inputRequestId;
+		});
+
+		await bob.pump();
+		await alice.pump();
+		expect(inputRequestId).not.toBe("");
+		await expect(stream.result).rejects.toThrow(/timed out/);
+		await expect(stream.provideInput(inputRequestId, true)).rejects.toThrow(
+			/not pending/,
+		);
+		await bob.pump();
+		await bob.tasksSettled();
+		const replies = (bus.inbox.get(ALICE) ?? [])
+			.map((message) => parseTaskEnvelope(message.text))
+			.filter((envelope) => envelope?.t === "res");
+		expect(replies).toHaveLength(1);
+	});
+
 	it("registers stream update handling before publishing the initial request", async () => {
 		const live = liveTransport(ALICE);
 		const base = bus.transport(ALICE);
@@ -1815,6 +1986,59 @@ describe("AgxClient runs tasks side by side when asked to", () => {
 		releaseGate();
 		await bob.tasksSettled();
 		expect(starts).toBe(2);
+	});
+
+	it("bounds live task queueing without marking overflow tasks seen", async () => {
+		const live = liveTransport(BOB);
+		const seen = {
+			has: vi.fn(async () => false),
+			add: vi.fn(async () => undefined),
+		};
+		const bob = new AgxClient({
+			transport: live.transport,
+			authorize: "accept-all",
+			seen,
+		});
+		let releaseGate: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			releaseGate = resolve;
+		});
+		let starts = 0;
+		bob.handle("slow", async () => {
+			starts += 1;
+			await gate;
+			return "ok";
+		});
+		await bob.start({ pollIntervalMs: 0, advertise: false });
+
+		const messages = Array.from({ length: 102 }, (_, index) => ({
+			from: ALICE,
+			eventId: `queue-event-${index}`,
+			createdAt: Math.floor(Date.now() / 1000),
+			text: encodeTaskEnvelope({
+				t: "req" as const,
+				taskId: `queue-task-${index}`,
+				capability: "slow",
+				payload: {},
+			}),
+			contextId: `queue-task-${index}`,
+			messageId: `queue-message-${index}`,
+			subject: null,
+			autoDepth: null,
+			contentType: TASK_CONTENT_TYPE,
+		}));
+		const delivery = Promise.all(messages.map((message) => live.deliverMessage(message)));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(starts).toBe(1);
+		expect(seen.add).not.toHaveBeenCalled();
+
+		releaseGate();
+		await delivery;
+		await bob.tasksSettled();
+		expect(starts).toBe(101);
+		expect(seen.add).toHaveBeenCalledTimes(101);
+		expect(seen.add).not.toHaveBeenCalledWith("queue-event-101");
+		await bob.stop();
 	});
 });
 
