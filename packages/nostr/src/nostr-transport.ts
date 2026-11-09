@@ -802,7 +802,7 @@ export class NostrTransport implements AgxTransport {
 	}
 
 	private async listenMessages(): Promise<void> {
-		this.subscriptions = await listenEvents(this.signer, this.relays, {
+		const subscriptions = await listenEvents(this.signer, this.relays, {
 			pubkey: this.publicKey,
 		}, (data: AgxIncomingMessage | AgxIncomingReceipt) => {
 			if ('receipt' in data) {
@@ -811,15 +811,22 @@ export class NostrTransport implements AgxTransport {
 				this.onMessageHandlers.forEach(handler => handler(data));
 			}
 		});
+		const previousSubscriptions = this.subscriptions;
+		this.subscriptions = subscriptions;
+		this.closeSubscriptions(previousSubscriptions);
+	}
+
+	private closeSubscriptions(subscriptions: Subscription[]): void {
+		subscriptions.forEach((sub) => sub.close());
+		new Set(subscriptions.map((sub) => sub.relay)).forEach((relay) =>
+			relay.close(),
+		);
 	}
 
 	async stop(): Promise<void> {
 		const subscriptions = this.subscriptions;
 		this.subscriptions = [];
-		subscriptions.forEach((sub) => sub.close());
-		new Set(subscriptions.map((sub) => sub.relay)).forEach((relay) =>
-			relay.close(),
-		);
+		this.closeSubscriptions(subscriptions);
 		this.onMessageHandlers.clear();
 		this.onReceiptHandlers.clear();
 	}

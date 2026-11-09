@@ -80,24 +80,38 @@ beforeEach(() => {
 
 describe("transport lifecycle", () => {
 	it("starts listening explicitly and closes relay connections on stop", async () => {
-		const closeSubscription = vi.fn();
-		const closeRelay = vi.fn();
-		listenEvents.mockResolvedValueOnce([
-			{
-				close: closeSubscription,
-				relay: { close: closeRelay },
-			},
-		]);
+		const closeFirstSubscription = vi.fn();
+		const closeFirstRelay = vi.fn();
+		const closeSecondSubscription = vi.fn();
+		const closeSecondRelay = vi.fn();
+		listenEvents
+			.mockResolvedValueOnce([
+				{
+					close: closeFirstSubscription,
+					relay: { close: closeFirstRelay },
+				},
+			])
+			.mockResolvedValueOnce([
+				{
+					close: closeSecondSubscription,
+					relay: { close: closeSecondRelay },
+				},
+			]);
 
 		const instance = await transport();
 		expect(listenEvents).not.toHaveBeenCalled();
 
 		await instance.start();
-		expect(listenEvents).toHaveBeenCalledOnce();
+		expect(closeFirstSubscription).not.toHaveBeenCalled();
+		await instance.start();
+		expect(listenEvents).toHaveBeenCalledTimes(2);
+
+		expect(closeFirstSubscription).toHaveBeenCalledOnce();
+		expect(closeFirstRelay).toHaveBeenCalledOnce();
 
 		await instance.stop();
-		expect(closeSubscription).toHaveBeenCalledOnce();
-		expect(closeRelay).toHaveBeenCalledOnce();
+		expect(closeSecondSubscription).toHaveBeenCalledOnce();
+		expect(closeSecondRelay).toHaveBeenCalledOnce();
 	});
 });
 
