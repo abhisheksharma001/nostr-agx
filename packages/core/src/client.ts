@@ -264,8 +264,11 @@ export class AgxClient {
 		return [...this.handlers.keys()];
 	}
 
-	/** Send a task to a peer and await its correlated result. Rejects on a `failed`
-	 * result, an unsupported capability, or timeout. */
+	/**
+	 * Send a task and return progress events plus its final `result` promise.
+	 * Live updates and final results use the pending-request dispatch path, so
+	 * polling-only transports work as well.
+	 */
 	async request<Output = unknown>(
 		peer: string,
 		capability: string,
@@ -290,8 +293,16 @@ export class AgxClient {
 		opts?: { timeoutMs?: number },
 	): Promise<StreamResponse<Output>> {
 		const taskId = randomId();
+		let resolveResult!: (output: Output) => void;
+		let rejectResult!: (error: Error) => void;
+		const result = new Promise<Output>((resolve, reject) => {
+			resolveResult = resolve;
+			rejectResult = reject;
+		});
+		result.catch(() => undefined);
 		const stream = new StreamResponse<Output>(
 			taskId,
+			result,
 			(listener) => {
 				this.receiptListeners.add(listener);
 				return () => this.receiptListeners.delete(listener);
@@ -301,14 +312,18 @@ export class AgxClient {
 			this.log,
 		);
 		try {
-			await this.sendRequest<Output>(peer, capability, payload, {
+			const { result } = await this.sendRequest<Output>(peer, capability, payload, {
 				...opts,
 				taskId,
 				onUpdate: (update) => stream.handleUpdate(update),
 				onError: (error) => stream.handleError(error),
 			});
+			void result.then(resolveResult, rejectResult);
 		} catch (error) {
-			stream.handleError(error instanceof Error ? error : new Error(String(error)));
+			const requestError =
+				error instanceof Error ? error : new Error(String(error));
+			stream.handleError(requestError);
+			rejectResult(requestError);
 			throw error;
 		}
 
@@ -1372,12 +1387,8 @@ type StreamEventData<Output> = {
 };
 
 
-/**
- * A StreamResponse represents a streaming response from a task request. 
- * It allows the caller to register event listeners for status updates, completion, and errors.
- * Similar how the SendStreamingMessage is expected to work according to the A2A specification
- */
-class StreamResponse<Output> {
+/** Progress events and the final result of a streaming task request. */
+export class StreamResponse<Output> {
 	private events = new Map<
 		keyof StreamEventData<Output>,
 		Array<(data: unknown) => unknown>
@@ -1390,6 +1401,8 @@ class StreamResponse<Output> {
 
 	constructor(
 		taskId: string,
+		/** Resolves with the final output; rejects on failure, timeout, or client stop. */
+		readonly result: Promise<Output>,
 		subscribeToReceipts: (
 			listener: (receipt: AgxIncomingReceipt) => void,
 		) => () => void,
@@ -1399,8 +1412,12 @@ class StreamResponse<Output> {
 		) => Promise<void>,
 		private readonly log: AgxLogger,
 	) {
+		this.result.catch(() => undefined);
 		this.unsubscribeReceipt = subscribeToReceipts((receipt) => {
-			if (receipt.receipt.contextId === taskId) {
+			if (
+				receipt.receipt.contextId === taskId &&
+				receipt.receipt.status === "delivered"
+			) {
 				this.emit('statusUpdate', 'delivered');
 			}
 		});

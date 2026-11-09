@@ -907,6 +907,139 @@ describe("AgxClient streamRequest", () => {
 		expect(errors).toEqual(["TaskNotFoundError"]);
 		await alice.stop();
 	});
+
+	it("resolves result and emits completion when polling receives the task response", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+		});
+		bob.handle("poll-only", () => "polled result");
+
+		const stream = await alice.streamRequest<string>(BOB, "poll-only", {});
+		const completed = vi.fn();
+		stream.on("completed", completed);
+
+		await bob.pump();
+		await alice.pump();
+
+		await expect(stream.result).resolves.toBe("polled result");
+		expect(completed).toHaveBeenCalledWith("polled result");
+	});
+
+	it("emits an error and rejects result when the request times out", async () => {
+		const client = new AgxClient({ transport: bus.transport(ALICE) });
+		const stream = await client.streamRequest(BOB, "never", {}, {
+			timeoutMs: 10,
+		});
+		const errors: string[] = [];
+		stream.on("error", (error) => errors.push(error));
+
+		await expect(stream.result).rejects.toThrow("timed out");
+		expect(errors).toEqual([expect.stringContaining("timed out")]);
+	});
+
+	it("emits an error and rejects result when publish fails", async () => {
+		const base = bus.transport(ALICE);
+		const transport: AgxTransport = {
+			...base,
+			async publishMessage(_to, message) {
+				return {
+					ok: false,
+					eventId: "",
+					contextId: message.contextId ?? "",
+				};
+			},
+		};
+		const client = new AgxClient({ transport });
+		const stream = await client.streamRequest(BOB, "fails-to-send", {}, {
+			timeoutMs: 0,
+		});
+		const errors: string[] = [];
+		stream.on("error", (error) => errors.push(error));
+
+		await expect(stream.result).rejects.toThrow("publish failed");
+		expect(errors).toEqual([
+			expect.stringContaining("publish failed"),
+		]);
+	});
+
+	it("emits an error and rejects result when the client stops", async () => {
+		const client = new AgxClient({ transport: bus.transport(ALICE) });
+		const stream = await client.streamRequest(BOB, "stopped", {}, {
+			timeoutMs: 0,
+		});
+		const errors: string[] = [];
+		stream.on("error", (error) => errors.push(error));
+
+		await client.stop();
+
+		await expect(stream.result).rejects.toThrow("AGX client stopped");
+		expect(errors).toEqual(["AGX client stopped"]);
+	});
+
+	it("reports only delivered receipts and removes stream receipt listeners at completion", async () => {
+		const client = new AgxClient({ transport: bus.transport(ALICE) });
+		const stream = await client.streamRequest(BOB, "receipt-status", {}, {
+			timeoutMs: 0,
+		});
+		const statuses: string[] = [];
+		stream.on("statusUpdate", (status) => statuses.push(status));
+		const request = bus.inbox.get(BOB)?.[0];
+		expect(request).toBeDefined();
+
+		for (const [status, eventId] of [
+			["quarantined", "receipt-quarantined"],
+			["read", "receipt-read"],
+			["delivered", "receipt-delivered"],
+		] as const) {
+			bus.pushReceiptEvent(ALICE, {
+				from: BOB,
+				transportId: eventId,
+				receipt: {
+					v: 1,
+					kind: "receipt",
+					refEventId: request!.eventId,
+					contextId: request!.contextId,
+					status,
+				},
+			});
+			await client.pump();
+		}
+		expect(statuses).toEqual(["delivered"]);
+
+		bus.pushMessage(ALICE, {
+			from: BOB,
+			text: encodeTaskEnvelope({
+				t: "res",
+				taskId: request!.contextId,
+				status: "completed",
+				output: "done",
+			}),
+			contextId: request!.contextId,
+			messageId: "receipt-status-complete",
+			subject: null,
+			autoDepth: null,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		await client.pump();
+		await expect(stream.result).resolves.toBe("done");
+
+		bus.pushReceiptEvent(ALICE, {
+			from: BOB,
+			transportId: "late-delivered-receipt",
+			receipt: {
+				v: 1,
+				kind: "receipt",
+				refEventId: request!.eventId,
+				contextId: request!.contextId,
+				status: "delivered",
+			},
+		});
+		await client.pump();
+		expect(statuses).toEqual(["delivered", "completed"]);
+		await client.stop();
+	});
 });
 
 describe("AgxClient polls far enough back for a backdating transport", () => {

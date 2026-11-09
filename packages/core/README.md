@@ -35,9 +35,12 @@ Hosts that only call `pump()` from their own scheduler can leave the client unst
 and will dispatch messages only during those pump calls.
 
 For human-in-the-loop work, a handler can await `ctx.requestInput(requirement)`.
-The requester uses `streamRequest()` to observe `inputRequired`, obtains an answer
-through its own UI or policy, and sends it with `stream.provideInput(inputRequestId, answer)`.
-The answer continues the same task. The suspended handler state is in memory and
-does not survive a process restart.
+The requester uses `streamRequest()` to observe `inputRequired`, `statusUpdate`,
+`completed`, and `error`; its `result` promise resolves with the final output or
+rejects on failure, timeout, or client stop. Stream updates use the same dispatch
+path as polling, so live transport hooks are optional. The requester obtains an
+answer through its own UI or policy and sends it with
+`stream.provideInput(inputRequestId, answer)`. The answer continues the same task.
+The suspended handler state is in memory and does not survive a process restart.
 
 > Status: **0.2.0 (draft)** — API is stabilizing alongside the NIP-AGX spec (`SPEC.md`).
