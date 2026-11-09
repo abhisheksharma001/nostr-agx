@@ -141,18 +141,28 @@ message that is part of the protocol contract (`invoice not found`, `amount exce
 `AgxPublicError`, whose message is forwarded verbatim.
 
 An `AgxPublicError` may also carry three optional fields so a workflow can branch without parsing
-the message. `code` is one of the closed set `busy`, `timeout`, `invalid_input`, `unavailable`,
-`input_invalid`, or a dotted namespaced code of the sender's own (`acme.rate_limited`), at most 64
-characters. A namespaced code uses lowercase letters, digits, `_` and `-` in each dotted segment, and
-its first segment may not be one of the closed-set words. `retryable` says whether the same request may succeed if sent again. `details` is at most
-8 short scalar entries (keys up to 64 characters, string values up to 200, no `__proto__` key). The
-sender refuses an invalid value when it builds the error, keeps a frozen copy, and checks the fields
-again just before it sends them. A receiver treats all three as claims by the peer: a value
-outside these limits is ignored and the failure is still delivered with its `error` text. Only an
+the message:
+
+- `code` is one of the closed set `busy`, `timeout`, `invalid_input`, `unavailable`,
+  `input_invalid`, or a namespaced code of the sender's own such as `acme.rate_limited`, at most 64
+  characters. A namespaced code has two or more dot-separated segments; each starts with a lowercase
+  letter or digit and continues with lowercase letters, digits, `_` and `-`. Its first segment may
+  not be a closed-set word, so `busy.later` is refused.
+- `retryable` is a boolean: whether the same request may succeed if sent again.
+- `details` is a plain object of at most 8 entries. Keys are 1 to 64 characters and may not be
+  `__proto__`; values are strings of up to 200 characters, finite numbers or booleans. No nesting.
+
+The sender checks these when it builds the error: an invalid value throws a `TypeError` in the
+handler, which the peer sees only as `handler failed`. The constructor reads each option once and
+keeps a frozen copy of what it accepted, and only that copy is sent: setting `code`, `retryable` or
+`details` on the error afterwards, or in a subclass, changes nothing on the wire. Only an
 `AgxPublicError` ever sets them; an ordinary exception is still reported as `handler failed` with no
-code, `retryable` or `details`, whatever properties the exception itself has. A requester sees them on
-`AgxTaskFailedError`, an `Error` whose message is the peer's `error` text. A receiver that predates
-these fields ignores them. Both the request and result envelopes are
+code, `retryable` or `details`, whatever properties the exception itself has.
+
+A receiver treats all three as claims by the peer: a value outside these limits is ignored and the
+failure is still delivered. A requester sees them on `AgxTaskFailedError`, an `Error` whose message
+is the peer's `error` text, or `task failed` when the peer sent none. A receiver that predates these
+fields ignores them. Both the request and result envelopes are
 size-checked before sending; an oversize payload fails fast (request) or is replaced with a
 `result too large` failure (result) rather than truncated into unparseable JSON.
 
