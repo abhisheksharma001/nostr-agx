@@ -1,6 +1,6 @@
 /**
- * Human-in-the-loop AGX task: the responder suspends its handler until the
- * initiator supplies the requested input.
+ * Multi-turn human-in-the-loop AGX task: the responder suspends its handler
+ * after each question until the initiator supplies the next answer.
  *
  *   pnpm build                                      # at the repository root
  *   cd packages/nostr && pnpm dlx tsx examples/input-required-agent.ts
@@ -30,15 +30,31 @@ async function main() {
 
 	responder.handle<
 		{ amount: number; vendor: string },
-		{ approved: boolean }
+		{ purpose: string; costCenter: string; approved: boolean }
 	>("invoice.review", async (task, ctx) => {
+		const purpose = await ctx.requestInput({
+			id: "invoice-purpose",
+			prompt: `What was ${task.payload.vendor}'s $${task.payload.amount} invoice for?`,
+			inputSchema: { type: "string" },
+			timeoutMs: 120_000,
+		});
+		const costCenter = await ctx.requestInput({
+			id: "invoice-cost-center",
+			prompt: `Which cost center should be charged for "${String(purpose)}"?`,
+			inputSchema: { type: "string" },
+			timeoutMs: 120_000,
+		});
 		const approved = await ctx.requestInput({
 			id: "invoice-approval",
-			prompt: `Approve ${task.payload.vendor}'s invoice for $${task.payload.amount}?`,
+			prompt: `Approve the $${task.payload.amount} ${task.payload.vendor} invoice for "${String(purpose)}" under ${String(costCenter)}?`,
 			inputSchema: { type: "boolean" },
 			timeoutMs: 120_000,
 		});
-		return { approved: approved === true };
+		return {
+			purpose: String(purpose),
+			costCenter: String(costCenter),
+			approved: approved === true,
+		};
 	});
 
 	const initiator = new AgxClient({
@@ -56,17 +72,19 @@ async function main() {
 			initiator.start({ pollIntervalMs: 100 }),
 		]);
 
-		const stream = await initiator.streamRequest<{ approved: boolean }>(
+		const stream = await initiator.streamRequest<{
+			purpose: string;
+			costCenter: string;
+			approved: boolean;
+		}>(
 			responder.whoami(),
 			"invoice.review",
 			{ amount: 4200, vendor: "Globex" },
 			{ timeoutMs: 120_000 },
 		);
-		let resolveInput!: () => void;
-		let rejectInput!: (error: Error) => void;
-		const inputProvided = new Promise<void>((resolve, reject) => {
-			resolveInput = resolve;
-			rejectInput = reject;
+		let rejectConversation!: (error: Error) => void;
+		const conversationError = new Promise<never>((_resolve, reject) => {
+			rejectConversation = reject;
 		});
 
 		stream.on("statusUpdate", (status) => {
@@ -77,22 +95,35 @@ async function main() {
 		});
 		stream.on("inputRequired", (update) => {
 			void (async () => {
-				const answer = await prompt.question(
-					`${update.requirement.prompt} [y/N] `,
+				const inputSchema = update.requirement.inputSchema;
+				const isBooleanInput =
+					inputSchema !== null &&
+					typeof inputSchema === "object" &&
+					"type" in inputSchema &&
+					inputSchema.type === "boolean";
+				console.info("responder asks →", update.requirement.prompt);
+				const answerText = await prompt.question(
+					isBooleanInput ? "[y/N] " : "> ",
+				);
+				const answer = isBooleanInput
+					? /^y(es)?$/i.test(answerText.trim())
+					: answerText.trim();
+				console.info(
+					"initiator answers →",
+					typeof answer === "boolean" ? (answer ? "yes" : "no") : answer,
 				);
 				await stream.provideInput(
 					update.inputRequestId,
-					/^y(es)?$/i.test(answer.trim()),
+					answer,
 				);
-				resolveInput();
 			})().catch((error: unknown) => {
-				rejectInput(
+				rejectConversation(
 					error instanceof Error ? error : new Error(String(error)),
 				);
 			});
 		});
 
-		const [result] = await Promise.all([stream.result, inputProvided]);
+		const result = await Promise.race([stream.result, conversationError]);
 		console.info("invoice.review result →", result);
 	} finally {
 		prompt.close();

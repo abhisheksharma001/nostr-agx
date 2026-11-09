@@ -28,9 +28,10 @@ await agx.start();
 `NostrTransport.create()` only constructs the transport. `AgxClient.start()` opens its relay subscriptions, and `AgxClient.stop()` closes both those subscriptions and their relay connections.
 Live subscriptions replay a bounded recent window, skip envelopes already in the client's `SeenStore` before decryption, and record expired or invalid wraps there; polling remains the completeness and recovery path.
 
-For a complete human-in-the-loop example where a task handler suspends with
-`ctx.requestInput()` and the requester answers through `stream.provideInput()`,
-run `pnpm dlx tsx examples/input-required-agent.ts` from `packages/nostr`.
+For a multi-turn human-in-the-loop example where a task handler asks several
+sequential questions with `ctx.requestInput()` and the requester answers each
+through `stream.provideInput()`, run
+`pnpm dlx tsx examples/input-required-agent.ts` from `packages/nostr`.
 
 **Runtime:** Node. The transport dials WebSockets and the SSRF guard uses `node:dns` to vet
 peer-supplied relay / NIP-05 hosts before connecting. `node:dns`/`node:net` are imported lazily so a
