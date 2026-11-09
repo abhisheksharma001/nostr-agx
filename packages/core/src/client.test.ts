@@ -6,6 +6,7 @@ import {
 	type AgxPublicErrorOptions,
 	AgxTaskDeclined,
 	AgxTaskFailedError,
+	publicErrorFieldsToSend,
 	readPublicErrorFields,
 } from "./errors";
 import { randomId } from "./id";
@@ -1537,6 +1538,29 @@ describe("AgxClient structured public errors", () => {
 		expect(text).toBe(
 			JSON.stringify({ t: "res", taskId, status: "failed", error: "invoice not found" }),
 		);
+	});
+
+	it("keeps the copy it sends frozen, so a caller holding it cannot change what is sent", async () => {
+		const error = new AgxPublicError("queue is full", { code: "busy" });
+		const toSend = publicErrorFieldsToSend(error) as AgxPublicErrorOptions;
+		expect(() => {
+			toSend.code = "acme.leak";
+			toSend.details = { dbHost: "db-7.internal" };
+		}).toThrow(TypeError);
+
+		const bob = bobWith(() => {
+			throw error;
+		});
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		alice.request(BOB, "work", {}).catch(() => undefined);
+		await bob.pump();
+		expect(resultOnWire()).toEqual({
+			t: "res",
+			taskId: expect.any(String),
+			status: "failed",
+			error: "queue is full",
+			code: "busy",
+		});
 	});
 
 	it("holds each limit at its exact edge", () => {
