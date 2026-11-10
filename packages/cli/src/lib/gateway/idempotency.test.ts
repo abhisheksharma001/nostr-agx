@@ -739,4 +739,35 @@ describe("TaskOperationStore storage fairness", () => {
 		expect(store.get("credential-c", released.id as string)).toMatchObject({ status: "failed" });
 		store.close();
 	});
+
+	it("puts back the unkeyed result it made room by evicting when the released record cannot be saved", async () => {
+		const path = gatewayTaskOperationsPath("test");
+		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 2 });
+		const unkeyed: string[] = [];
+		for (let index = 0; index < 2; index++) {
+			const accepted = store.submit("credential-a", null, { background: true }, async () => ({ index }));
+			unkeyed.push(accepted.id as string);
+			await waitForStatus(store, "credential-a", accepted.id as string, "completed");
+		}
+		let fail: () => void = () => undefined;
+		const released = store.submit(
+			"credential-a",
+			"released",
+			{ background: true },
+			() =>
+				new Promise<Record<string, unknown>>((_resolve, reject) => {
+					fail = () => reject(new ApiError(404, "no_card", "No Agent Card was found"));
+				}),
+		);
+		rmSync(path, { force: true });
+		mkdirSync(path);
+		writeFileSync(join(path, "keep"), "blocks the final rename");
+		fail();
+
+		await waitForStatus(store, "credential-a", released.id as string, "failed");
+		expect(store.get("credential-a", released.id as string)).toMatchObject({ error: { code: "result_unknown" } });
+		expect(store.get("credential-a", unkeyed[0] as string)).toMatchObject({ status: "completed" });
+		rmSync(path, { recursive: true });
+		store.close();
+	});
 });
