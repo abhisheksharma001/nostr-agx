@@ -46,6 +46,7 @@ interface Entry {
 	record: AgxSuspendedTask;
 	continuation?: Continuation;
 	timer?: ReturnType<typeof setTimeout>;
+	settled: boolean;
 }
 
 interface SuspensionManagerOptions {
@@ -70,9 +71,26 @@ function nowSec(): number {
 
 export class AgxSuspensionManager {
 	private readonly entries = new Map<string, Entry>();
+	private readonly transitions = new Map<string, Promise<void>>();
 	private ready?: Promise<void>;
 
 	constructor(private readonly options: SuspensionManagerOptions) {}
+
+	private enqueue<T>(taskId: string, transition: () => Promise<T>): Promise<T> {
+		const previous = this.transitions.get(taskId) ?? Promise.resolve();
+		const result = previous.catch(() => undefined).then(transition);
+		const tail = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.transitions.set(taskId, tail);
+		void tail.then(() => {
+			if (this.transitions.get(taskId) === tail) {
+				this.transitions.delete(taskId);
+			}
+		});
+		return result;
+	}
 
 	load(): Promise<void> {
 		this.ready ??= this.restore();
@@ -137,22 +155,26 @@ export class AgxSuspensionManager {
 				const entry: Entry = {
 					record,
 					continuation: { resolve, reject },
+					settled: false,
 				};
 				this.entries.set(task.taskId, entry);
 				this.schedule(entry);
 			},
 		);
 		try {
-			await this.options.store.put(record);
-			await this.options.sendStatus(task.from, {
-				t: "status",
-				taskId: task.taskId,
-				status: "input-required",
-				seq,
-				question,
-				resumeSchema: input.resumeSchema,
-				expiresAt: record.expiresAt,
-			});
+			await this.enqueue(task.taskId, () => this.options.store.put(record));
+			const current = this.entries.get(task.taskId);
+			if (current?.record.seq === seq && !current.settled) {
+				await this.options.sendStatus(task.from, {
+					t: "status",
+					taskId: task.taskId,
+					status: "input-required",
+					seq,
+					question,
+					resumeSchema: input.resumeSchema,
+					expiresAt: record.expiresAt,
+				});
+			}
 		} catch (error) {
 			const entry = this.entries.get(task.taskId);
 			if (entry?.record.seq === seq) {
@@ -169,7 +191,7 @@ export class AgxSuspensionManager {
 	async resume(msg: AgxIncomingMessage, envelope: TaskResumeEnvelope): Promise<void> {
 		await this.load();
 		const entry = this.entries.get(envelope.taskId);
-		if (!entry) {
+		if (!entry || entry.settled) {
 			return;
 		}
 		if (this.options.normalizeId(msg.from) !== this.options.normalizeId(entry.record.from)) {
@@ -211,7 +233,7 @@ export class AgxSuspensionManager {
 
 		entry.record.resuming = true;
 		try {
-			await this.options.store.put(entry.record);
+			await this.enqueue(envelope.taskId, () => this.options.store.put(entry.record));
 		} catch (error) {
 			this.options.logger.error?.("AGX: could not persist resume marker", {
 				taskId: envelope.taskId,
@@ -222,6 +244,17 @@ export class AgxSuspensionManager {
 				error: "resume_state_failed",
 			});
 			return;
+		}
+		if (
+			entry.settled ||
+			this.entries.get(envelope.taskId) !== entry ||
+			entry.record.seq !== envelope.seq
+		) {
+			return;
+		}
+		if (entry.timer) {
+			clearTimeout(entry.timer);
+			entry.timer = undefined;
 		}
 		const resumeHandler = this.options.resumeHandler(entry.record.capability);
 		if (!resumeHandler) {
@@ -310,7 +343,7 @@ export class AgxSuspensionManager {
 		const records = await this.options.store.list();
 		for (const stored of records) {
 			const record = suspendedTaskSchema.parse(stored);
-			const entry: Entry = { record };
+			const entry: Entry = { record, settled: false };
 			this.entries.set(record.taskId, entry);
 			if (record.resuming) {
 				await this.settle(entry, {
@@ -345,6 +378,10 @@ export class AgxSuspensionManager {
 		result: TaskResult,
 		chain: TaskRef[] = [],
 	): Promise<void> {
+		if (entry.settled) {
+			return;
+		}
+		entry.settled = true;
 		if (entry.timer) {
 			clearTimeout(entry.timer);
 			entry.timer = undefined;
@@ -368,10 +405,15 @@ export class AgxSuspensionManager {
 		if (entry.timer) {
 			clearTimeout(entry.timer);
 		}
-		const current = this.entries.get(entry.record.taskId);
-		if (!current || current.record.seq === entry.record.seq) {
-			this.entries.delete(entry.record.taskId);
+		await this.enqueue(entry.record.taskId, async () => {
+			const current = this.entries.get(entry.record.taskId);
+			if (current && current.record.seq !== entry.record.seq) {
+				return;
+			}
+			if (current === entry) {
+				this.entries.delete(entry.record.taskId);
+			}
 			await this.options.store.delete(entry.record.taskId);
-		}
+		});
 	}
 }

@@ -3,7 +3,10 @@ import { AgxClient } from "./client";
 import { AgxPublicError, AgxTaskDeclined } from "./errors";
 import { randomId } from "./id";
 import { InMemorySeenStore } from "./seen-store";
-import { InMemorySuspensionStore } from "./suspension-store";
+import {
+	type AgxSuspendedTask,
+	InMemorySuspensionStore,
+} from "./suspension-store";
 import {
 	encodeTaskEnvelope,
 	parseTaskEnvelope,
@@ -1904,6 +1907,112 @@ describe("AgxClient durable input-required resume", () => {
 			expect(resume).not.toHaveBeenCalled();
 			expect(await store.list()).toEqual([]);
 		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not run a resume after expiry wins a pending marker write", async () => {
+		vi.useFakeTimers();
+		let releaseMarker!: () => void;
+		let markerEntered!: () => void;
+		const markerReleased = new Promise<void>((resolve) => {
+			releaseMarker = resolve;
+		});
+		const markerPending = new Promise<void>((resolve) => {
+			markerEntered = resolve;
+		});
+		class ExpiringStore extends InMemorySuspensionStore {
+			override async put(task: AgxSuspendedTask): Promise<void> {
+				if (task.resuming) {
+					markerEntered();
+					await markerReleased;
+				}
+				await super.put(task);
+			}
+		}
+		try {
+			const store = new ExpiringStore();
+			const initial = vi.fn(async (task: Task) => task.requireInput?.({
+				question,
+				resumeSchema,
+				timeoutSec: 1,
+			}));
+			const resume = vi.fn(() => "too late");
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+				suspensions: store,
+			});
+			bob.handle("approval", initial, undefined, resume);
+			const pending = alice.request(BOB, "approval", {}, { timeoutMs: 5_000 });
+			const taskId = outboundRequest().taskId;
+			await bob.pump();
+			await alice.pump();
+			await alice.resume(taskId, { answer: "yes" });
+
+			const resumingPump = bob.pump();
+			await markerPending;
+			const rejection = expect(pending).rejects.toThrow("input_required_expired");
+			await vi.advanceTimersByTimeAsync(1_000);
+			await alice.pump();
+			await rejection;
+			releaseMarker();
+			await resumingPump;
+			await alice.pump();
+
+			expect(resume).not.toHaveBeenCalled();
+			expect(await store.list()).toEqual([]);
+			const results = (bus.inbox.get(ALICE) ?? [])
+				.map((message) => parseTaskEnvelope(message.text))
+				.filter((envelope) => envelope?.t === "res");
+			expect(results).toHaveLength(1);
+		} finally {
+			releaseMarker();
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not expire a committed resume while its handler is running", async () => {
+		vi.useFakeTimers();
+		let finishResume: ((value: string) => void) | undefined;
+		try {
+			const store = new InMemorySuspensionStore();
+			const initial = vi.fn(async (task: Task) => task.requireInput?.({
+				question,
+				resumeSchema,
+				timeoutSec: 1,
+			}));
+			const resume = vi.fn(() => new Promise<string>((resolve) => {
+				finishResume = resolve;
+			}));
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+				suspensions: store,
+			});
+			bob.handle("approval", initial, undefined, resume);
+			const pending = alice.request(BOB, "approval", {}, { timeoutMs: 5_000 });
+			pending.catch(() => undefined);
+			const taskId = outboundRequest().taskId;
+			await bob.pump();
+			await alice.pump();
+			await alice.resume(taskId, { answer: "yes" });
+			await bob.pump();
+
+			await vi.advanceTimersByTimeAsync(1_000);
+			await alice.pump();
+			expect(resume).toHaveBeenCalledTimes(1);
+			expect(finishResume).toBeDefined();
+			finishResume?.("done");
+
+			expect(await pumpUntilResult(pending, alice, bob)).toBe("done");
+			expect(await store.list()).toEqual([]);
+		} finally {
+			finishResume?.("done");
 			vi.useRealTimers();
 		}
 	});
