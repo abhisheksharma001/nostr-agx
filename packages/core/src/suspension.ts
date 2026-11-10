@@ -369,7 +369,12 @@ export class AgxSuspensionManager {
 			void this.settle(entry, {
 				status: "failed",
 				error: "input_required_expired",
-			});
+			}).catch((error) =>
+				this.options.logger.error?.("AGX: input-required expiry failed", {
+					taskId: entry.record.taskId,
+					error: error instanceof Error ? error.message : String(error),
+				}),
+			);
 		}, delay);
 	}
 
