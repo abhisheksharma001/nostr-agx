@@ -652,7 +652,17 @@ export class TaskOperationStore {
 		if (!operation.keyed || !operation.publicId) {
 			return [];
 		}
-		const evicted = this.makeStorageRoom(operation.credential ?? "", false);
+		let evicted: Operation[] = [];
+		try {
+			evicted = this.makeStorageRoom(operation.credential ?? "", false);
+		} catch (error) {
+			// Every unkeyed record is still running, so none can go. The key is freed all the same:
+			// the pool stays over its limit until one of them finishes, and the next unkeyed
+			// submission trims it. Failing here would hide this task's own error.
+			if (!(error instanceof ApiError)) {
+				throw error;
+			}
+		}
 		this.drop(operation);
 		operation.id = hash(`background task\0${operation.publicId}`);
 		operation.keyed = false;
