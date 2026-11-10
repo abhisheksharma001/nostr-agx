@@ -284,10 +284,7 @@ export class AgxClient {
 	private readonly handlers = new Map<string, TaskHandler>();
 	private readonly pending = new Map<string, Pending>();
 	private readonly pendingTaskInputs = new Map<string, PendingTaskInput>();
-	private readonly activeInboundTasks = new Map<
-		string,
-		{ peer: string; canceled: boolean }
-	>();
+	private readonly activeInboundTasks = new Map<string, { canceled: boolean }>();
 	private readonly cancellationSends = new Set<Promise<void>>();
 	private cursor: number;
 	private pollTimer?: ReturnType<typeof setTimeout>;
@@ -1120,8 +1117,16 @@ export class AgxClient {
 			// Guard defensively and, crucially, do NOT auto-reply.
 			return;
 		}
-		this.activeInboundTasks.set(env.taskId, {
-			peer: this.normalizeId(msg.from),
+		const peer = this.normalizeId(msg.from);
+		const activeTaskKey = this.activeInboundTaskKey(peer, env.taskId);
+		if (this.activeInboundTasks.has(activeTaskKey)) {
+			this.log.warn?.("AGX: duplicate active task ID; dropping", {
+				taskId: env.taskId,
+				from: msg.from,
+			});
+			return;
+		}
+		this.activeInboundTasks.set(activeTaskKey, {
 			canceled: false,
 		});
 		// Best-effort delivery receipt (the task was accepted for processing).
@@ -1164,7 +1169,7 @@ export class AgxClient {
 				await Promise.race([scheduled.completion, scheduled.inputRequired]);
 			}
 		} catch (error) {
-			this.activeInboundTasks.delete(env.taskId);
+			this.activeInboundTasks.delete(activeTaskKey);
 			throw error;
 		}
 	}
@@ -1286,7 +1291,9 @@ export class AgxClient {
 		releaseSlot: () => void,
 		acquireSlot: () => Promise<void>,
 	): Promise<void> {
-		const active = this.activeInboundTasks.get(env.taskId);
+		const active = this.activeInboundTasks.get(
+			this.activeInboundTaskKey(this.normalizeId(msg.from), env.taskId),
+		);
 		const deadline =
 			env.timeoutMs && env.timeoutMs > 0
 				? Date.now() + env.timeoutMs
@@ -1413,7 +1420,9 @@ export class AgxClient {
 					: "handler failed",
 			});
 		} finally {
-			this.activeInboundTasks.delete(env.taskId);
+			this.activeInboundTasks.delete(
+				this.activeInboundTaskKey(this.normalizeId(msg.from), env.taskId),
+			);
 		}
 	}
 
@@ -1559,6 +1568,10 @@ export class AgxClient {
 		return JSON.stringify([taskId, inputRequestId]);
 	}
 
+	private activeInboundTaskKey(peer: string, taskId: string): string {
+		return JSON.stringify([peer, taskId]);
+	}
+
 	private resolveTaskInput(
 		msg: AgxIncomingMessage,
 		env: TaskInputEnvelope,
@@ -1590,12 +1603,12 @@ export class AgxClient {
 		msg: AgxIncomingMessage,
 		env: TaskCancelEnvelope,
 	): void {
-		const active = this.activeInboundTasks.get(env.taskId);
+		const peer = this.normalizeId(msg.from);
+		const active = this.activeInboundTasks.get(
+			this.activeInboundTaskKey(peer, env.taskId),
+		);
 		if (!active) return;
-		if (
-			msg.contextId !== env.taskId ||
-			this.normalizeId(msg.from) !== active.peer
-		) {
+		if (msg.contextId !== env.taskId) {
 			this.log.warn?.("AGX: task cancellation from unexpected peer; dropping", {
 				taskId: env.taskId,
 				from: msg.from,
@@ -1604,7 +1617,7 @@ export class AgxClient {
 		}
 		active.canceled = true;
 		for (const pending of this.pendingTaskInputs.values()) {
-			if (pending.taskId === env.taskId) {
+			if (pending.taskId === env.taskId && pending.peer === peer) {
 				this.rejectTaskInput(
 					env.taskId,
 					pending.inputRequestId,
