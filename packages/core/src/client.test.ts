@@ -136,6 +136,7 @@ function liveTransport(id: string) {
 let bus: MemoryBus;
 const ALICE = "alice";
 const BOB = "bob";
+const CAROL = "carol";
 
 beforeEach(() => {
 	bus = new MemoryBus();
@@ -496,6 +497,180 @@ describe("AgxClient task request/response", () => {
 		const pending = alice.request(BOB, "noop", {});
 		await alice.stop();
 		await expect(pending).rejects.toThrow("AGX client stopped");
+	});
+
+	it("publishes results from running inbound tasks after stop()", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+		});
+		let release!: () => void;
+		let markStarted!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		bob.handle("slow", async () => {
+			markStarted();
+			await gate;
+			return "finished";
+		});
+
+		const result = alice.request(BOB, "slow", {}, { timeoutMs: 0 });
+		await bob.pump();
+		await started;
+		await bob.stop();
+		release();
+		await bob.tasksSettled();
+		await alice.pump();
+
+		await expect(result).resolves.toBe("finished");
+		await alice.stop();
+	});
+
+	it("fails input-waiting tasks when the responder stops", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+		});
+		bob.handle("approval", async (_task, ctx) =>
+			ctx.requestInput({ prompt: "Approve?" }),
+		);
+		const stream = await alice.streamRequest(BOB, "approval", {}, {
+			timeoutMs: 0,
+		});
+
+		await bob.pump();
+		await alice.pump();
+		await bob.stop();
+		await bob.tasksSettled();
+		await alice.pump();
+
+		await expect(stream.result).rejects.toThrow("handler failed");
+		expect(
+			(bus.inbox.get(ALICE) ?? [])
+				.map((message) => parseTaskEnvelope(message.text))
+				.some((envelope) => envelope?.t === "res" && envelope.status === "failed"),
+		).toBe(true);
+		await alice.stop();
+	});
+
+	it("scopes active task IDs and cancellation to the requesting peer", async () => {
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+		});
+		const handler = vi.fn(async (_task, ctx) =>
+			ctx.requestInput({ prompt: "Continue?" }),
+		);
+		bob.handle("wait", handler);
+		const taskId = "shared-task";
+		const requestText = encodeTaskEnvelope({
+			t: "req",
+			taskId,
+			capability: "wait",
+			payload: {},
+			supportsInput: true,
+			timeoutMs: 0,
+		});
+		for (const [peer, messageId] of [
+			[ALICE, "alice-request"],
+			[ALICE, "alice-duplicate"],
+			[CAROL, "carol-request"],
+		]) {
+			bus.pushMessage(BOB, {
+				from: peer,
+				text: requestText,
+				contextId: taskId,
+				messageId,
+				subject: null,
+				autoDepth: null,
+				contentType: TASK_CONTENT_TYPE,
+			});
+		}
+
+		await bob.pump();
+		const waitForInput = async (peer: string) => {
+			for (;;) {
+				const input = (bus.inbox.get(peer) ?? [])
+					.map((message) => parseTaskEnvelope(message.text))
+					.find(
+						(envelope) =>
+							envelope?.t === "res" &&
+							envelope.status === "input-required" &&
+							envelope.taskId === taskId,
+					);
+				if (input?.t === "res" && input.status === "input-required") {
+					return input.inputRequestId;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
+		};
+		const [aliceInputRequestId, carolInputRequestId] = await Promise.all([
+			waitForInput(ALICE),
+			waitForInput(CAROL),
+		]);
+		expect(handler).toHaveBeenCalledTimes(2);
+
+		await bus.transport(CAROL).publishMessage(BOB, {
+			text: encodeTaskEnvelope({ t: "cancel", taskId }),
+			contextId: taskId,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		await bob.pump();
+		expect(
+			(bus.inbox.get(ALICE) ?? [])
+				.map((message) => parseTaskEnvelope(message.text))
+				.some(
+					(envelope) =>
+						envelope?.t === "res" &&
+						(envelope.status === "completed" || envelope.status === "failed"),
+				),
+		).toBe(false);
+
+		await bus.transport(ALICE).publishMessage(BOB, {
+			text: encodeTaskEnvelope({
+				t: "input",
+				taskId,
+				inputRequestId: aliceInputRequestId,
+				input: "continue",
+			}),
+			contextId: taskId,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		await bob.pump();
+		await bob.tasksSettled();
+
+		const aliceResults = (bus.inbox.get(ALICE) ?? [])
+			.map((message) => parseTaskEnvelope(message.text))
+			.filter((envelope) => envelope?.t === "res" && envelope.status === "completed");
+		expect(aliceResults).toEqual([
+			expect.objectContaining({ taskId, status: "completed", output: "continue" }),
+		]);
+		expect(carolInputRequestId).not.toBe(aliceInputRequestId);
+		await bob.stop();
+	});
+
+	it("ignores cancellation messages for unknown tasks", async () => {
+		const onMessage = vi.fn();
+		const bob = new AgxClient({ transport: bus.transport(BOB), onMessage });
+		await bus.transport(ALICE).publishMessage(BOB, {
+			text: encodeTaskEnvelope({ t: "cancel", taskId: "unknown-task" }),
+			contextId: "unknown-task",
+			contentType: TASK_CONTENT_TYPE,
+		});
+
+		await bob.pump();
+
+		expect(onMessage).not.toHaveBeenCalled();
+		expect(bus.inbox.get(ALICE)).toBeUndefined();
+		await bob.stop();
 	});
 
 	it("does not double-run a handler under concurrent pumps", async () => {

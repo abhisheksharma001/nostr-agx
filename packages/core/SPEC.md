@@ -145,7 +145,8 @@ otherwise it **MUST** fail the task promptly. A completed handler transitions th
 the pending task and `inputRequestId` and come from the peer that initiated the task. A cancellation
 **MUST** match an active task and come from its initiating peer; the responder **MUST** stop waiting
 for input and **MUST NOT** send a later result. Cancellation cannot forcibly stop arbitrary
-application code already running.
+application code already running. A cancellation for an unknown or inactive task is ignored and
+**MUST NOT** be delivered as a plain message or trigger a reply.
 
 An input requirement's `id` is an optional stable, handler-chosen label for the kind of question;
 `inputRequestId` is the unique correlation id for that specific prompt and answer. `timeoutMs` is

@@ -977,12 +977,9 @@ export class AgxClient {
 			if (p.timer) {
 				clearTimeout(p.timer);
 			}
-			p.reject(new AgxTaskCanceled());
+			p.reject(new Error("AGX client stopped"));
 		}
 		this.pendingTaskInputs.clear();
-		for (const task of this.activeInboundTasks.values()) {
-			task.canceled = true;
-		}
 		while (this.cancellationSends.size > 0) {
 			await Promise.all([...this.cancellationSends]);
 		}
@@ -1021,7 +1018,7 @@ export class AgxClient {
 					return;
 				}
 			}
-			if (env?.t === "cancel" && this.activeInboundTasks.has(env.taskId)) {
+			if (env?.t === "cancel") {
 				this.cancelInboundTask(msg, env);
 				return;
 			}
