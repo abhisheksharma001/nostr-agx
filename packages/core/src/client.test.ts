@@ -2017,6 +2017,76 @@ describe("AgxClient durable input-required resume", () => {
 		}
 	});
 
+	it("logs a failed cleanup when a restored question expires, instead of crashing", async () => {
+		vi.useFakeTimers();
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		const error = vi.fn();
+		try {
+			const base = new InMemorySuspensionStore();
+			let failDelete = false;
+			const store = {
+				list: () => base.list(),
+				put: (task: Parameters<typeof base.put>[0]) => base.put(task),
+				delete: async (taskId: string) => {
+					if (failDelete) {
+						throw new Error("disk full");
+					}
+					await base.delete(taskId);
+				},
+			};
+			const seen = new InMemorySeenStore();
+			const initial = vi.fn(async (task: Task) => task.requireInput?.({
+				question,
+				resumeSchema,
+				timeoutSec: 1,
+			}));
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const firstBob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+				seen,
+				suspensions: store,
+			});
+			firstBob.handle("approval", initial, undefined, () => "done");
+			const pending = alice.request(BOB, "approval", {}, { timeoutMs: 5_000 });
+			const rejection = expect(pending).rejects.toThrow("input_required_expired");
+			await firstBob.pump();
+			await alice.pump();
+			await firstBob.stop();
+
+			const secondBob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+				seen,
+				suspensions: store,
+				logger: { error },
+			});
+			secondBob.handle("approval", initial, undefined, () => "done");
+			await secondBob.start({ pollIntervalMs: 0, advertise: false });
+			failDelete = true;
+			await vi.advanceTimersByTimeAsync(1_000);
+			await alice.pump();
+			await rejection;
+			vi.useRealTimers();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(unhandled).toEqual([]);
+			expect(error).toHaveBeenCalledWith(
+				"AGX: input-required expiry failed",
+				expect.objectContaining({ error: "disk full" }),
+			);
+		} finally {
+			vi.useRealTimers();
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
 	it("resumes from a shared store after client restart without rerunning initial work", async () => {
 		const store = new InMemorySuspensionStore();
 		const seen = new InMemorySeenStore();
