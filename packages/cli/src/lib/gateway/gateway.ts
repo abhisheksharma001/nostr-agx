@@ -27,9 +27,9 @@ import { AGX_CLI_VERSION } from "../version.js";
 import { DeliveryQueue, deliver } from "./delivery.js";
 import { messageEvent, receiptEvent, taskEvent } from "./events.js";
 import { ApiError, readJson, sendError, sendJson } from "./http.js";
-import { parseIdempotencyKey, TaskIdempotencyStore } from "./idempotency.js";
+import { parseIdempotencyKey, TaskOperationStore } from "./idempotency.js";
 import { verifyGatewayKey } from "./keys.js";
-import { type OperationDeps, readCard, requestTask, sendMessage } from "./operations.js";
+import { type OperationDeps, parseTaskRequest, readCard, runTaskRequest, sendMessage } from "./operations.js";
 import { Requester } from "./requester.js";
 import { KeyedSlots } from "./slots.js";
 import {
@@ -80,6 +80,8 @@ export interface GatewayOptions {
 	maxTaskRequestsWaiting?: number;
 	/** For tests: keyed task operations still running after callers disconnect. Default 256. */
 	maxTaskOperationsInFlight?: number;
+	/** For tests: background task operations running at once. Default 64. */
+	maxBackgroundTasksInFlight?: number;
 }
 
 export interface RunningGateway {
@@ -160,9 +162,10 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				log(`A message could not be stored and will be retried: ${error instanceof Error ? error.message : String(error)}`),
 		});
 		const subscriptions = new SubscriptionStore(name);
-		const taskOperations = new TaskIdempotencyStore(name, {
+		const taskOperations = new TaskOperationStore(name, {
 			log,
 			maxInFlight: options.maxTaskOperationsInFlight ?? MAX_TASK_REQUESTS_WAITING,
+			maxBackgroundInFlight: options.maxBackgroundTasksInFlight,
 		});
 		const queue = new DeliveryQueue({
 			retryDelaysMs: options.deliveryRetryDelaysMs,
@@ -497,9 +500,18 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				});
 				return;
 			}
+			const task = /^\/v1\/tasks\/([^/]+)$/.exec(path);
+			if (method === "GET" && task) {
+				const output = taskOperations.get(bearer(req), decodeURIComponent(task[1]));
+				if (output === null) {
+					throw new ApiError(404, "not_found", "No background task with that ID for this credential");
+				}
+				sendJson(res, 200, output);
+				return;
+			}
 			if (method === "POST" && path === "/v1/tasks") {
 				const idempotencyKey = parseIdempotencyKey(req.headers["idempotency-key"]);
-				// Each one holds a connection and a result poll until it is answered.
+				// Each one holds a connection; synchronous requests also hold a result poll.
 				if (tasksWaiting >= maxTaskRequestsWaiting) {
 					throw new ApiError(
 						503,
@@ -519,7 +531,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				const gone = new AbortController();
 				res.on("close", () => {
 					if (!res.writableFinished) {
-						// Only work without a key belongs to this one HTTP caller. Every
+						// Only synchronous work without a key uses this abort signal. Every
 						// disconnected caller stops consuming a waiting slot immediately.
 						if (idempotencyKey === null) {
 							gone.abort();
@@ -529,9 +541,15 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				});
 				try {
 					const body = await readJson(req);
+					const taskRequest = parseTaskRequest(body);
+					const operation = () => runTaskRequest(deps, taskRequest);
+					if (taskRequest.background) {
+						sendJson(res, 202, taskOperations.submit(bearer(req), idempotencyKey, body, operation));
+						return;
+					}
 					const output = idempotencyKey === null
-						? await requestTask(deps, body, gone.signal)
-						: await taskOperations.execute(bearer(req), idempotencyKey, body, () => requestTask(deps, body));
+						? await runTaskRequest(deps, taskRequest, gone.signal)
+						: await taskOperations.execute(bearer(req), idempotencyKey, body, operation);
 					sendJson(res, 200, output);
 				} finally {
 					releaseWaiting();

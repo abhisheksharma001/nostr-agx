@@ -39,7 +39,7 @@ import { dirname, join } from "node:path";
  *                                         webhooks `agx gateway` delivers to,
  *                                         with their signing secrets
  *     profiles/<name>/gateway-task-operations.json
- *                                         idempotent task requests and outcomes
+ *                                         idempotent and background task operations and outcomes
  */
 
 export function agxHome(): string {
