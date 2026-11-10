@@ -619,12 +619,12 @@ export class TaskOperationStore {
 			try {
 				if (retryable) {
 					if (operation.background) {
-						this.releaseBackgroundKey(operation);
+						evicted = this.releaseBackgroundKey(operation);
 					} else {
 						this.drop(operation);
 					}
 				}
-				evicted = this.enforceByteBudget(operation.id);
+				evicted = evicted.concat(this.enforceByteBudget(operation.id));
 				this.persist();
 			} catch {
 				for (const settled of evicted) {
@@ -647,14 +647,17 @@ export class TaskOperationStore {
 		return this.replay(operation, outcome);
 	}
 
-	private releaseBackgroundKey(operation: Operation): void {
+	/** The record leaves the keyed pool for the unkeyed one, so it needs room there first. */
+	private releaseBackgroundKey(operation: Operation): Operation[] {
 		if (!operation.keyed || !operation.publicId) {
-			return;
+			return [];
 		}
+		const evicted = this.makeStorageRoom(operation.credential ?? "", false);
 		this.drop(operation);
 		operation.id = hash(`background task\0${operation.publicId}`);
 		operation.keyed = false;
 		this.put(operation);
+		return evicted;
 	}
 
 	private retainedOutcome(outcome: Outcome, background: boolean): Outcome {
