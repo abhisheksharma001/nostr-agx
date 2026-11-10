@@ -656,10 +656,12 @@ export class TaskOperationStore {
 		try {
 			evicted = this.makeStorageRoom(operation.credential ?? "", false);
 		} catch (error) {
-			// Every unkeyed record is still running, so none can go. The key is freed all the same:
-			// the pool stays over its limit until one of them finishes, and the next unkeyed
-			// submission trims it. Failing here would hide this task's own error.
-			if (!(error instanceof ApiError)) {
+			// Every unkeyed record is still running, so none can go. Free the key all the same: failing
+			// here would hide this task's own error. The pool stays over its limit until a running task
+			// finishes and a later unkeyed submission trims it, and each release in that state adds a
+			// record. The default limits keep this from happening: at most 63 other background tasks
+			// run, against a per-credential limit of 100.
+			if (!(error instanceof ApiError && error.code === "idempotency_store_full")) {
 				throw error;
 			}
 		}
