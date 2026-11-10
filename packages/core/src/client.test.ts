@@ -657,6 +657,120 @@ describe("AgxClient task request/response", () => {
 		await bob.stop();
 	});
 
+	it("keeps a task cancellable after another peer's task with the same id finishes", async () => {
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+		});
+		const handler = vi.fn(async (_task, ctx) =>
+			// Bounded prompt timeout so a cancel that wrongly misses this task
+			// fails the test with a visible "failed" result instead of hanging.
+			ctx.requestInput({ prompt: "Continue?", timeoutMs: 1000 }),
+		);
+		bob.handle("wait", handler);
+		const taskId = "shared-finish";
+		const requestText = encodeTaskEnvelope({
+			t: "req",
+			taskId,
+			capability: "wait",
+			payload: {},
+			supportsInput: true,
+			timeoutMs: 0,
+		});
+		for (const [peer, messageId] of [
+			[ALICE, "alice-request"],
+			[CAROL, "carol-request"],
+		]) {
+			bus.pushMessage(BOB, {
+				from: peer,
+				text: requestText,
+				contextId: taskId,
+				messageId,
+				subject: null,
+				autoDepth: null,
+				contentType: TASK_CONTENT_TYPE,
+			});
+		}
+
+		await bob.pump();
+		const waitForInput = async (peer: string) => {
+			for (;;) {
+				const input = (bus.inbox.get(peer) ?? [])
+					.map((message) => parseTaskEnvelope(message.text))
+					.find(
+						(envelope) =>
+							envelope?.t === "res" &&
+							envelope.status === "input-required" &&
+							envelope.taskId === taskId,
+					);
+				if (input?.t === "res" && input.status === "input-required") {
+					return input.inputRequestId;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
+		};
+		const [aliceInputRequestId, carolInputRequestId] = await Promise.all([
+			waitForInput(ALICE),
+			waitForInput(CAROL),
+		]);
+
+		// Carol finishes her task. Her cleanup must remove only HER active-task
+		// entry — Alice's must survive it. (No `tasksSettled()` here: Alice's
+		// task is still waiting on input, so settling would block on it.)
+		await bus.transport(CAROL).publishMessage(BOB, {
+			text: encodeTaskEnvelope({
+				t: "input",
+				taskId,
+				inputRequestId: carolInputRequestId,
+				input: "carol's answer",
+			}),
+			contextId: taskId,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		await bob.pump();
+		const waitForTerminal = async (peer: string) => {
+			for (;;) {
+				const done = (bus.inbox.get(peer) ?? [])
+					.map((message) => parseTaskEnvelope(message.text))
+					.find(
+						(envelope) =>
+							envelope?.t === "res" &&
+							(envelope.status === "completed" || envelope.status === "failed"),
+					);
+				if (done?.t === "res") return done;
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
+		};
+		expect(await waitForTerminal(CAROL)).toMatchObject({
+			taskId,
+			status: "completed",
+			output: "carol's answer",
+		});
+
+		// Alice can still cancel her own task, and its cancellation is honored:
+		// the pending input is rejected, the handler's AgxTaskCanceled is
+		// suppressed, and no terminal result is ever published to her.
+		await bus.transport(ALICE).publishMessage(BOB, {
+			text: encodeTaskEnvelope({ t: "cancel", taskId }),
+			contextId: taskId,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		await bob.pump();
+		await bob.tasksSettled();
+
+		const aliceTerminal = (bus.inbox.get(ALICE) ?? [])
+			.map((message) => parseTaskEnvelope(message.text))
+			.filter(
+				(envelope) =>
+					envelope?.t === "res" &&
+					(envelope.status === "completed" || envelope.status === "failed"),
+			);
+		expect(aliceTerminal).toEqual([]);
+		expect(handler).toHaveBeenCalledTimes(2);
+		await bob.stop();
+	});
+
 	it("ignores cancellation messages for unknown tasks", async () => {
 		const onMessage = vi.fn();
 		const bob = new AgxClient({ transport: bus.transport(BOB), onMessage });

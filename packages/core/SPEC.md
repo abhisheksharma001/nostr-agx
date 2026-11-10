@@ -141,8 +141,12 @@ States: `submitted → working ↔ input-required → completed | failed | cance
 `requestInput(requirement)` to publish an `input-required` update and await the continuation. A
 responder **MUST NOT** publish that update unless the request opted in with `supportsInput: true`;
 otherwise it **MUST** fail the task promptly. A completed handler transitions the task to
-`completed`; a thrown handler error transitions it to `failed`. An input continuation **MUST** match
-the pending task and `inputRequestId` and come from the peer that initiated the task. A cancellation
+`completed`; a thrown handler error transitions it to `failed`. Task identity is scoped per requester: a
+`taskId` names a task only within the exchange with the peer that chose it, so the same id arriving
+from two different peers names two distinct tasks whose lifecycles — active entry, input,
+cancellation, cleanup — **MUST** stay separate, and a second request from a peer reusing a `taskId`
+that is still active **MUST** be refused rather than overwrite it. An input continuation **MUST**
+match the pending task and `inputRequestId` and come from the peer that initiated the task. A cancellation
 **MUST** match an active task and come from its initiating peer; the responder **MUST** stop waiting
 for input and **MUST NOT** send a later result. Cancellation cannot forcibly stop arbitrary
 application code already running. A cancellation for an unknown or inactive task — one that has
