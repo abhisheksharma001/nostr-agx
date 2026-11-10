@@ -131,7 +131,7 @@ const MAX_RESULT_ERROR = 2000;
 
 /** Cut a public error message to {@link MAX_RESULT_ERROR} UTF-16 units. If the
  * cut would split a surrogate pair (an emoji, say), keep one unit fewer so the
- * message never ends in half a character. */
+ * cut never separates the two halves of a pair. */
 function fitPublicMessage(message: string): string {
 	if (message.length <= MAX_RESULT_ERROR) {
 		return message;
