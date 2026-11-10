@@ -699,4 +699,44 @@ describe("TaskOperationStore storage fairness", () => {
 		release?.();
 		store.close();
 	});
+
+	// A keyed background task that fails before anything is published frees its key and keeps its
+	// record as an unkeyed one. That record joins the unkeyed pool, so it has to fit that pool's limits.
+	const releasedByNoCard = async (): Promise<Record<string, unknown>> => {
+		throw new ApiError(404, "no_card", "No Agent Card was found");
+	};
+
+	it("keeps a released background key's record within the per-credential limit of unkeyed results", async () => {
+		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 2 });
+		const unkeyed: string[] = [];
+		for (let index = 0; index < 2; index++) {
+			const accepted = store.submit("credential-a", null, { background: true }, async () => ({ index }));
+			unkeyed.push(accepted.id as string);
+			await waitForStatus(store, "credential-a", accepted.id as string, "completed");
+		}
+		const released = store.submit("credential-a", "released", { background: true }, releasedByNoCard);
+		await waitForStatus(store, "credential-a", released.id as string, "failed");
+
+		const kept = [...unkeyed, released.id as string].filter((id) => store.get("credential-a", id) !== null);
+		expect(kept).toEqual([unkeyed[1], released.id]);
+		store.close();
+	});
+
+	it("keeps a released background key's record within the store-wide limit of unkeyed results", async () => {
+		let clock = 0;
+		const store = new TaskOperationStore("test", { maxOperations: 2, now: () => (clock += 1) });
+		const unkeyed: string[] = [];
+		for (const credential of ["credential-a", "credential-b"]) {
+			const accepted = store.submit(credential, null, { background: true }, async () => ({ credential }));
+			unkeyed.push(accepted.id as string);
+			await waitForStatus(store, credential, accepted.id as string, "completed");
+		}
+		const released = store.submit("credential-c", "released", { background: true }, releasedByNoCard);
+		await waitForStatus(store, "credential-c", released.id as string, "failed");
+
+		expect(store.get("credential-a", unkeyed[0] as string)).toBeNull();
+		expect(store.get("credential-b", unkeyed[1] as string)).toMatchObject({ status: "completed" });
+		expect(store.get("credential-c", released.id as string)).toMatchObject({ status: "failed" });
+		store.close();
+	});
 });
