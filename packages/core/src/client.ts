@@ -1604,9 +1604,18 @@ export class AgxClient {
 		const active = this.activeInboundTasks.get(
 			this.activeInboundTaskKey(peer, env.taskId),
 		);
-		if (!active) return;
+		if (!active) {
+			// Expected in the common timeout race: the task already completed
+			// (its entry was cleaned up) or never started here. Ignore it —
+			// consumed, never replied to, never surfaced as a plain message.
+			this.log.debug?.(
+				"AGX: cancellation for unknown or finished task; ignoring",
+				{ taskId: env.taskId, from: msg.from },
+			);
+			return;
+		}
 		if (msg.contextId !== env.taskId) {
-			this.log.warn?.("AGX: task cancellation from unexpected peer; dropping", {
+			this.log.warn?.("AGX: task cancellation context mismatch; dropping", {
 				taskId: env.taskId,
 				from: msg.from,
 			});

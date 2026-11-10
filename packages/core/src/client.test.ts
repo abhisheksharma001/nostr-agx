@@ -673,6 +673,50 @@ describe("AgxClient task request/response", () => {
 		await bob.stop();
 	});
 
+	it("ignores a cancellation that arrives after the task finished", async () => {
+		const onMessage = vi.fn();
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			onMessage,
+		});
+		const handler = vi.fn(() => "done");
+		bob.handle("quick", handler);
+		const taskId = "finished-task";
+		await bus.transport(ALICE).publishMessage(BOB, {
+			text: encodeTaskEnvelope({
+				t: "req",
+				taskId,
+				capability: "quick",
+				payload: {},
+			}),
+			contextId: taskId,
+			contentType: TASK_CONTENT_TYPE,
+		});
+
+		await bob.pump();
+		await bob.tasksSettled();
+		expect(handler).toHaveBeenCalledTimes(1);
+		// The completed result reached the requester, so the task really did
+		// finish and its active-task entry was cleaned up.
+		const inboxBefore = (bus.inbox.get(ALICE) ?? []).length;
+		expect(inboxBefore).toBeGreaterThan(0);
+
+		// This cancel now matches no active task — the other half of the
+		// timeout race. It must be ignored without a reply and never surface
+		// as a plain message.
+		await bus.transport(ALICE).publishMessage(BOB, {
+			text: encodeTaskEnvelope({ t: "cancel", taskId }),
+			contextId: taskId,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		await bob.pump();
+
+		expect(onMessage).not.toHaveBeenCalled();
+		expect((bus.inbox.get(ALICE) ?? []).length).toBe(inboxBefore);
+		await bob.stop();
+	});
+
 	it("does not double-run a handler under concurrent pumps", async () => {
 		const handler = vi.fn(() => "ok");
 		const bob = new AgxClient({
