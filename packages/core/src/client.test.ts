@@ -2019,11 +2019,6 @@ describe("AgxClient durable input-required resume", () => {
 
 	it("logs a failed cleanup when a restored question expires, instead of crashing", async () => {
 		vi.useFakeTimers();
-		const unhandled: unknown[] = [];
-		const onUnhandled = (reason: unknown) => {
-			unhandled.push(reason);
-		};
-		process.on("unhandledRejection", onUnhandled);
 		const error = vi.fn();
 		try {
 			const base = new InMemorySuspensionStore();
@@ -2076,14 +2071,14 @@ describe("AgxClient durable input-required resume", () => {
 			vi.useRealTimers();
 			await new Promise((resolve) => setTimeout(resolve, 0));
 
-			expect(unhandled).toEqual([]);
+			// Without the fix the failed delete is an unhandled rejection, which
+			// the test runner reports and which ends a Node 22 process.
 			expect(error).toHaveBeenCalledWith(
 				"AGX: input-required expiry failed",
 				expect.objectContaining({ error: "disk full" }),
 			);
 		} finally {
 			vi.useRealTimers();
-			process.off("unhandledRejection", onUnhandled);
 		}
 	});
 
