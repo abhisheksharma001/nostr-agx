@@ -525,6 +525,11 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 		}, 10_000);
 		timer.unref();
 		await client.stop().catch(() => undefined);
+		// Drain in-flight handlers before exiting: stop() has rejected input
+		// waits (each fails with a published `failed` result) and running
+		// handlers keep their right to publish — but only if the process is
+		// still alive when they finish. The 10s timer above bounds the wait.
+		await client.tasksSettled().catch(() => undefined);
 		clearTimeout(timer);
 		persist();
 		releaseLock();
@@ -565,6 +570,8 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 
 	if (options.once) {
 		await client.stop().catch(() => undefined);
+		// Same drain as Ctrl-C: publish what in-flight handlers produced.
+		await client.tasksSettled().catch(() => undefined);
 		persist();
 		releaseLock();
 	}

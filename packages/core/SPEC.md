@@ -154,6 +154,12 @@ already finished, never started here, or was issued by a different peer — is i
 reply: it is consumed, **MUST NOT** be delivered to the host as a plain message, and **MUST NOT**
 trigger any reply.
 
+**Responder shutdown.** A responder that stops **MUST NOT** treat it as a requester cancellation: a
+handler already running still publishes its terminal result, and a task waiting for input or to
+resume is failed with a `failed` result, so no requester is left waiting on a responder that has
+gone away. A task accepted but not yet started sends nothing — the requester's own timeout, or a
+replacing responder instance (which observes that no result was sent), remains the backstop.
+
 An input requirement's `id` is an optional stable, handler-chosen label for the kind of question;
 `inputRequestId` is the unique correlation id for that specific prompt and answer. `timeoutMs` is
 the maximum wait for this prompt. Missing or zero uses the responder's configured default, and the

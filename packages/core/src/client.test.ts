@@ -560,6 +560,78 @@ describe("AgxClient task request/response", () => {
 		await alice.stop();
 	});
 
+	it("fails a slot-waiting task when the responder stops", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: bus.transport(BOB),
+			authorize: "accept-all",
+			maxConcurrentTasks: 2,
+		});
+		let releaseBlockers!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			releaseBlockers = resolve;
+		});
+		bob.handle("ask", async (_task, ctx) => ctx.requestInput({ prompt: "Continue?" }));
+		bob.handle("block", async () => {
+			await gate;
+			return "blocked done";
+		});
+
+		const ask = await alice.streamRequest(BOB, "ask", {}, { timeoutMs: 0 });
+		await bob.pump();
+
+		// "ask" publishes its requirement and releases its slot.
+		const waitForUpdate = async () => {
+			for (;;) {
+				const found = (bus.inbox.get(ALICE) ?? [])
+					.map((message) => parseTaskEnvelope(message.text))
+					.find(
+						(envelope) =>
+							envelope?.t === "res" && envelope.status === "input-required",
+					);
+				if (found?.t === "res" && found.status === "input-required") {
+					return found;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
+		};
+		const update = await waitForUpdate();
+
+		// Both slots fill, so "ask"'s continuation must queue to re-acquire one.
+		const blockers = [
+			alice.request(BOB, "block", {}, { timeoutMs: 0 }),
+			alice.request(BOB, "block", {}, { timeoutMs: 0 }),
+		];
+		await bob.pump();
+
+		// The answer arrives while both slots are held: "ask" queues for a
+		// slot — a mid-task wait that stop() then breaks.
+		await bus.transport(ALICE).publishMessage(BOB, {
+			text: encodeTaskEnvelope({
+				t: "input",
+				taskId: update.taskId,
+				inputRequestId: update.inputRequestId,
+				input: "the answer",
+			}),
+			contextId: update.taskId,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		await bob.pump();
+		await new Promise((resolve) => setTimeout(resolve, 1));
+
+		// stop() must FAIL "ask" with a published result (never silently
+		// suppress it as if the requester had cancelled) while letting the
+		// running "block" tasks publish once they finish.
+		await bob.stop();
+		releaseBlockers();
+		await bob.tasksSettled();
+		await alice.pump();
+
+		await expect(ask.result).rejects.toThrow("handler failed");
+		await Promise.all(blockers.map((b) => expect(b).resolves.toBe("blocked done")));
+		await alice.stop();
+	});
+
 	it("scopes active task IDs and cancellation to the requesting peer", async () => {
 		const bob = new AgxClient({
 			transport: bus.transport(BOB),

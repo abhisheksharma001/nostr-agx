@@ -1214,7 +1214,13 @@ export class AgxClient {
 		};
 		const acquireSlot = (): Promise<void> => {
 			if (this.stopping) {
-				return Promise.reject(new AgxTaskCanceled());
+				// NOT AgxTaskCanceled: that error suppresses the task's result
+				// (runTask treats it as a requester cancel). A stop that breaks a
+				// mid-task slot wait must FAIL the task — a published `failed`
+				// result — or the requester is left to time out in the dark.
+				return Promise.reject(
+					new Error("AGX client stopped while waiting for a task slot"),
+				);
 			}
 			if (holdingSlot) return Promise.resolve();
 			if (this.activeTaskCount < this.maxConcurrentTasks) {
@@ -1233,7 +1239,12 @@ export class AgxClient {
 						this.activeTaskCount += 1;
 						resolve();
 					},
-					cancel: () => reject(new AgxTaskCanceled()),
+					// Same rule as the check above: a stop that breaks this wait
+					// fails the task with a result, never silently.
+					cancel: () =>
+						reject(
+							new Error("AGX client stopped while waiting for a task slot"),
+						),
 				});
 			});
 		};
