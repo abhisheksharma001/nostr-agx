@@ -699,4 +699,126 @@ describe("TaskOperationStore storage fairness", () => {
 		release?.();
 		store.close();
 	});
+
+	// A keyed background task that fails before anything is published frees its key and keeps its
+	// record as an unkeyed one. That record joins the unkeyed pool, so it has to fit that pool's limits.
+	const releasedByNoCard = async (): Promise<Record<string, unknown>> => {
+		throw new ApiError(404, "no_card", "No Agent Card was found");
+	};
+
+	it("keeps a released background key's record within the per-credential limit of unkeyed results", async () => {
+		let clock = 0;
+		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 2, now: () => (clock += 1) });
+		const unkeyed: string[] = [];
+		for (let index = 0; index < 2; index++) {
+			const accepted = store.submit("credential-a", null, { background: true }, async () => ({ index }));
+			unkeyed.push(accepted.id as string);
+			await waitForStatus(store, "credential-a", accepted.id as string, "completed");
+		}
+		const released = store.submit("credential-a", "released", { background: true }, releasedByNoCard);
+		await waitForStatus(store, "credential-a", released.id as string, "failed");
+
+		const kept = [...unkeyed, released.id as string].filter((id) => store.get("credential-a", id) !== null);
+		expect(kept).toEqual([unkeyed[1], released.id]);
+		store.close();
+	});
+
+	it("keeps a released background key's record within the store-wide limit of unkeyed results", async () => {
+		let clock = 0;
+		const store = new TaskOperationStore("test", { maxOperations: 2, now: () => (clock += 1) });
+		const unkeyed: string[] = [];
+		for (const credential of ["credential-a", "credential-b"]) {
+			const accepted = store.submit(credential, null, { background: true }, async () => ({ credential }));
+			unkeyed.push(accepted.id as string);
+			await waitForStatus(store, credential, accepted.id as string, "completed");
+		}
+		const released = store.submit("credential-c", "released", { background: true }, releasedByNoCard);
+		await waitForStatus(store, "credential-c", released.id as string, "failed");
+
+		expect(store.get("credential-a", unkeyed[0] as string)).toBeNull();
+		expect(store.get("credential-b", unkeyed[1] as string)).toMatchObject({ status: "completed" });
+		expect(store.get("credential-c", released.id as string)).toMatchObject({ status: "failed" });
+		store.close();
+	});
+
+	it("puts back the unkeyed result it made room by evicting when the released record cannot be saved", async () => {
+		const path = gatewayTaskOperationsPath("test");
+		let clock = 0;
+		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 2, now: () => (clock += 1) });
+		const unkeyed: string[] = [];
+		for (let index = 0; index < 2; index++) {
+			const accepted = store.submit("credential-a", null, { background: true }, async () => ({ index }));
+			unkeyed.push(accepted.id as string);
+			await waitForStatus(store, "credential-a", accepted.id as string, "completed");
+		}
+		let fail: () => void = () => undefined;
+		const released = store.submit(
+			"credential-a",
+			"released",
+			{ background: true },
+			() =>
+				new Promise<Record<string, unknown>>((_resolve, reject) => {
+					fail = () => reject(new ApiError(404, "no_card", "No Agent Card was found"));
+				}),
+		);
+		rmSync(path, { force: true });
+		mkdirSync(path);
+		writeFileSync(join(path, "keep"), "blocks the final rename");
+		fail();
+
+		await waitForStatus(store, "credential-a", released.id as string, "failed");
+		expect(store.get("credential-a", released.id as string)).toMatchObject({ error: { code: "result_unknown" } });
+		// The disk still holds the evicted result, so memory gets it back. The released record keeps its
+		// new place, so for now the pool is one over its limit; the next unkeyed submission trims it.
+		expect(store.get("credential-a", unkeyed[0] as string)).toMatchObject({ status: "completed" });
+		rmSync(path, { recursive: true });
+		store.close();
+	});
+
+	it("keeps the unkeyed pool within its limit when the same key is released again and again", async () => {
+		let clock = 0;
+		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 2, now: () => (clock += 1) });
+		const ids: string[] = [];
+		for (let round = 0; round < 5; round++) {
+			const released = store.submit("credential-a", "released", { background: true }, releasedByNoCard);
+			ids.push(released.id as string);
+			await waitForStatus(store, "credential-a", released.id as string, "failed");
+		}
+
+		expect(ids.filter((id) => store.get("credential-a", id) !== null)).toEqual(ids.slice(-2));
+		store.close();
+	});
+
+	it("still frees the key of a task that failed before publishing when every unkeyed result is still running", async () => {
+		const store = new TaskOperationStore("test", { maxOperationsPerCredential: 1 });
+		let finish: () => void = () => undefined;
+		store.submit(
+			"credential-a",
+			null,
+			{ background: true },
+			() =>
+				new Promise<Record<string, unknown>>((resolve) => {
+					finish = () => resolve({});
+				}),
+		);
+		let runs = 0;
+		const operation = async (): Promise<Record<string, unknown>> => {
+			runs += 1;
+			if (runs === 1) {
+				throw new ApiError(404, "no_card", "No Agent Card was found");
+			}
+			return { status: "completed", output: { run: runs } };
+		};
+		const first = store.submit("credential-a", "released", { background: true }, operation);
+		await expect(waitForStatus(store, "credential-a", first.id as string, "failed")).resolves.toMatchObject({
+			error: { code: "no_card" },
+		});
+
+		const second = store.submit("credential-a", "released", { background: true }, operation);
+		expect(second.id).not.toBe(first.id);
+		await waitForStatus(store, "credential-a", second.id as string, "completed");
+		expect(runs).toBe(2);
+		finish();
+		store.close();
+	});
 });

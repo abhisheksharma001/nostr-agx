@@ -188,7 +188,11 @@ export async function requestCommand(
 		transport,
 		logger: makeLogger(options.verbose ?? false),
 	});
-	await client.start({ pollIntervalMs: 0, advertise: false });
+	await client.start({
+		pollIntervalMs: 0,
+		advertise: false,
+		liveDispatch: false,
+	});
 
 	info(`requesting ${capability} from ${toDisplayNpub(to)} …`);
 	const pending = client.request(to, capability, payload, { timeoutMs });
@@ -220,6 +224,24 @@ export async function requestCommand(
 		say(JSON.stringify(outcome.value, null, 2));
 		json({ ok: true, capability, result: outcome.value });
 		return;
+	}
+
+	if (outcome.error.startsWith("AGX task requires input")) {
+		fail(`${capability} requires interactive input: ${outcome.error}`);
+		json({
+			ok: false,
+			capability,
+			error: "interactive_input_required",
+			message: `${toDisplayNpub(to)} requires interactive input to continue this task.`,
+		});
+		throw new AgxCliError(
+			`The peer requires interactive input to continue ${capability}; agx request cannot answer prompts.`,
+			{
+				exitCode: EXIT.remote,
+				remediation:
+					"Use an input-capable AGX client to answer the peer's prompts and receive the task result.",
+			},
+		);
 	}
 
 	fail(`${capability} failed: ${outcome.error}`);

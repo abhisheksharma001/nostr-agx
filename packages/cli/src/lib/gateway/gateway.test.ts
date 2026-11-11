@@ -298,6 +298,30 @@ describe("agx gateway: outbound", () => {
 		});
 	}, 30_000);
 
+	it("reports interactive input as unsupported instead of a task failure", async () => {
+		const reviewer = await peer({ authorize: "accept-all" });
+		reviewer.client.handle("invoice.approve", async (_task, ctx) =>
+			ctx.requestInput({ prompt: "Approve?" }),
+		);
+		await reviewer.client.start({ pollIntervalMs: 200, advertise: false });
+
+		const res = await api("/v1/tasks", {
+			method: "POST",
+			body: JSON.stringify({
+				peer: reviewer.npub,
+				capability: "invoice.approve",
+				timeoutSec: 20,
+			}),
+		});
+		expect(res.status).toBe(422);
+		expect(await json(res)).toMatchObject({
+			error: {
+				code: "input_required",
+				message: `${reviewer.npub} requires interactive input to continue this task`,
+			},
+		});
+	});
+
 	it("explains a timeout as the probable missing allowlist entry", async () => {
 		const stranger = await peer();
 		const res = await api("/v1/tasks", {

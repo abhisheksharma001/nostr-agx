@@ -124,16 +124,37 @@ A **task** is a capability-keyed request one agent asks another to perform. Task
 inside the message payload text, labelled by `application/agx-task+json`, so the transport carries
 them like any message:
 
-- **request** — `{ t: "req", taskId, capability, payload }`. `payload` is arbitrary JSON the handler
-  interprets (payload-agnostic).
+- **request** — `{ t: "req", taskId, capability, payload, supportsInput?, timeoutMs? }`. `payload` is
+  arbitrary JSON the handler interprets (payload-agnostic). `supportsInput` is an explicit opt-in to
+  interactive input; it defaults to false. `timeoutMs` is the requester's end-to-end deadline in
+  milliseconds; zero means no requester deadline.
+- **result/update** — `{ t: "res", taskId, status: "input-required", inputRequestId, requirement }`
+  is a nonterminal update; `{ t: "res", taskId, status: "completed", output? }` and
+  `{ t: "res", taskId, status: "failed", error? }` are terminal results.
 - **status** — `{ t: "status", taskId, status: "working", seq, message? }`, a nonterminal public
   progress update correlated to the request by `taskId` and ordered by `seq` starting at 1.
-- **result** — `{ t: "res", taskId, status: "completed" | "failed", output?, error? }`, correlated to
-  the request by `taskId`.
+- **input continuation** — `{ t: "input", taskId, inputRequestId, input }` supplies the answer to an
+  outstanding input requirement. It is a new message/event, but continues the same task and uses
+  the same `taskId` as its transport `contextId`.
+- **cancellation** — `{ t: "cancel", taskId }` tells the responder that the requester has stopped
+  waiting or cannot continue. It uses the same `taskId` as its transport `contextId`.
 
-States: `submitted → working → input-required → completed | failed | canceled`. A handler returning a
-value transitions the task to `completed` (its return is `output`); a handler that throws transitions
-to `failed`. `working` is available through status updates; `input-required` remains reserved.
+States: `submitted → working ↔ input-required → completed | failed | canceled`. A handler may call
+`requestInput(requirement)` to publish an `input-required` update and await the continuation. A
+responder **MUST NOT** publish that update unless the request opted in with `supportsInput: true`;
+otherwise it **MUST** fail the task promptly. A completed handler transitions the task to
+`completed`; a thrown handler error transitions it to `failed`. Task identity is scoped per requester: a
+`taskId` names a task only within the exchange with the peer that chose it, so the same id arriving
+from two different peers names two distinct tasks whose lifecycles — active entry, input,
+cancellation, cleanup — **MUST** stay separate, and a second request from a peer reusing a `taskId`
+that is still active **MUST** be refused rather than overwrite it. An input continuation **MUST**
+match the pending task and `inputRequestId` and come from the peer that initiated the task. A cancellation
+**MUST** match an active task and come from its initiating peer; the responder **MUST** stop waiting
+for input and **MUST NOT** send a later result. Cancellation cannot forcibly stop arbitrary
+application code already running. A cancellation for an unknown or inactive task — one that has
+already finished, never started here, or was issued by a different peer — is ignored without a
+reply: it is consumed, **MUST NOT** be delivered to the host as a plain message, and **MUST NOT**
+trigger any reply.
 
 A handler calls `task.report(message?)` to publish best-effort `working` updates. A requester supplies
 `onTaskStatus` to receive them while its original request remains pending. Updates bind to both task
@@ -143,6 +164,32 @@ to 2,000 characters and contain handler-supplied public text, never raw reasonin
 details. Transport failure drops an update without failing the task. Unknown, late, and post-terminal
 status traffic receives no automatic reply and follows the plain-message trust path. Typed contracts
 advertise the `working` feature; this is not token-by-token model streaming.
+
+**Responder shutdown.** A responder that stops **MUST NOT** treat it as a requester cancellation: a
+handler already running still publishes its terminal result, and a task waiting for input or to
+resume is failed with a `failed` result, so no requester is left waiting on a responder that has
+gone away. A task accepted but not yet started sends nothing — the requester's own timeout, or a
+replacing responder instance (which observes that no result was sent), remains the backstop.
+
+An input requirement's `id` is an optional stable, handler-chosen label for the kind of question;
+`inputRequestId` is the unique correlation id for that specific prompt and answer. `timeoutMs` is
+the maximum wait for this prompt. Missing or zero uses the responder's configured default, and the
+effective timeout is capped by the responder's client-wide maximum and any remaining end-to-end
+request deadline. The responder includes that effective timeout in the published requirement. An
+input-required update is nonterminal: an opted-in initiator keeps its request open and may provide
+input through `streamRequest()`. A plain `request()` caller rejects with a clear input-required error
+and sends cancellation. The initiator's timeout covers the whole task, not each prompt separately.
+
+`inputSchema` on an input requirement, when present, describes the expected answer using JSON Schema,
+but is advisory. The protocol core does not validate answers against it (task payloads and results are
+checked separately, see "Typed payload validation"); the requester SHOULD validate user input, and
+the handler MUST validate input before relying on it.
+
+The current in-process handler API waits for input in memory; it does not persist suspended handler
+state across process restarts. A runtime requiring restart recovery must persist and restore that
+state itself. Waiting for input releases the handler's concurrency slot, so another task may run;
+the number of simultaneous pending input requirements and the duration of each wait are bounded by
+client configuration.
 
 **Error boundary.** A `failed` result crosses trust domains, so a thrown handler error is reported to
 the peer **generically** (`handler failed`) and the real message is logged locally — an internal
@@ -158,6 +205,15 @@ An agent's Agent Card lists the `capabilities` it handles (the set of registered
 are dot-namespaced (`invoice.review`). A `.*` suffix advertises a namespace wildcard (`invoice.*`
 matches `invoice.review`); `*` advertises all. An initiator selects a peer whose card satisfies the
 requested capability before sending.
+
+**Unhandled task traffic (normative).** Because the payload `contentType` is peer-supplied, a
+task-labelled message is not proof of task intent. A responder **MUST** consume a message as a task
+only when it can service it — a request whose capability it has a registered handler for, or a result
+correlated to one of its own pending requests. Any other task-labelled message (unknown capability,
+unmatched/late result, malformed envelope) **MUST NOT** be auto-replied to — emitting a signed reply
+to an unauthenticated peer turns the identity into a reflector — and **MUST** be delivered to the
+plain-message path instead, so a host that gates all inbound traffic there (peer registration, flood
+budget, block rules) triages it rather than being bypassed by a content-type label.
 
 ### Typed skills and extensions (Agent Card format 1.1.0)
 
@@ -219,27 +275,21 @@ reference client rejects unsupported local schemas at registration and includes 
 in discovery metadata while retaining the same legacy capability keys. Existing handlers without a
 contract retain their previous behavior.
 
-`request(..., { validate: true })` opts into requester preflight. The client resolves the peer card,
-selects the exact typed skill ID, and rejects a payload that violates its `inputSchema` before
-publishing. A missing card, typed skill, or input schema skips preflight; this option performs no
+`request(..., { validate: true })` and `streamRequest(..., { validate: true })` opt into requester
+preflight. The client resolves the peer card, selects the exact typed skill ID, and rejects a payload
+that violates its `inputSchema` before publishing. A missing card, typed skill, or input schema skips preflight; this option performs no
 schema-driven fetch beyond normal peer-card resolution.
 
 After authorization succeeds, a receiver with an input schema validates before invoking its handler.
 Invalid input produces only the safe `invalid_input` failure; detailed paths remain in local logs.
 Denied requesters receive no validation response and follow the normal plain-message trust path.
+An invalid request is answered before it is registered as an active task or takes a concurrency slot,
+so a retry under the same task ID is accepted. A task the requester has canceled sends no result, so
+it never sends `invalid_output` either.
 A handler result that violates its registered `outputSchema` produces `invalid_output` instead of a
 completed result. Structured error codes and requester-side validation of remote results remain
 outside this change. Validation uses only the bounded inline subset above and never evaluates schema
 text as code.
-
-**Unhandled task traffic (normative).** Because the payload `contentType` is peer-supplied, a
-task-labelled message is not proof of task intent. A responder **MUST** consume a message as a task
-only when it can service it — a request whose capability it has a registered handler for, or a result
-correlated to one of its own pending requests. Any other task-labelled message (unknown capability,
-unmatched/late result, malformed envelope) **MUST NOT** be auto-replied to — emitting a signed reply
-to an unauthenticated peer turns the identity into a reflector — and **MUST** be delivered to the
-plain-message path instead, so a host that gates all inbound traffic there (peer registration, flood
-budget, block rules) triages it rather than being bypassed by a content-type label.
 
 ## Correlation & replay
 

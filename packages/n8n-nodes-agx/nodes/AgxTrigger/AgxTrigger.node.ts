@@ -568,6 +568,7 @@ export class AgxTrigger implements INodeType {
 				.start({
 					pollIntervalMs: 0,
 					advertise: serveTasks && options.advertise === true,
+					liveDispatch: false,
 				})
 				.catch((error) =>
 					logger.warn?.("AGX Trigger: could not start advertising", {
@@ -582,8 +583,8 @@ export class AgxTrigger implements INodeType {
 			// An in-flight task is NOT awaited. In a manual run n8n awaits this
 			// before the execution's end hook, and that hook is what settles the
 			// task's done-promise: waiting here would hang until the result timeout.
-			// The transport keeps no connection between polls, so the task still
-			// publishes its result after this returns.
+			// The live listener is disabled; publishing the result does not depend
+			// on the polling connection.
 			await client.stop();
 		};
 

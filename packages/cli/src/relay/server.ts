@@ -4,7 +4,7 @@ import {
 	type Server as TlsServer,
 } from "node:https";
 import type { AddressInfo } from "node:net";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 
 /**
  * A minimal in-process NIP-01 relay for local development.
@@ -18,10 +18,10 @@ import { WebSocketServer } from "ws";
  * it cannot mask a scheme bug against a real host).
  *
  * Implements only what `@nostr-agx/nostr`'s relay pool uses: EVENT publish with an OK
- * reply, REQ with filters + EOSE, CLOSE, and NIP-40 (expired events are not
- * served). It is a permissive fake: no kind allow-list, no NIP-13 proof-of-work
- * or expiration-required check — those belong to a production relay's write
- * policy. Notably it does NOT implement
+ * reply, REQ with filters + EOSE and live matching events, CLOSE, and NIP-40
+ * (expired events are not served). It is a permissive fake: no kind allow-list,
+ * no NIP-13 proof-of-work or expiration-required check — those belong to a
+ * production relay's write policy. Notably it does NOT implement
  * replaceable-event semantics for kind 11337, nor does it apply kind-5
  * deletions — whether a given relay honours a deletion is not ours to decide,
  * which is exactly why a de-list is reported as "requested".
@@ -113,13 +113,27 @@ export interface RunningRelay {
 	close: () => Promise<void>;
 }
 
+interface RelaySubscription {
+	socket: WebSocket;
+	id: string;
+	filters: Filter[];
+}
+
 function attach(
 	server: Server | TlsServer,
 	stored: RelayEvent[],
+	subscriptions: Set<RelaySubscription>,
 	options: RelayOptions,
 ): WebSocketServer {
 	const wss = new WebSocketServer({ server });
 	wss.on("connection", (socket) => {
+		const connectionSubscriptions = new Map<string, RelaySubscription>();
+		socket.on("close", () => {
+			for (const subscription of connectionSubscriptions.values()) {
+				subscriptions.delete(subscription);
+			}
+			connectionSubscriptions.clear();
+		});
 		socket.on("message", (raw) => {
 			let msg: unknown;
 			try {
@@ -137,12 +151,29 @@ function attach(
 				stored.unshift(ev);
 				socket.send(JSON.stringify(["OK", ev.id, true, ""]));
 				options.onEvent?.(ev);
+				for (const subscription of subscriptions) {
+					if (
+						subscription.socket.readyState === WebSocket.OPEN &&
+						subscription.filters.some((filter) => matches(filter, ev))
+					) {
+						subscription.socket.send(
+							JSON.stringify(["EVENT", subscription.id, ev]),
+						);
+					}
+				}
 				return;
 			}
 
 			if (verb === "REQ") {
 				const subId = msg[1] as string;
 				const filters = msg.slice(2) as Filter[];
+				const previous = connectionSubscriptions.get(subId);
+				if (previous) {
+					subscriptions.delete(previous);
+				}
+				const subscription = { socket, id: subId, filters };
+				connectionSubscriptions.set(subId, subscription);
+				subscriptions.add(subscription);
 				let matched = 0;
 				for (const filter of filters) {
 					const limit = filter.limit ?? 500;
@@ -161,7 +192,13 @@ function attach(
 			}
 
 			if (verb === "CLOSE") {
-				socket.send(JSON.stringify(["CLOSED", msg[1], ""]));
+				const subId = msg[1] as string;
+				const subscription = connectionSubscriptions.get(subId);
+				if (subscription) {
+					subscriptions.delete(subscription);
+					connectionSubscriptions.delete(subId);
+				}
+				socket.send(JSON.stringify(["CLOSED", subId, ""]));
 			}
 		});
 	});
@@ -183,12 +220,13 @@ async function bindRelay(
 	port: number,
 	host: string,
 	stored: RelayEvent[],
+	subscriptions: Set<RelaySubscription>,
 	options: RelayOptions,
 ): Promise<WebSocketServer | null> {
 	if (!(await listen(server, port, host))) {
 		return null;
 	}
-	return attach(server, stored, options);
+	return attach(server, stored, subscriptions, options);
 }
 
 function listen(
@@ -222,11 +260,19 @@ export async function startRelay(
 	options: RelayOptions = {},
 ): Promise<RunningRelay> {
 	const stored: RelayEvent[] = [];
+	const subscriptions = new Set<RelaySubscription>();
 	const requested = options.port ?? 7447;
 	const addresses: string[] = [];
 
 	const v4 = createServer();
-	const wssV4 = await bindRelay(v4, requested, "127.0.0.1", stored, options);
+	const wssV4 = await bindRelay(
+		v4,
+		requested,
+		"127.0.0.1",
+		stored,
+		subscriptions,
+		options,
+	);
 	if (!wssV4) {
 		throw new Error(
 			`Could not bind 127.0.0.1:${requested} — is another agx relay already running?`,
@@ -236,7 +282,7 @@ export async function startRelay(
 	addresses.push(`127.0.0.1:${port}`);
 
 	const v6 = createServer();
-	const wssV6 = await bindRelay(v6, port, "::1", stored, options);
+	const wssV6 = await bindRelay(v6, port, "::1", stored, subscriptions, options);
 	if (wssV6) {
 		addresses.push(`[::1]:${port}`);
 	}
@@ -259,6 +305,7 @@ export async function startRelay(
 			options.tls.port,
 			"127.0.0.1",
 			stored,
+			subscriptions,
 			options,
 		);
 		if (!tlsWss) {
@@ -278,7 +325,14 @@ export async function startRelay(
 			cert: options.tls.cert,
 			key: options.tls.key,
 		});
-		tlsWssV6 = await bindRelay(tlsV6, tlsPort, "::1", stored, options);
+		tlsWssV6 = await bindRelay(
+			tlsV6,
+			tlsPort,
+			"::1",
+			stored,
+			subscriptions,
+			options,
+		);
 		if (tlsWssV6) {
 			addresses.push(`[::1]:${tlsPort} (wss)`);
 		}

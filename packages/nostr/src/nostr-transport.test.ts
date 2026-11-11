@@ -11,10 +11,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const publishToRelays = vi.fn();
 const resolvePeerRelays = vi.fn();
+const listenEvents = vi.fn(
+	async (..._args: unknown[]): Promise<
+		Array<{ close(): void; relay: { close(): void } }>
+	> => [],
+);
 
 vi.mock("./relay-pool", () => ({
 	publishToRelays: (...args: unknown[]) => publishToRelays(...args),
 	pollInbox: vi.fn(async () => ({ events: [], complete: true })),
+	listenEvents: (...args: unknown[]) => listenEvents(...args),
 }));
 vi.mock("./discovery", async (importOriginal) => ({
 	...(await importOriginal<typeof import("./discovery")>()),
@@ -70,6 +76,57 @@ beforeEach(() => {
 	resolvePeerRelays.mockResolvedValue([]);
 	// Module-scoped cache outlives each transport() — clear between cases.
 	__resetPeerRelayCacheForTests();
+});
+
+describe("transport lifecycle", () => {
+	it("starts listening explicitly and closes relay connections on stop", async () => {
+		const closeFirstSubscription = vi.fn();
+		const closeFirstRelay = vi.fn();
+		const closeSecondSubscription = vi.fn();
+		const closeSecondRelay = vi.fn();
+		const externalHandler = vi.fn();
+		listenEvents
+			.mockResolvedValueOnce([
+				{
+					close: closeFirstSubscription,
+					relay: { close: closeFirstRelay },
+				},
+			])
+			.mockResolvedValueOnce([
+				{
+					close: closeSecondSubscription,
+					relay: { close: closeSecondRelay },
+				},
+			]);
+
+		const instance = await transport();
+		instance.onMessage(externalHandler);
+		expect(listenEvents).not.toHaveBeenCalled();
+
+		await instance.start();
+		expect(closeFirstSubscription).not.toHaveBeenCalled();
+		await instance.start();
+		expect(listenEvents).toHaveBeenCalledOnce();
+
+		expect(closeFirstSubscription).not.toHaveBeenCalled();
+		expect(closeFirstRelay).not.toHaveBeenCalled();
+
+		await instance.stop();
+		expect(closeFirstSubscription).toHaveBeenCalledOnce();
+		expect(closeFirstRelay).toHaveBeenCalledOnce();
+
+		await instance.start();
+		expect(listenEvents).toHaveBeenCalledTimes(2);
+		const onEvent = listenEvents.mock.calls[1]?.[3] as
+			| ((data: never) => void)
+			| undefined;
+		onEvent?.({} as never);
+		expect(externalHandler).toHaveBeenCalledOnce();
+
+		await instance.stop();
+		expect(closeSecondSubscription).toHaveBeenCalledOnce();
+		expect(closeSecondRelay).toHaveBeenCalledOnce();
+	});
 });
 
 describe("publishMessage derives deliveredToPeer", () => {

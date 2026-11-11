@@ -58,6 +58,20 @@ these schemas for authorized task input and handler output, and offers opt-in re
 Validation never fetches references or treats claims as proof of quality. Agent Cards and schemas are
 public and unencrypted.
 
+`NostrTransport.create()` only constructs the transport. `AgxClient.start()` opens its relay subscriptions, and `AgxClient.stop()` closes both those subscriptions and their relay connections.
+Live subscriptions replay a bounded recent window, skip envelopes already in the client's `SeenStore` before decryption, and record expired or invalid wraps there; polling remains the completeness and recovery path.
+
+For a multi-turn human-in-the-loop example where a task handler asks several
+sequential questions with `ctx.requestInput()` and the requester answers each
+through `stream.provideInput()`, run
+`pnpm dlx tsx examples/input-required-agent.ts` from `packages/nostr`.
+
+For the same workflow split across **two real agents** — separate processes
+with persistent identities, default-deny authorization, Agent Card discovery
+and an autonomous requester, all over a local relay and each backed by any
+local OpenAI-compatible LLM server — see
+[`examples/two-agents`](examples/two-agents/README.md).
+
 **Runtime:** Node. The transport dials WebSockets and the SSRF guard uses `node:dns` to vet
 peer-supplied relay / NIP-05 hosts before connecting. `node:dns`/`node:net` are imported lazily so a
 non-Node bundle doesn't fail to resolve them, but where DNS is unavailable (browser/edge) the guard
