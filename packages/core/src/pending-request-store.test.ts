@@ -230,6 +230,22 @@ describe("durable pending-request recovery", () => {
 		await client.stop();
 	});
 
+	it("does not give a restored request a fresh timeout window", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		seed(store, { key: "local-1", taskId: "task-1", deadlineAt: Date.now() + 20 });
+		const client = durableClient(bus, store);
+		const [recovered] = await restore(client);
+		let timedOut = false;
+		void recovered.result.catch((error: Error) => {
+			timedOut = /timed out/.test(error.message);
+		});
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect(timedOut).toBe(true);
+		expect(store.records.has("local-1")).toBe(false);
+		await client.stop();
+	});
+
 	it("recovers a publishing record as unknown and never republishes it", async () => {
 		const bus = new MemoryTransport(ALICE);
 		const store = new MemoryPendingStore();
