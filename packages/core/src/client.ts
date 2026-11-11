@@ -1425,10 +1425,6 @@ export class AgxClient {
 			reportsClosed = true;
 			return reportsInFlight;
 		};
-		const activeKey = this.activeInboundTaskKey(
-			this.normalizeId(msg.from),
-			env.taskId,
-		);
 		try {
 			if (active?.canceled) return;
 			const output = await registered.handler(task, {
@@ -1439,13 +1435,9 @@ export class AgxClient {
 					// A requester that did not opt in may predate `working` and would
 					// misread it, so send nothing at all.
 					if (env.supportsWorking !== true) return;
-					// Only while this run is the live task: not after a cancel, not once
-					// the handler has returned and the task entry is gone.
-					if (
-						reportsClosed ||
-						active?.canceled ||
-						this.activeInboundTasks.get(activeKey) !== active
-					) {
+					// Only while the handler runs: not after a cancel, not once it has
+					// returned or thrown.
+					if (reportsClosed || active?.canceled) {
 						return;
 					}
 					statusSeq += 1;
