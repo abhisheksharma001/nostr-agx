@@ -662,6 +662,44 @@ describe("AgxClient task request/response", () => {
 			await expect(stream.result).rejects.toThrow("AGX client stopped");
 		});
 
+		it("never puts a working update on the wire after the terminal result", async () => {
+			const base = bus.transport(BOB);
+			// A slow relay for working updates: a report still publishing when the
+			// handler returns must not land after the terminal result.
+			const slowWorking: AgxTransport = {
+				...base,
+				async publishMessage(to, message) {
+					const envelope = parseTaskEnvelope(message.text);
+					const isWorking = envelope?.t === "res" && envelope.status === "working";
+					await new Promise((resolve) => setTimeout(resolve, isWorking ? 30 : 10));
+					return base.publishMessage(to, message);
+				},
+			};
+			const bob = new AgxClient({ transport: slowWorking, authorize: "accept-all" });
+			bob.handle("long.task", async (_task, ctx) => {
+				void ctx.report("in flight"); // still publishing when the handler returns
+				setTimeout(() => void ctx.report("late"), 5); // fires during the terminal publish
+				return "done";
+			});
+			pushTaskEnvelope(BOB, ALICE, {
+				t: "req",
+				taskId: "race-1",
+				capability: "long.task",
+				payload: {},
+				supportsWorking: true,
+				timeoutMs: 0,
+			});
+			await bob.pump();
+			await bob.tasksSettled();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			const wire = (bus.inbox.get(ALICE) ?? []).map((message) => parseTaskEnvelope(message.text));
+			expect(wire).toEqual([
+				{ t: "res", taskId: "race-1", status: "working", seq: 1, message: "in flight" },
+				{ t: "res", taskId: "race-1", status: "completed", output: "done" },
+			]);
+		});
+
 		it("sends no working update after the requester cancels the task", async () => {
 			const bob = new AgxClient({
 				transport: bus.transport(BOB),
