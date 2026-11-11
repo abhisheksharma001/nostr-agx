@@ -203,6 +203,19 @@ export class TaskOperationStore {
 				}
 			}
 		}
+		for (const idempotency of [true, false]) {
+			const credentials = new Set<string>();
+			for (const operation of this.records.values()) {
+				if (holdsIdempotencyKey(operation) === idempotency) {
+					credentials.add(operation.credential ?? "");
+				}
+			}
+			for (const credential of credentials) {
+				if (this.makeStorageRoom(credential, idempotency, false).length > 0) {
+					changed = true;
+				}
+			}
+		}
 		if (this.enforceByteBudget().length > 0) {
 			changed = true;
 		}
@@ -428,9 +441,11 @@ export class TaskOperationStore {
 		}
 	}
 
-	private makeStorageRoom(credentialHash: string, idempotency: boolean): Operation[] {
+	private makeStorageRoom(credentialHash: string, idempotency: boolean, reserveSlot = true): Operation[] {
 		const evicted: Operation[] = [];
 		const samePool = (record: Operation) => holdsIdempotencyKey(record) === idempotency;
+		const credentialLimit = this.maxOperationsPerCredential - (reserveSlot ? 1 : 0);
+		const poolLimit = this.maxOperations - (reserveSlot ? 1 : 0);
 		let credentialOperations = 0;
 		let poolOperations = 0;
 		const poolCounts = new Map<string, number>();
@@ -444,7 +459,7 @@ export class TaskOperationStore {
 			}
 		}
 		try {
-			while (credentialOperations >= this.maxOperationsPerCredential) {
+			while (credentialOperations > credentialLimit) {
 				const oldest = this.oldestSettled((record) => samePool(record) && record.credential === credentialHash);
 				if (!oldest) {
 					throw new ApiError(
@@ -459,7 +474,7 @@ export class TaskOperationStore {
 				credentialOperations -= 1;
 				poolOperations -= 1;
 			}
-			while (poolOperations >= this.maxOperations) {
+			while (poolOperations > poolLimit) {
 				const oldest = this.oldestOfHeaviest(
 					(record) => samePool(record),
 					(credential) => poolCounts.get(credential) ?? 0,
