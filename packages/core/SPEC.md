@@ -162,19 +162,21 @@ them while its original request remains pending (`statusUpdate` and `progress` o
 `onTaskStatus` on `request()`). A responder **MUST NOT** send `working` unless the request opted in with
 `supportsWorking: true`; without it, `ctx.report` sends nothing and the task otherwise runs unchanged.
 `streamRequest()` and `request()` with `onTaskStatus` opt in; a plain `request()` does not. A `working`
-update is nonterminal and independent of `supportsInput`; it **MUST NOT** settle the request, cancel it, or extend its deadline. A requester **MUST** accept one only
-from the peer the request was sent to, for the pending `taskId`, with the transport `contextId` equal to
-that `taskId`, exactly as for `input-required`. Duplicate or older `seq` values are ignored; a later
-terminal result still settles the request normally. A responder **MUST NOT** send `working` after the
-task has finished or been canceled: the reference client stops accepting reports as soon as the handler
-returns or throws, and waits for any update already being published before it sends the terminal result. The message is handler-supplied public text, never raw reasoning or
-internal error details. A transport failure or oversized message drops the update without failing the
-task. Unknown, late, and post-terminal updates receive no automatic reply and follow the plain-message
-trust path. The opt-in exists because a requester that predates `working` cannot be relied on to treat
-an unrecognized update as a plain message: the reference `streamRequest()` before this change reads it
-as `TaskNotFoundError` and drops its pending input. Such a requester never sets `supportsWorking`, so it
-never receives one; a responder that predates `working` ignores the unknown key and sends no updates.
-Typed contracts advertise the `working` feature; this is not token-by-token model streaming.
+update is nonterminal and independent of `supportsInput`; it **MUST NOT** settle the request, cancel it,
+or extend its deadline. A requester **MUST** accept one only from the peer the request was sent to, for
+the pending `taskId`, with the transport `contextId` equal to that `taskId`, exactly as for
+`input-required`. Duplicate or older `seq` values are ignored; a later terminal result still settles the
+request normally. A responder **MUST NOT** send `working` after the task has finished or been canceled:
+the reference client stops accepting reports as soon as the handler returns or throws, and waits for any
+update already being published before it sends the terminal result. The message is handler-supplied
+public text, never raw reasoning or internal error details. A transport failure or oversized message
+drops the update without failing the task. Unknown, late, and post-terminal updates receive no automatic
+reply and follow the plain-message trust path. The opt-in exists because a requester that predates
+`working` cannot be relied on to treat an unrecognized update as a plain message: the reference
+`streamRequest()` before this change reads it as `TaskNotFoundError` and drops its pending input. Such a
+requester never sets `supportsWorking`, so it never receives one; a responder that predates `working`
+ignores the unknown key and sends no updates. Typed contracts advertise the `working` feature; this is
+not token-by-token model streaming.
 
 **Responder shutdown.** A responder that stops **MUST NOT** treat it as a requester cancellation: a
 handler already running still publishes its terminal result, and a task waiting for input or to
