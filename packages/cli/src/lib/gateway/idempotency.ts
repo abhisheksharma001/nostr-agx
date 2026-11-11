@@ -211,9 +211,12 @@ export class TaskOperationStore {
 				}
 			}
 			for (const credential of credentials) {
-				if (this.makeStorageRoom(credential, idempotency, false).length > 0) {
+				if (this.makeStorageRoom(credential, idempotency, { reserveSlot: false, enforcePool: false }).length > 0) {
 					changed = true;
 				}
+			}
+			if (this.makeStorageRoom("", idempotency, { reserveSlot: false }).length > 0) {
+				changed = true;
 			}
 		}
 		if (this.enforceByteBudget().length > 0) {
@@ -441,9 +444,15 @@ export class TaskOperationStore {
 		}
 	}
 
-	private makeStorageRoom(credentialHash: string, idempotency: boolean, reserveSlot = true): Operation[] {
+	private makeStorageRoom(
+		credentialHash: string,
+		idempotency: boolean,
+		options: { reserveSlot?: boolean; enforcePool?: boolean } = {},
+	): Operation[] {
 		const evicted: Operation[] = [];
 		const samePool = (record: Operation) => holdsIdempotencyKey(record) === idempotency;
+		const reserveSlot = options.reserveSlot ?? true;
+		const enforcePool = options.enforcePool ?? true;
 		const credentialLimit = this.maxOperationsPerCredential - (reserveSlot ? 1 : 0);
 		const poolLimit = this.maxOperations - (reserveSlot ? 1 : 0);
 		let credentialOperations = 0;
@@ -474,7 +483,7 @@ export class TaskOperationStore {
 				credentialOperations -= 1;
 				poolOperations -= 1;
 			}
-			while (poolOperations > poolLimit) {
+			while (enforcePool && poolOperations > poolLimit) {
 				const oldest = this.oldestOfHeaviest(
 					(record) => samePool(record),
 					(credential) => poolCounts.get(credential) ?? 0,
