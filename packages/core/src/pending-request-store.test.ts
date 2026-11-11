@@ -485,6 +485,19 @@ describe("durable pending-request races", () => {
 		await client.stop();
 	});
 
+	it("still expires on its deadline when the result's record removal fails", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		seed(store, { key: "local-1", taskId: "task-1", deadlineAt: Date.now() + 60 });
+		const client = durableClient(bus, store);
+		const [recovered] = await restore(client);
+		store.failRemove = true;
+		bus.result(ALICE, BOB, "task-1");
+		expect((await client.pump()).complete).toBe(false);
+		await expect(recovered.result).rejects.toThrow(/original deadline/);
+		await client.stop();
+	});
+
 	it("does not register restored requests on a client stopped during restore", async () => {
 		const bus = new MemoryTransport(ALICE);
 		const store = new MemoryPendingStore();
