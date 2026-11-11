@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -11,10 +11,11 @@ import { type RunningRelay, startRelay } from "../../relay/server.js";
 import { agx, sandbox } from "../../test/helpers.js";
 import { resolveProfileName } from "../config.js";
 import { loadIdentity } from "../identity.js";
-import { profileDir, seenPath } from "../paths.js";
+import { gatewayTaskOperationsPath, profileDir, seenPath } from "../paths.js";
 import { MESSAGES_FILE } from "../store/message-store.js";
 import { AGX_CLI_VERSION } from "../version.js";
 import { type RunningGateway, startGateway } from "./gateway.js";
+import { TaskOperationStore } from "./idempotency.js";
 import { createGatewayKey } from "./keys.js";
 
 /**
@@ -692,6 +693,45 @@ describe("agx gateway: outbound", () => {
 			result: { status: "completed", output: { run: 1 } },
 		});
 		expect(runs).toBe(1);
+	}, 45_000);
+
+	it("starts with stored waiting work above lowered in-flight limits and keeps all of it", async () => {
+		await gateway.close();
+		const path = gatewayTaskOperationsPath(profile);
+		const original = existsSync(path) ? readFileSync(path) : undefined;
+		try {
+			const seeded = new TaskOperationStore(profile);
+			const ids: string[] = [];
+			for (let index = 0; index < 3; index++) {
+				const view = seeded.submit(key, null, { index }, async (operationId: string) => {
+					const base = {
+						key: operationId,
+						taskId: `stored-task-${index}`,
+						peer: "c".repeat(64),
+						capability: "invoice.stored",
+						deadlineAt: Date.now() + 60_000,
+					};
+					seeded.save({ ...base, phase: "publishing" });
+					seeded.save({ ...base, phase: "waiting" });
+					return new Promise<Record<string, unknown>>(() => undefined);
+				});
+				ids.push(view.id as string);
+			}
+			seeded.close();
+
+			gateway = await startGateway({ ...gatewayOptions(), maxTaskOperationsInFlight: 1, maxBackgroundTasksInFlight: 1 });
+			for (const id of ids) {
+				expect(await backgroundTask(id)).toMatchObject({ id, status: "running" });
+			}
+			await gateway.close();
+		} finally {
+			if (original) {
+				writeFileSync(path, original);
+			} else {
+				rmSync(path, { force: true });
+			}
+			gateway = await startGateway(gatewayOptions());
+		}
 	}, 45_000);
 });
 
