@@ -412,6 +412,24 @@ export class AgxClient {
 		);
 	}
 
+	/** Check the payload against the peer's typed skill before anything is
+	 * published or registered. A peer with no matching skill schema passes.
+	 * Callers await this only when `validate` is set, so a plain request still
+	 * publishes in the same tick. */
+	private async preflightInput(
+		peer: string,
+		capability: string,
+		payload: unknown,
+	): Promise<void> {
+		const card = (await this.transport.resolvePeer(peer)).card;
+		const skill = card?.skills?.find((candidate) => candidate.id === capability);
+		if (!skill?.inputSchema) return;
+		const problem = validateAgxJsonPayload(skill.inputSchema, payload);
+		if (problem) {
+			throw new Error(`AGX request: invalid_input: ${problem}`);
+		}
+	}
+
 	/** Send a task to a peer and await its correlated result. Rejects on a `failed`
 	 * result, an unsupported capability, timeout, or opted-in schema preflight. */
 	async request<Output = unknown>(
@@ -420,16 +438,7 @@ export class AgxClient {
 		payload: unknown,
 		opts?: { timeoutMs?: number; validate?: boolean },
 	): Promise<Output> {
-		if (opts?.validate) {
-			const card = (await this.transport.resolvePeer(peer)).card;
-			const skill = card?.skills?.find((candidate) => candidate.id === capability);
-			if (skill?.inputSchema) {
-				const problem = validateAgxJsonPayload(skill.inputSchema, payload);
-				if (problem) {
-					throw new Error(`AGX request: invalid_input: ${problem}`);
-				}
-			}
-		}
+		if (opts?.validate) await this.preflightInput(peer, capability, payload);
 		const { result } = await this.sendRequest<Output>(
 			peer,
 			capability,
@@ -440,13 +449,14 @@ export class AgxClient {
 	}
 
 	/** Send a task to a peer and await its correlated result. Rejects on a `failed`
-	 * result, an unsupported capability, or timeout. */
+	 * result, an unsupported capability, timeout, or opted-in schema preflight. */
 	async streamRequest<Output = unknown>(
 		peer: string,
 		capability: string,
 		payload: unknown,
-		opts?: { timeoutMs?: number },
+		opts?: { timeoutMs?: number; validate?: boolean },
 	): Promise<StreamResponse<Output>> {
+		if (opts?.validate) await this.preflightInput(peer, capability, payload);
 		const taskId = randomId();
 		let resolveResult!: (output: Output) => void;
 		let rejectResult!: (error: Error) => void;
