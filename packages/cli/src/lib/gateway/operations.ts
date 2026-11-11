@@ -132,6 +132,14 @@ export async function runTaskRequest(
 		output = await deps.requester.request(req.peer, req.capability, req.payload, req.timeoutSec * 1000, signal);
 	} catch (error) {
 		const message = messageOf(error);
+		if (message.startsWith("AGX task requires input")) {
+			throw new ApiError(
+				422,
+				"input_required",
+				`${req.npub} requires interactive input to continue this task`,
+				"This gateway task endpoint cannot answer interactive prompts. Use an input-capable AGX client.",
+			);
+		}
 		if (message.startsWith("AGX request timed out")) {
 			throw new ApiError(
 				504,

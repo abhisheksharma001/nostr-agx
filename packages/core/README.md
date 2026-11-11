@@ -28,4 +28,27 @@ agx.handle("invoice.review", async (task) => paperclip.run(task.payload));
 await agx.start();
 ```
 
+Live transport listeners are registered by `start()` and removed by `stop()`.
+Transport `onMessage` and `onReceipt` hooks return an `Unsubscribe` function;
+calling it removes only that registration.
+Hosts that only call `pump()` from their own scheduler can leave the client unstarted
+and will dispatch messages only during those pump calls.
+
+For human-in-the-loop work, a handler can await `ctx.requestInput(requirement)`.
+Only `streamRequest()` opts in to interactive input; plain `request()` tells the
+responder it cannot answer prompts and fails clearly if the task requires input.
+An input-waiting handler releases its concurrency slot, and pending input count
+and per-prompt duration are bounded by `maxPendingTaskInputs` and
+`maxInputTimeoutMs`. A nonzero request timeout is the end-to-end task deadline.
+The requester uses `streamRequest()` to observe `inputRequired`, `statusUpdate`,
+`completed`, and `error`; its `result` promise resolves with the final output or
+rejects on failure, timeout, or client stop. Stream updates use the same dispatch
+path as polling, so live transport hooks are optional. The requester obtains an
+answer through its own UI or policy and sends it with
+`stream.provideInput(inputRequestId, answer)`. The answer continues the same task.
+The suspended handler state is in memory and does not survive a process restart.
+The handler must validate answers itself; `inputSchema` is advisory and is not
+validated by the protocol core. A requester timeout or stop sends a cancellation
+so the responder stops waiting and does not send a late result.
+
 > Status: **0.2.0 (draft)** — API is stabilizing alongside the NIP-AGX spec (`SPEC.md`).
