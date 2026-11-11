@@ -169,8 +169,9 @@ input-required update is nonterminal: an opted-in initiator keeps its request op
 input through `streamRequest()`. A plain `request()` caller rejects with a clear input-required error
 and sends cancellation. The initiator's timeout covers the whole task, not each prompt separately.
 
-`inputSchema`, when present, describes the expected answer using JSON Schema, but is advisory. The
-protocol core does not validate answers against it; the requester SHOULD validate user input, and
+`inputSchema` on an input requirement, when present, describes the expected answer using JSON Schema,
+but is advisory. The protocol core does not validate answers against it (task payloads and results are
+checked separately, see "Typed payload validation"); the requester SHOULD validate user input, and
 the handler MUST validate input before relying on it.
 
 The current in-process handler API waits for input in memory; it does not persist suspended handler
@@ -193,6 +194,15 @@ An agent's Agent Card lists the `capabilities` it handles (the set of registered
 are dot-namespaced (`invoice.review`). A `.*` suffix advertises a namespace wildcard (`invoice.*`
 matches `invoice.review`); `*` advertises all. An initiator selects a peer whose card satisfies the
 requested capability before sending.
+
+**Unhandled task traffic (normative).** Because the payload `contentType` is peer-supplied, a
+task-labelled message is not proof of task intent. A responder **MUST** consume a message as a task
+only when it can service it — a request whose capability it has a registered handler for, or a result
+correlated to one of its own pending requests. Any other task-labelled message (unknown capability,
+unmatched/late result, malformed envelope) **MUST NOT** be auto-replied to — emitting a signed reply
+to an unauthenticated peer turns the identity into a reflector — and **MUST** be delivered to the
+plain-message path instead, so a host that gates all inbound traffic there (peer registration, flood
+budget, block rules) triages it rather than being bypassed by a content-type label.
 
 ### Typed skills and extensions (Agent Card format 1.1.0)
 
@@ -253,27 +263,21 @@ reference client rejects unsupported local schemas at registration and includes 
 in discovery metadata while retaining the same legacy capability keys. Existing handlers without a
 contract retain their previous behavior.
 
-`request(..., { validate: true })` opts into requester preflight. The client resolves the peer card,
-selects the exact typed skill ID, and rejects a payload that violates its `inputSchema` before
-publishing. A missing card, typed skill, or input schema skips preflight; this option performs no
+`request(..., { validate: true })` and `streamRequest(..., { validate: true })` opt into requester
+preflight. The client resolves the peer card, selects the exact typed skill ID, and rejects a payload
+that violates its `inputSchema` before publishing. A missing card, typed skill, or input schema skips preflight; this option performs no
 schema-driven fetch beyond normal peer-card resolution.
 
 After authorization succeeds, a receiver with an input schema validates before invoking its handler.
 Invalid input produces only the safe `invalid_input` failure; detailed paths remain in local logs.
 Denied requesters receive no validation response and follow the normal plain-message trust path.
+An invalid request is answered before it is registered as an active task or takes a concurrency slot,
+so a retry under the same task ID is accepted. A task the requester has canceled sends no result, so
+it never sends `invalid_output` either.
 A handler result that violates its registered `outputSchema` produces `invalid_output` instead of a
 completed result. Structured error codes and requester-side validation of remote results remain
 outside this change. Validation uses only the bounded inline subset above and never evaluates schema
 text as code.
-
-**Unhandled task traffic (normative).** Because the payload `contentType` is peer-supplied, a
-task-labelled message is not proof of task intent. A responder **MUST** consume a message as a task
-only when it can service it — a request whose capability it has a registered handler for, or a result
-correlated to one of its own pending requests. Any other task-labelled message (unknown capability,
-unmatched/late result, malformed envelope) **MUST NOT** be auto-replied to — emitting a signed reply
-to an unauthenticated peer turns the identity into a reflector — and **MUST** be delivered to the
-plain-message path instead, so a host that gates all inbound traffic there (peer registration, flood
-budget, block rules) triages it rather than being bypassed by a content-type label.
 
 ## Correlation & replay
 

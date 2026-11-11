@@ -39,7 +39,8 @@ agx.handle("invoice.review", async (task) => paperclip.run(task.payload), {
 
 await agx.start();
 
-// Optional: resolve the peer's typed card and reject bad input before publishing.
+// Optional: resolve the peer's typed card and reject bad input before publishing
+// (`streamRequest` accepts the same option).
 const result = await agx.request(peer, "invoice.review", { amount: 25 }, {
   validate: true,
 });
@@ -68,8 +69,8 @@ path as polling, so live transport hooks are optional. The requester obtains an
 answer through its own UI or policy and sends it with
 `stream.provideInput(inputRequestId, answer)`. The answer continues the same task.
 The suspended handler state is in memory and does not survive a process restart.
-The handler must validate answers itself; `inputSchema` is advisory and is not
-validated by the protocol core. A requester timeout or stop sends a cancellation
+The handler must validate answers itself; an input requirement's `inputSchema` is advisory
+and is not validated by the protocol core (task contracts above are a separate check). A requester timeout or stop sends a cancellation
 so the responder stops waiting and does not send a late result.
 
 > Status: **0.2.0 (draft)** — API is stabilizing alongside the NIP-AGX spec (`SPEC.md`).
