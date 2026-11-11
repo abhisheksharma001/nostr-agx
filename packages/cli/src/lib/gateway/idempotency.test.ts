@@ -821,4 +821,76 @@ describe("TaskOperationStore storage fairness", () => {
 		finish();
 		store.close();
 	});
+
+	it("enforces keyed count limits when restoring an over-limit store", async () => {
+		let clock = 0;
+		const store = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 10,
+			maxOperations: 20,
+			now: () => (clock += 1),
+		});
+		for (const [owner, count] of [["credential-a", 5], ["credential-b", 2]] as const) {
+			for (let index = 0; index < count; index++) {
+				await store.execute(owner, `key-${index}`, {}, async () => ({ owner, index }));
+			}
+		}
+		const bystander = store.submit("credential-c", null, { background: true }, async () => ({ owner: "c", index: 0 }));
+		await waitForStatus(store, "credential-c", bystander.id as string, "completed");
+		store.close();
+
+		const restored = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 3,
+			maxOperations: 4,
+			now: () => (clock += 1),
+		});
+		const raw = JSON.parse(readFileSync(gatewayTaskOperationsPath("test"), "utf8")) as {
+			operations: Array<{ background: boolean; outcome: { body?: unknown } }>;
+		};
+		expect(raw.operations.filter((operation) => !operation.background).map((operation) => operation.outcome.body)).toEqual([
+			{ owner: "credential-a", index: 3 },
+			{ owner: "credential-a", index: 4 },
+			{ owner: "credential-b", index: 0 },
+			{ owner: "credential-b", index: 1 },
+		]);
+		expect(raw.operations.filter((operation) => operation.background)).toHaveLength(1);
+		restored.close();
+	});
+
+	it("enforces unkeyed background count limits when restoring an over-limit store", async () => {
+		let clock = 0;
+		const store = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 10,
+			maxOperations: 20,
+			now: () => (clock += 1),
+		});
+		for (const [owner, count] of [["credential-a", 5], ["credential-b", 2]] as const) {
+			for (let index = 0; index < count; index++) {
+				const accepted = store.submit(owner, null, { background: true }, async () => ({ owner, index }));
+				await waitForStatus(store, owner, accepted.id as string, "completed");
+			}
+		}
+		await store.execute("credential-c", "bystander", {}, async () => ({ owner: "c", index: 0 }));
+		store.close();
+
+		const restored = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 3,
+			maxOperations: 4,
+			now: () => (clock += 1),
+		});
+		const raw = JSON.parse(readFileSync(gatewayTaskOperationsPath("test"), "utf8")) as {
+			operations: Array<{ background: boolean; keyed: boolean; outcome: { body?: unknown } }>;
+		};
+		expect(
+			raw.operations
+				.filter((operation) => operation.background && !operation.keyed)
+				.map((operation) => operation.outcome.body),
+		).toEqual([
+			{ owner: "credential-a", index: 3 },
+			{ owner: "credential-a", index: 4 },
+			{ owner: "credential-b", index: 0 },
+			{ owner: "credential-b", index: 1 },
+		]);
+		expect(raw.operations.filter((operation) => !operation.background)).toHaveLength(1);
+		restored.close();
+	});
 });
