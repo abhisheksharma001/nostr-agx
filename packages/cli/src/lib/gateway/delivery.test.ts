@@ -183,6 +183,12 @@ describe("DeliveryQueue", () => {
 			await new Promise((r) => setTimeout(r, 10));
 		}
 		expect(healthy.received).toHaveLength(1);
+		// The healthy webhook can answer before the stalled one has received its
+		// second delivery, and its delivery only counts as done once the answer is
+		// read. Wait for both before counting.
+		for (let i = 0; i < 100 && (stalled.received.length < 2 || queue.pending() !== 5); i++) {
+			await new Promise((r) => setTimeout(r, 10));
+		}
 		// Two of the stalled webhook's deliveries are in flight, not four.
 		expect(stalled.received).toHaveLength(2);
 		expect(queue.pending()).toBe(5);

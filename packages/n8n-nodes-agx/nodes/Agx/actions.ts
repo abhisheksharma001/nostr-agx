@@ -176,6 +176,17 @@ export async function requestTasks(
 			output = await requester.request(peer, capability, payload, timeoutSec * 1000);
 		} catch (error) {
 			const message = messageOf(error);
+			if (message.startsWith("AGX task requires input")) {
+				throw new NodeOperationError(
+					ctx.getNode(),
+					`${npub} requires interactive input to continue this task`,
+					{
+						itemIndex: i,
+						description:
+							"This Task → Request operation cannot answer interactive prompts. Use an input-capable AGX client.",
+					},
+				);
+			}
 			if (message.startsWith("AGX request timed out")) {
 				throw new NodeOperationError(
 					ctx.getNode(),

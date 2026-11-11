@@ -1,9 +1,13 @@
 import {
+	type AgxIncomingMessage,
+	type AgxIncomingReceipt,
 	type AgxLogger,
 	type AgxPollResult,
 	type AgxResolvedPeer,
 	type AgxTransport,
+	type AgxTransportListenerOptions,
 	type ExchangeEvidence,
+	type Unsubscribe,
 	exchangeEvidenceProblem,
 	MAX_BODY,
 	MAX_EVIDENCE_FIELDS,
@@ -41,6 +45,7 @@ import {
 	unwrapRumor,
 } from "./giftwrap";
 import {
+	listenEvents,
 	pollInbox,
 	publishToRelays,
 	type RelayFailureKind,
@@ -51,6 +56,7 @@ import {
 	isSignerUnavailable,
 } from "./signer";
 import { configureWebSocket, type WebSocketImpl } from "./ws";
+import type { Subscription } from "nostr-tools/relay";
 
 export interface NostrTransportConfig {
 	/** Signs, encrypts and decrypts for this agent. Use `localSigner(secretKey)`
@@ -123,6 +129,21 @@ export class NostrTransport implements AgxTransport {
 		string,
 		CacheEntry<AgxResolvedPeer["card"]>
 	>();
+
+	private readonly ws?: WebSocketImpl | undefined;
+	private onMessageHandlers = new Set<(msg: AgxIncomingMessage) => void | Promise<void>>();
+	private onReceiptHandlers = new Set<(receipt: AgxIncomingReceipt) => void | Promise<void>>();
+	private messageListenerOptions = new Map<
+		(msg: AgxIncomingMessage) => void | Promise<void>,
+		AgxTransportListenerOptions | undefined
+	>();
+	private receiptListenerOptions = new Map<
+		(receipt: AgxIncomingReceipt) => void | Promise<void>,
+		AgxTransportListenerOptions | undefined
+	>();
+	private subscriptions: Subscription[] = [];
+	private started = false;
+	private startPromise?: Promise<void>;
 
 	/** Resolves the signer's public key once, up front, so `whoami()` stays
 	 * synchronous (the `AgxTransport` contract) even for a remote signer. */
@@ -786,5 +807,134 @@ export class NostrTransport implements AgxTransport {
 			this.signer,
 		);
 		return { ok: a.ok && b.ok };
+	}
+
+	async start(): Promise<void> {
+		if (this.started) {
+			return;
+		}
+		if (this.startPromise) {
+			await this.startPromise;
+			return;
+		}
+
+		const startPromise = this.listenMessages();
+		this.startPromise = startPromise;
+		try {
+			await startPromise;
+			this.started = true;
+		} finally {
+			if (this.startPromise === startPromise) {
+				this.startPromise = undefined;
+			}
+		}
+	}
+
+	private async listenMessages(): Promise<void> {
+		const subscriptions = await listenEvents(this.signer, this.relays, {
+			pubkey: this.publicKey,
+			logger: this.logger,
+			isKnown: async (transportIds) => {
+				const registrations = [
+					...this.messageListenerOptions.values(),
+					...this.receiptListenerOptions.values(),
+				];
+				if (
+					registrations.length === 0 ||
+					registrations.some((options) => !options?.isKnown)
+				) {
+					return new Set<string>();
+				}
+				const knownByListener = await Promise.all(
+					registrations.map((options) => options!.isKnown!(transportIds)),
+				);
+				return new Set(
+					transportIds.filter((id) =>
+						knownByListener.every((known) => known.has(id)),
+					),
+				);
+			},
+			onDiscarded: async (transportIds) => {
+				const callbacks = new Set(
+					[
+						...this.messageListenerOptions.values(),
+						...this.receiptListenerOptions.values(),
+					]
+						.map((options) => options?.onDiscarded)
+						.filter(
+							(callback): callback is NonNullable<typeof callback> =>
+								callback !== undefined,
+						),
+				);
+				await Promise.all(
+					Array.from(callbacks, (callback) => callback(transportIds)),
+				);
+			},
+		}, async (data: AgxIncomingMessage | AgxIncomingReceipt) => {
+			if ('receipt' in data) {
+				await Promise.all(
+					Array.from(this.onReceiptHandlers, (handler) => handler(data)),
+				);
+			} else {
+				await Promise.all(
+					Array.from(this.onMessageHandlers, (handler) => handler(data)),
+				);
+			}
+		});
+		const previousSubscriptions = this.subscriptions;
+		this.subscriptions = subscriptions;
+		this.closeSubscriptions(previousSubscriptions);
+	}
+
+	private closeSubscriptions(subscriptions: Subscription[]): void {
+		subscriptions.forEach((sub) => sub.close());
+		new Set(subscriptions.map((sub) => sub.relay)).forEach((relay) =>
+			relay.close(),
+		);
+	}
+
+	async stop(): Promise<void> {
+		const startPromise = this.startPromise;
+		let startFailed = false;
+		let startError: unknown;
+		if (startPromise) {
+			try {
+				await startPromise;
+			} catch (error) {
+				startFailed = true;
+				startError = error;
+			}
+		}
+		this.started = false;
+		const subscriptions = this.subscriptions;
+		this.subscriptions = [];
+		this.closeSubscriptions(subscriptions);
+		if (startFailed) {
+			throw startError;
+		}
+	}
+
+	onMessage(
+		handler: (msg: AgxIncomingMessage) => void | Promise<void>,
+		options?: AgxTransportListenerOptions,
+	): Unsubscribe {
+		this.onMessageHandlers.add(handler);
+		this.messageListenerOptions.set(handler, options);
+		return () => {
+			this.onMessageHandlers.delete(handler);
+			this.messageListenerOptions.delete(handler);
+		};
+	}
+
+	onReceipt(
+		handler: (receipt: AgxIncomingReceipt) => void | Promise<void>,
+		options?: AgxTransportListenerOptions,
+	): Unsubscribe {
+		this.onReceiptHandlers.add(handler);
+		this.receiptListenerOptions.set(handler, options);
+		return () => {
+			this.onReceiptHandlers.delete(handler);
+			this.receiptListenerOptions.delete(handler);
+		};
 	}
 }

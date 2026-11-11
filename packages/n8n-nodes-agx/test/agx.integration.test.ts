@@ -89,6 +89,7 @@ describe("AGX node: Task → Request", () => {
 		peer.handle("invoice.review", () => {
 			throw new AgxPublicError("invoice not found");
 		});
+
 		await peer.start({ pollIntervalMs: 250, advertise: false });
 		const ctx = executeContext({
 			credentials: n8nAgent.credentials,
@@ -103,6 +104,30 @@ describe("AGX node: Task → Request", () => {
 		});
 		await expect(execute(new Agx(), ctx, [peer])).rejects.toThrow(
 			/reported that the task failed: invoice not found/,
+		);
+	});
+
+	it("reports when a peer requires interactive input", async () => {
+		const n8nAgent = newAgent(relay);
+		const reviewer = newAgent(relay);
+		const peer = await peerClient(relay, reviewer, { authorize: "accept-all" });
+		peer.handle("invoice.approve", async (_task, ctx) =>
+			ctx.requestInput({ prompt: "Approve?" }),
+		);
+		await peer.start({ pollIntervalMs: 250, advertise: false });
+		const ctx = executeContext({
+			credentials: n8nAgent.credentials,
+			params: () => ({
+				resource: "task",
+				operation: "request",
+				peer: reviewer.publicKey,
+				capability: "invoice.approve",
+				payload: "{}",
+				options: { timeout: 20 },
+			}),
+		});
+		await expect(execute(new Agx(), ctx, [peer])).rejects.toThrow(
+			/requires interactive input to continue this task/,
 		);
 	});
 
