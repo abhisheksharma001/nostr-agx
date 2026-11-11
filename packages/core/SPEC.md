@@ -166,7 +166,8 @@ update is nonterminal and independent of `supportsInput`; it **MUST NOT** settle
 from the peer the request was sent to, for the pending `taskId`, with the transport `contextId` equal to
 that `taskId`, exactly as for `input-required`. Duplicate or older `seq` values are ignored; a later
 terminal result still settles the request normally. A responder **MUST NOT** send `working` after the
-task has finished or been canceled. The message is handler-supplied public text, never raw reasoning or
+task has finished or been canceled: the reference client stops accepting reports as soon as the handler
+returns or throws, and waits for any update already being published before it sends the terminal result. The message is handler-supplied public text, never raw reasoning or
 internal error details. A transport failure or oversized message drops the update without failing the
 task. Unknown, late, and post-terminal updates receive no automatic reply and follow the plain-message
 trust path. The opt-in exists because a requester that predates `working` cannot be relied on to treat

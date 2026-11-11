@@ -1416,6 +1416,15 @@ export class AgxClient {
 				: undefined;
 		let waitingForInput = false;
 		let statusSeq = 0;
+		// `working` stops the moment the handler returns or throws; publishes
+		// already started are awaited before any terminal result is sent, so no
+		// update ever follows it on the wire.
+		let reportsClosed = false;
+		let reportsInFlight: Promise<void> = Promise.resolve();
+		const closeReports = () => {
+			reportsClosed = true;
+			return reportsInFlight;
+		};
 		const activeKey = this.activeInboundTaskKey(
 			this.normalizeId(msg.from),
 			env.taskId,
@@ -1432,11 +1441,20 @@ export class AgxClient {
 					if (env.supportsWorking !== true) return;
 					// Only while this run is the live task: not after a cancel, not once
 					// the handler has returned and the task entry is gone.
-					if (active?.canceled || this.activeInboundTasks.get(activeKey) !== active) {
+					if (
+						reportsClosed ||
+						active?.canceled ||
+						this.activeInboundTasks.get(activeKey) !== active
+					) {
 						return;
 					}
 					statusSeq += 1;
-					await this.sendTaskStatus(msg.from, env.taskId, statusSeq, message);
+					const sending = this.sendTaskStatus(msg.from, env.taskId, statusSeq, message);
+					reportsInFlight = Promise.all([
+						reportsInFlight,
+						sending.catch(() => undefined),
+					]).then(() => undefined);
+					await sending;
 				},
 				requestInput: async (requirement) => {
 					if (env.supportsInput !== true) {
@@ -1514,6 +1532,7 @@ export class AgxClient {
 					}
 				},
 			});
+			await closeReports();
 			if (active?.canceled) return;
 			if (registered.contract?.outputSchema) {
 				const problem = validateAgxJsonPayload(
@@ -1538,6 +1557,7 @@ export class AgxClient {
 				output,
 			});
 		} catch (err) {
+			await closeReports();
 			if (err instanceof AgxTaskCanceled || active?.canceled) {
 				return;
 			}
