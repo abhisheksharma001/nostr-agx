@@ -415,7 +415,8 @@ export class AgxClient {
 	/** Check the payload against the peer's typed skill before anything is
 	 * published or registered. A peer with no matching skill schema passes.
 	 * Callers await this only when `validate` is set, so a plain request still
-	 * publishes in the same tick. */
+	 * publishes in the same tick. The peer lookup runs before the request's
+	 * `timeoutMs` deadline starts, so that deadline does not cover it. */
 	private async preflightInput(
 		peer: string,
 		capability: string,

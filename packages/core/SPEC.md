@@ -266,7 +266,8 @@ contract retain their previous behavior.
 `request(..., { validate: true })` and `streamRequest(..., { validate: true })` opt into requester
 preflight. The client resolves the peer card, selects the exact typed skill ID, and rejects a payload
 that violates its `inputSchema` before publishing. A missing card, typed skill, or input schema skips preflight; this option performs no
-schema-driven fetch beyond normal peer-card resolution.
+schema-driven fetch beyond normal peer-card resolution. That peer-card lookup runs before the request is
+published, so `timeoutMs` does not cover it.
 
 After authorization succeeds, a receiver with an input schema validates before invoking its handler.
 Invalid input produces only the safe `invalid_input` failure; detailed paths remain in local logs.
