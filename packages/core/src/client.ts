@@ -432,7 +432,8 @@ export class AgxClient {
 	/** Check the payload against the peer's typed skill before anything is
 	 * published or registered. A peer with no matching skill schema passes.
 	 * Callers await this only when `validate` is set, so a plain request still
-	 * publishes in the same tick. */
+	 * publishes in the same tick. The peer lookup runs before the request's
+	 * `timeoutMs` deadline starts, so that deadline does not cover it. */
 	private async preflightInput(
 		peer: string,
 		capability: string,
@@ -1189,6 +1190,17 @@ export class AgxClient {
 			// Guard defensively and, crucially, do NOT auto-reply.
 			return;
 		}
+		// Refuse a reused active task id before validating its payload, so a
+		// duplicate never answers for (or terminates) the task already running.
+		const peer = this.normalizeId(msg.from);
+		const activeTaskKey = this.activeInboundTaskKey(peer, env.taskId);
+		if (this.activeInboundTasks.has(activeTaskKey)) {
+			this.log.warn?.("AGX: duplicate active task ID; dropping", {
+				taskId: env.taskId,
+				from: msg.from,
+			});
+			return;
+		}
 		if (registered.contract?.inputSchema) {
 			const problem = validateAgxJsonPayload(
 				registered.contract.inputSchema,
@@ -1207,15 +1219,6 @@ export class AgxClient {
 				});
 				return;
 			}
-		}
-		const peer = this.normalizeId(msg.from);
-		const activeTaskKey = this.activeInboundTaskKey(peer, env.taskId);
-		if (this.activeInboundTasks.has(activeTaskKey)) {
-			this.log.warn?.("AGX: duplicate active task ID; dropping", {
-				taskId: env.taskId,
-				from: msg.from,
-			});
-			return;
 		}
 		this.activeInboundTasks.set(activeTaskKey, {
 			canceled: false,
