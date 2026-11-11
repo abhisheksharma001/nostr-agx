@@ -475,11 +475,10 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 		);
 	}
 
-	// `pollIntervalMs: 0` disables the library's own self-rescheduling loop so the
-	// cursor can be persisted after each poll — `start()`'s internal loop offers no
-	// per-pump hook, and an unpersisted cursor means a restart re-drains the inbox.
+	// This host drives pump() itself so it can persist the cursor after each poll;
+	// disable both library-managed polling and live dispatch.
 	const advertise = options.advertise === true;
-	await client.start({ pollIntervalMs: 0, advertise });
+	await client.start({ pollIntervalMs: 0, advertise, liveDispatch: false });
 	if (advertise) {
 		info(
 			"Published an Agent Card (kind 11337) and relay list (kind 10002). These are UNENCRYPTED.",
@@ -526,6 +525,11 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 		}, 10_000);
 		timer.unref();
 		await client.stop().catch(() => undefined);
+		// Drain in-flight handlers before exiting: stop() has rejected input
+		// waits (each fails with a published `failed` result) and running
+		// handlers keep their right to publish — but only if the process is
+		// still alive when they finish. The 10s timer above bounds the wait.
+		await client.tasksSettled().catch(() => undefined);
 		clearTimeout(timer);
 		persist();
 		releaseLock();
@@ -566,6 +570,8 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 
 	if (options.once) {
 		await client.stop().catch(() => undefined);
+		// Same drain as Ctrl-C: publish what in-flight handlers produced.
+		await client.tasksSettled().catch(() => undefined);
 		persist();
 		releaseLock();
 	}

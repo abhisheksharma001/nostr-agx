@@ -3,3 +3,4 @@ dist/
 *.tgz
 .turbo/
 .DS_Store
+packages/nostr/examples/two-agents/.two-agents/

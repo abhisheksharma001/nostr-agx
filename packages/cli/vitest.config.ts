@@ -12,10 +12,11 @@ export default defineConfig({
 		// AGX_* overrides, so no test can touch the real ~/.agx.
 		setupFiles: ["./src/test/setup.ts"],
 		// `*.e2e.test.ts` drive the BUILT CLI, so they only run on request
-		// (`pnpm test:e2e:login`, after `pnpm build`), never in `test:unit`.
+		// (`pnpm test:e2e:login` / `pnpm test:e2e:serve`, after `pnpm build`),
+		// never in `test:unit`.
 		exclude: [
 			...configDefaults.exclude,
-			...(process.env.E2E_LOGIN ? [] : ["**/*.e2e.test.ts"]),
+			...(process.env.E2E ? [] : ["**/*.e2e.test.ts"]),
 		],
 	},
 	resolve: {

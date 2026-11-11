@@ -10,15 +10,20 @@ import {
 	encodeTaskEnvelope,
 	parseTaskEnvelope,
 	type Task,
-	type TaskEnvelope,
+	type TaskCancelEnvelope,
+	type TaskInputEnvelope,
 	type TaskRequestEnvelope,
 	type TaskResultEnvelope,
+	type InputRequirement,
+	type InputRequiredUpdate,
 } from "./task";
 import type {
 	AgxAgentSkill,
 	AgxIncomingMessage,
 	AgxIncomingReceipt,
+	AgxTransportListenerOptions,
 	AgxTransport,
+	Unsubscribe,
 } from "./transport";
 import {
 	DEFAULT_CONTENT_TYPE,
@@ -39,6 +44,7 @@ import {
  * `failed`, except {@link AgxTaskDeclined}, which sends nothing back. */
 export type TaskHandler<Payload = unknown, Output = unknown> = (
 	task: Task<Payload>,
+	ctx: HandlerContext,
 ) => Output | Promise<Output>;
 
 export type AgxTaskContract = Omit<AgxAgentSkill, "id">;
@@ -47,6 +53,17 @@ interface RegisteredTaskHandler {
 	handler: TaskHandler;
 	contract?: AgxTaskContract;
 }
+
+export type HandlerContext = {
+	/** The peer that sent the task request. */
+	from: string;
+	/** The capability requested. */
+	capability: string;
+	/** The AGX event ID of the request message. */
+	eventId: string;
+	/** Ask the task requester for input and resume when it replies. */
+	requestInput(requirement: InputRequirement): Promise<unknown>;
+};
 
 /** Context for the trust/authorization hook, evaluated before a task runs. */
 export interface AgxAuthorizeContext {
@@ -102,14 +119,21 @@ export interface AgxClientOptions {
 	 * (unbounded at-least-once retries). Prevents a poison event from stalling the
 	 * inbox and letting a held cursor outrun the SeenStore retention window. */
 	maxDispatchAttempts?: number;
-	/** Task handlers that may run at once. With the default, 1, a handler runs
-	 * inside `pump()`, which waits for it, and its request is recorded as handled
-	 * once it has answered. Above 1, `pump()` starts each task in a free slot and
-	 * moves on, so a slow handler holds up neither other tasks nor messages; it
-	 * waits only while every slot is busy. A task then counts as handled once it
-	 * has started: a restart while it runs does not run it again, and its
-	 * requester's timeout covers the result it never gets. */
+	/** Task handlers that may run at once. With the default, 1, `pump()` waits for
+	 * a handler to finish unless it requests input; an input-waiting handler
+	 * releases its task slot so another task can run while the continuation is
+	 * outstanding.
+	 * Above 1, handlers start in free slots and run independently; when all slots
+	 * are busy, dispatch waits for a slot before marking the task handled. A task
+	 * request is marked handled once its handler starts, so a restart while it runs
+	 * does not run it again, and its requester's timeout covers a result it never
+	 * gets. */
 	maxConcurrentTasks?: number;
+	/** Maximum concurrent input requirements retained in memory (default 32). */
+	maxPendingTaskInputs?: number;
+	/** Maximum duration of one input requirement (default 5 minutes). A task's
+	 * overall request timeout, when nonzero, may impose a shorter deadline. */
+	maxInputTimeoutMs?: number;
 }
 
 interface Pending {
@@ -120,9 +144,46 @@ interface Pending {
 	 * if its sender matches — correlation by `taskId` alone is forgeable, since the
 	 * responder legitimately knows the `taskId`. */
 	peer: string;
+	published?: boolean;
+	cancelRequested?: boolean;
+	onUpdate?: (update: TaskResultEnvelope) => void;
+	onError?: (error: Error) => void;
+}
+
+interface PendingTaskInput {
+	taskId: string;
+	inputRequestId: string;
+	peer: string;
+	resolve: (input: unknown) => void;
+	reject: (error: Error) => void;
+	timer?: ReturnType<typeof setTimeout>;
+}
+
+interface SendRequestOptions {
+	timeoutMs?: number;
+	taskId?: string;
+	supportsInput?: boolean;
+	onUpdate?: (update: TaskResultEnvelope) => void;
+	onError?: (error: Error) => void;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_PENDING_TASK_INPUTS = 32;
+const DEFAULT_MAX_INPUT_TIMEOUT_MS = 5 * 60_000;
+const MAX_QUEUED_TASK_RUNS = 100;
+const INPUT_UNSUPPORTED_ERROR =
+	"AGX task requires input; this request does not support interactive input";
+const INPUT_CANCELLED_ERROR = "AGX task was canceled by its requester";
+const STREAM_HANDLE_UPDATE = Symbol("stream update");
+const STREAM_HANDLE_ERROR = Symbol("stream error");
+
+class AgxTaskQueueFull extends Error {}
+
+class AgxTaskCanceled extends Error {
+	constructor() {
+		super(INPUT_CANCELLED_ERROR);
+	}
+}
 /** Default {@link AgxClientOptions.pollOverlapSec}. Exported for hosts that keep
  * their own replay records and must know how far back a poll reaches. */
 export const DEFAULT_POLL_OVERLAP_SEC = 120;
@@ -135,6 +196,69 @@ const DEFAULT_MAX_DISPATCH_ATTEMPTS = 10;
  * {@link DEFAULT_POLL_OVERLAP_SEC}, for hosts that keep their own replay records:
  * an event dispatched at time `t` is dated no later than `t` plus this. */
 export const MAX_FUTURE_SKEW_SEC = 300;
+
+interface TransportLifecycle {
+	clients: Set<object>;
+	started: boolean;
+	queue: Promise<void>;
+}
+
+const transportLifecycles = new WeakMap<AgxTransport, TransportLifecycle>();
+
+async function retainTransport(
+	transport: AgxTransport,
+	client: object,
+): Promise<void> {
+	let lifecycle = transportLifecycles.get(transport);
+	if (!lifecycle) {
+		lifecycle = { clients: new Set(), started: false, queue: Promise.resolve() };
+		transportLifecycles.set(transport, lifecycle);
+	}
+	lifecycle.clients.add(client);
+	const operation = lifecycle.queue.then(async () => {
+		if (!lifecycle.started) {
+			await transport.start?.();
+			lifecycle.started = true;
+		}
+	});
+	lifecycle.queue = operation.catch(() => undefined);
+	try {
+		await operation;
+	} catch (error) {
+		lifecycle.clients.delete(client);
+		if (lifecycle.clients.size === 0 && !lifecycle.started) {
+			transportLifecycles.delete(transport);
+		}
+		throw error;
+	}
+}
+
+async function releaseTransport(
+	transport: AgxTransport,
+	client: object,
+): Promise<void> {
+	const lifecycle = transportLifecycles.get(transport);
+	if (!lifecycle || !lifecycle.clients.delete(client)) {
+		return;
+	}
+	const operation = lifecycle.queue.then(async () => {
+		if (lifecycle.clients.size > 0) {
+			return;
+		}
+		if (lifecycle.started) {
+			await transport.stop?.();
+			lifecycle.started = false;
+		}
+		if (
+			lifecycle.clients.size === 0 &&
+			transportLifecycles.get(transport) === lifecycle
+		) {
+			transportLifecycles.delete(transport);
+		}
+	});
+	lifecycle.queue = operation.catch(() => undefined);
+	await operation;
+}
 
 export class AgxClient {
 	private readonly transport: AgxTransport;
@@ -157,15 +281,36 @@ export class AgxClient {
 	private readonly pollOverlapSec: number;
 	private readonly maxDispatchAttempts: number;
 	private readonly maxConcurrentTasks: number;
-	/** Handlers running outside `pump()` (`maxConcurrentTasks` above 1). */
+	private readonly maxPendingTaskInputs: number;
+	private readonly maxInputTimeoutMs: number;
+	/** Active and queued task handler runs. */
 	private readonly runningTasks = new Set<Promise<void>>();
+	private readonly queuedTaskRuns: Array<{
+		start: () => void;
+		cancel: () => void;
+	}> = [];
+	private activeTaskCount = 0;
+	private readonly receiptListeners = new Set<
+		(receipt: AgxIncomingReceipt) => void
+	>();
 	private readonly handlers = new Map<string, RegisteredTaskHandler>();
 	private readonly pending = new Map<string, Pending>();
+	private readonly pendingTaskInputs = new Map<string, PendingTaskInput>();
+	private readonly activeInboundTasks = new Map<string, { canceled: boolean }>();
+	private readonly cancellationSends = new Set<Promise<void>>();
 	private cursor: number;
 	private pollTimer?: ReturnType<typeof setTimeout>;
+	private transportRetained = false;
+	private stopping = false;
+	private started = false;
+	private startPromise?: Promise<void>;
+	private listenerUnsubscribers: Unsubscribe[] = [];
 	/** True while a pump() is in flight — prevents overlapping pumps from
 	 * double-running a handler (the seen-add happens only after dispatch). */
 	private pumping = false;
+	/** Shared by live subscriptions and poll() so they cannot dispatch one event
+	 * twice while either path is still processing it. */
+	private readonly activeDispatches = new Map<string, Promise<boolean>>();
 	/** True while the self-rescheduling poll loop should keep running. */
 	private running = false;
 
@@ -186,6 +331,20 @@ export class AgxClient {
 		const concurrent = Math.floor(opts.maxConcurrentTasks ?? 1);
 		this.maxConcurrentTasks =
 			Number.isFinite(concurrent) && concurrent > 1 ? concurrent : 1;
+		const maxPendingInputs = Math.floor(
+			opts.maxPendingTaskInputs ?? DEFAULT_MAX_PENDING_TASK_INPUTS,
+		);
+		this.maxPendingTaskInputs =
+			Number.isFinite(maxPendingInputs) && maxPendingInputs > 0
+				? maxPendingInputs
+				: DEFAULT_MAX_PENDING_TASK_INPUTS;
+		const maxInputTimeout = Math.floor(
+			opts.maxInputTimeoutMs ?? DEFAULT_MAX_INPUT_TIMEOUT_MS,
+		);
+		this.maxInputTimeoutMs =
+			Number.isFinite(maxInputTimeout) && maxInputTimeout > 0
+				? maxInputTimeout
+				: DEFAULT_MAX_INPUT_TIMEOUT_MS;
 		this.cursor = opts.startCursor ?? 0;
 	}
 
@@ -271,13 +430,77 @@ export class AgxClient {
 				}
 			}
 		}
+		const { result } = await this.sendRequest<Output>(
+			peer,
+			capability,
+			payload,
+			{ ...opts, supportsInput: false },
+		);
+		return result;
+	}
+
+	/** Send a task to a peer and await its correlated result. Rejects on a `failed`
+	 * result, an unsupported capability, or timeout. */
+	async streamRequest<Output = unknown>(
+		peer: string,
+		capability: string,
+		payload: unknown,
+		opts?: { timeoutMs?: number },
+	): Promise<StreamResponse<Output>> {
 		const taskId = randomId();
+		let resolveResult!: (output: Output) => void;
+		let rejectResult!: (error: Error) => void;
+		const result = new Promise<Output>((resolve, reject) => {
+			resolveResult = resolve;
+			rejectResult = reject;
+		});
+		result.catch(() => undefined);
+		const stream = new StreamResponse<Output>(
+			taskId,
+			result,
+			(listener) => {
+				this.receiptListeners.add(listener);
+				return () => this.receiptListeners.delete(listener);
+			},
+			(inputRequestId, input) =>
+				this.sendTaskInput(peer, taskId, inputRequestId, input),
+			this.log,
+		);
+		try {
+			const { result } = await this.sendRequest<Output>(peer, capability, payload, {
+				...opts,
+				taskId,
+				supportsInput: true,
+				onUpdate: (update) => stream[STREAM_HANDLE_UPDATE](update),
+				onError: (error) => stream[STREAM_HANDLE_ERROR](error),
+			});
+			void result.then(resolveResult, rejectResult);
+		} catch (error) {
+			const requestError =
+				error instanceof Error ? error : new Error(String(error));
+			stream[STREAM_HANDLE_ERROR](requestError);
+			rejectResult(requestError);
+			throw error;
+		}
+
+		return stream;
+	}
+
+	private async sendRequest<Output = unknown>(
+		peer: string,
+		capability: string,
+		payload: unknown,
+		opts?: SendRequestOptions,
+	): Promise<{ taskId: string; result: Promise<Output> }> {
+		const taskId = opts?.taskId ?? randomId();
 		const timeoutMs = opts?.timeoutMs ?? this.requestTimeoutMs;
 		const envelope: TaskRequestEnvelope = {
 			t: "req",
 			taskId,
 			capability,
 			payload,
+			supportsInput: opts?.supportsInput === true,
+			timeoutMs: timeoutMs > 0 ? timeoutMs : 0,
 		};
 		const text = encodeTaskEnvelope(envelope);
 		// Fail fast (before registering the pending) rather than silently truncate
@@ -291,24 +514,31 @@ export class AgxClient {
 		// Register the pending entry SYNCHRONOUSLY (before the await), so a stop()
 		// or a publish failure while the send is in flight still settles the caller
 		// instead of leaving it hanging.
+		let pending!: Pending;
 		const result = new Promise<Output>((resolve, reject) => {
-			const timer =
-				timeoutMs > 0
-					? setTimeout(() => {
-							this.pending.delete(taskId);
-							reject(
-								new Error(
-									`AGX request timed out after ${timeoutMs}ms`,
-								),
-							);
-						}, timeoutMs)
-					: undefined;
-			this.pending.set(taskId, {
+			pending = {
 				resolve: resolve as (o: unknown) => void,
 				reject,
-				timer,
 				peer: this.normalizeId(peer),
-			});
+				onUpdate: opts?.onUpdate,
+				onError: opts?.onError,
+			};
+			if (timeoutMs > 0) {
+				pending.timer = setTimeout(() => {
+					if (this.pending.get(taskId) !== pending) return;
+					this.pending.delete(taskId);
+					const error = new Error(
+						`AGX request timed out after ${timeoutMs}ms`,
+					);
+					pending.reject(error);
+					pending.onError?.(error);
+					pending.cancelRequested = true;
+					if (pending.published) {
+						void this.sendTaskCancel(pending.peer, taskId);
+					}
+				}, timeoutMs);
+			}
+			this.pending.set(taskId, pending);
 		});
 		// The timeout or a stop() can settle it while the publish below is still
 		// in flight, before the caller holds it: handled here, it is not an
@@ -328,8 +558,14 @@ export class AgxClient {
 				taskId,
 				new Error(`AGX request: publish failed to ${peer}`),
 			);
+		} else {
+			pending.published = true;
+			if (pending.cancelRequested) {
+				void this.sendTaskCancel(pending.peer, taskId);
+			}
 		}
-		return result;
+
+		return { taskId, result };
 	}
 
 	/** One poll → dispatch cycle. Drains inbound messages, dispatches task requests
@@ -391,6 +627,55 @@ export class AgxClient {
 		return false;
 	}
 
+	private async markSeen(event: {
+		eventId: string;
+		transportId?: string;
+	}): Promise<void> {
+		const ids =
+			event.transportId && event.transportId !== event.eventId
+				? [event.eventId, event.transportId]
+				: [event.eventId];
+		if (this.seen.addMany) {
+			await this.seen.addMany(ids);
+			return;
+		}
+		for (const id of ids) {
+			await this.seen.add(id);
+		}
+	}
+
+	/** Dispatch an event through whichever receive path got it first. */
+	private async dispatchOnce(
+		event: { eventId: string; transportId?: string },
+		dispatch: () => void | Promise<void>,
+	): Promise<boolean> {
+		const active = this.activeDispatches.get(event.eventId);
+		if (active) {
+			await active;
+			return false;
+		}
+
+		const operation = (async () => {
+			if (await this.seen.has(event.eventId)) {
+				if (event.transportId && event.transportId !== event.eventId) {
+					await this.seen.add(event.transportId);
+				}
+				return false;
+			}
+			await dispatch();
+			await this.markSeen(event);
+			return true;
+		})();
+		this.activeDispatches.set(event.eventId, operation);
+		try {
+			return await operation;
+		} finally {
+			if (this.activeDispatches.get(event.eventId) === operation) {
+				this.activeDispatches.delete(event.eventId);
+			}
+		}
+	}
+
 	private async pumpOnce(): Promise<{
 		cursor: number;
 		dispatched: number;
@@ -417,14 +702,14 @@ export class AgxClient {
 				this.seen.hasMany
 					? await this.seen.hasMany(ids)
 					: new Set(
-							(
-								await Promise.all(
-									ids.map(async (id) =>
-										(await this.seen.has(id)) ? id : null,
-									),
-								)
-							).filter((id): id is string => id !== null),
-						),
+						(
+							await Promise.all(
+								ids.map(async (id) =>
+									(await this.seen.has(id)) ? id : null,
+								),
+							)
+						).filter((id): id is string => id !== null),
+					),
 		});
 		// One batched write when the store can take it (`addMany`), per-id `add`
 		// otherwise.
@@ -446,18 +731,6 @@ export class AgxClient {
 		// to us, and one round-trip each would let that flood stall the pump
 		// before any real message is dispatched.
 		await addAll(res.discarded ?? []);
-		// An event's envelope id, when the binding has one distinct from its
-		// event id; recorded alongside it so the next poll skips the envelope.
-		const markSeen = async (event: {
-			eventId: string;
-			transportId?: string;
-		}): Promise<void> => {
-			await addAll(
-				event.transportId && event.transportId !== event.eventId
-					? [event.eventId, event.transportId]
-					: [event.eventId],
-			);
-		};
 		// Prefetch the whole batch's seen-set in one round-trip when the store
 		// supports it — a busy team can carry hundreds of events per poll, and a
 		// serial `has()` per event would be that many sequential DB round-trips.
@@ -467,9 +740,9 @@ export class AgxClient {
 		// id in one batch twice. `attempted` below is what covers that.
 		const prefetchedSeen = this.seen.hasMany
 			? await this.seen.hasMany([
-					...res.messages.map((m) => m.eventId),
-					...res.receipts.map((r) => r.eventId),
-				])
+				...res.messages.map((m) => m.eventId),
+				...res.receipts.map((r) => r.eventId),
+			])
 			: null;
 		const alreadySeen = async (id: string): Promise<boolean> =>
 			prefetchedSeen ? prefetchedSeen.has(id) : await this.seen.has(id);
@@ -514,15 +787,23 @@ export class AgxClient {
 				continue;
 			}
 			let ignored = false;
+			let processed: boolean;
 			try {
 				// Inside the try: a host filter that throws is a failed dispatch
 				// (retried, then dead-lettered), not a pump that rejects at the same
 				// event on every poll.
-				ignored = this.ignore?.(msg) === true;
-				if (!ignored) {
-					await this.dispatchMessage(msg);
-				}
+				processed = await this.dispatchOnce(msg, async () => {
+					ignored = this.ignore?.(msg) === true;
+					if (!ignored) {
+						await this.dispatchMessage(msg);
+					}
+				});
 			} catch (err) {
+				if (err instanceof AgxTaskQueueFull) {
+					attempted.set(msg.eventId, "pending");
+					anyFailed = true;
+					break;
+				}
 				// A transient host error (e.g. a throwing onMessage) must not lose the
 				// message or block the rest of the batch: leave it UNSEEN, hold the
 				// cursor, and retry next poll (at-least-once) — UNLESS it has failed
@@ -536,7 +817,7 @@ export class AgxClient {
 				);
 				if (deadLettered) {
 					// Its envelope too, or the next poll re-opens it just to skip it.
-					await markSeen(msg);
+					await this.markSeen(msg);
 					attempted.set(msg.eventId, "done");
 				} else {
 					attempted.set(msg.eventId, "pending");
@@ -544,10 +825,8 @@ export class AgxClient {
 				}
 				continue;
 			}
-			// Record as processed only AFTER a successful dispatch.
-			await markSeen(msg);
 			attempted.set(msg.eventId, "done");
-			if (!ignored) {
+			if (processed && !ignored) {
 				dispatched += 1;
 			}
 		}
@@ -562,9 +841,11 @@ export class AgxClient {
 				continue;
 			}
 			try {
-				if (this.ignore?.(receipt) !== true) {
-					await this.onReceipt?.(receipt);
-				}
+				await this.dispatchOnce(receipt, async () => {
+					if (this.ignore?.(receipt) !== true) {
+						await this.dispatchReceipt(receipt);
+					}
+				});
 			} catch (err) {
 				const deadLettered = await this.onDispatchFailure(
 					"receipt",
@@ -574,7 +855,7 @@ export class AgxClient {
 				);
 				if (deadLettered) {
 					// Its envelope too, or the next poll re-opens it just to skip it.
-					await markSeen(receipt);
+					await this.markSeen(receipt);
 					attempted.set(receipt.eventId, "done");
 				} else {
 					attempted.set(receipt.eventId, "pending");
@@ -582,7 +863,6 @@ export class AgxClient {
 				}
 				continue;
 			}
-			await markSeen(receipt);
 			attempted.set(receipt.eventId, "done");
 		}
 		// Advance the cursor only when the poll was complete AND nothing failed —
@@ -608,12 +888,54 @@ export class AgxClient {
 
 	/** Advertise capabilities (if the transport supports discovery) and begin
 	 * polling on an interval. Serverless hosts should skip the interval
-	 * (`pollIntervalMs: 0`) and drive `pump()` from their own scheduler. */
+	 * (`pollIntervalMs: 0`) and drive `pump()` from their own scheduler.
+	 * Hosts that drive `pump()` themselves can disable
+	 * the interval and live dispatch while retaining advertising. */
 	async start(opts?: {
 		pollIntervalMs?: number;
 		advertise?: boolean;
+		/** Set false when the host drives `pump()` and does not want live delivery.
+		 * Defaults to true. */
+		liveDispatch?: boolean;
 	}): Promise<void> {
-		await this.transport.start?.();
+		if (this.started) {
+			return;
+		}
+		if (this.startPromise) {
+			await this.startPromise;
+			return;
+		}
+
+		this.stopping = false;
+		const startPromise = this.startClient(opts);
+		this.startPromise = startPromise;
+		try {
+			await startPromise;
+			this.started = true;
+		} catch (error) {
+			this.unsubscribeTransportListeners();
+			if (this.transportRetained) {
+				this.transportRetained = false;
+				await releaseTransport(this.transport, this);
+			}
+			throw error;
+		} finally {
+			if (this.startPromise === startPromise) {
+				this.startPromise = undefined;
+			}
+		}
+	}
+
+	private async startClient(opts?: {
+		pollIntervalMs?: number;
+		advertise?: boolean;
+		liveDispatch?: boolean;
+	}): Promise<void> {
+		if (opts?.liveDispatch !== false) {
+			await this.startMessageListener();
+			await retainTransport(this.transport, this);
+			this.transportRetained = true;
+		}
 		if (opts?.advertise !== false && this.transport.advertise) {
 			const skills = this.typedSkills();
 			await this.transport
@@ -652,30 +974,70 @@ export class AgxClient {
 		}, interval);
 	}
 
-	/** Stop the poll interval + release the transport. In-flight `request()` callers
+	/** Stop polling and this client's live listener. In-flight `request()` callers
 	 * are rejected (their result can no longer arrive) rather than left hanging. */
 	async stop(): Promise<void> {
+		this.running = false;
+		this.stopping = true;
+		for (const queued of this.queuedTaskRuns.splice(0)) {
+			queued.cancel();
+		}
+		if (this.pollTimer) {
+			clearTimeout(this.pollTimer);
+			this.pollTimer = undefined;
+		}
+		const startPromise = this.startPromise;
+		if (startPromise) {
+			try {
+				await startPromise;
+			} catch {
+				// start() reports its own failure; still release its resources here.
+			}
+		}
 		this.running = false;
 		if (this.pollTimer) {
 			clearTimeout(this.pollTimer);
 			this.pollTimer = undefined;
 		}
-		for (const p of this.pending.values()) {
+		this.started = false;
+		this.unsubscribeTransportListeners();
+		this.receiptListeners.clear();
+		for (const [taskId, p] of this.pending) {
+			if (p.timer) {
+				clearTimeout(p.timer);
+			}
+			const error = new Error("AGX client stopped");
+			p.reject(error);
+			p.onError?.(error);
+			p.cancelRequested = true;
+			if (p.published) {
+				void this.sendTaskCancel(p.peer, taskId);
+			}
+		}
+		this.pending.clear();
+		for (const p of this.pendingTaskInputs.values()) {
 			if (p.timer) {
 				clearTimeout(p.timer);
 			}
 			p.reject(new Error("AGX client stopped"));
 		}
-		this.pending.clear();
-		await this.transport.stop?.();
+		this.pendingTaskInputs.clear();
+		while (this.cancellationSends.size > 0) {
+			await Promise.all([...this.cancellationSends]);
+		}
+		if (this.transportRetained) {
+			this.transportRetained = false;
+			await releaseTransport(this.transport, this);
+		}
 	}
 
 	private async dispatchMessage(msg: AgxIncomingMessage): Promise<void> {
 		if (msg.contentType === TASK_CONTENT_TYPE) {
 			// `contentType` is peer-supplied, so a task label can't be trusted to mean
 			// "this is task traffic for me". Consume it as a task ONLY when we can
-			// actually service it: a request for a capability WE registered, or a
-			// result correlated to a pending request of OURS. Anything else — an
+			// actually service it: a request for a capability WE registered, a result
+			// correlated to a pending request of OURS, or an input correlated to a
+			// handler waiting for it. Anything else — an
 			// unknown capability, an unmatched/late result, a malformed envelope — is
 			// deliberately NOT auto-replied to (a reply would let any peer coax a
 			// signed event out of this identity) and NOT silently dropped; it falls
@@ -688,12 +1050,61 @@ export class AgxClient {
 				return;
 			}
 			if (env?.t === "res" && this.pending.has(env.taskId)) {
-				this.resolvePending(msg, env);
+				await this.resolvePending(msg, env);
 				return;
+			}
+			if (env?.t === "input") {
+				const key = this.taskInputKey(env.taskId, env.inputRequestId);
+				if (this.pendingTaskInputs.has(key)) {
+					this.resolveTaskInput(msg, env);
+					return;
+				}
+			}
+			if (env?.t === "cancel") {
+				this.cancelInboundTask(msg, env);
+				return;
+			}
+			if (!env) {
+				const pending = this.pending.get(msg.contextId);
+				if (pending && this.normalizeId(msg.from) === pending.peer) {
+					pending.onError?.(new Error("TaskNotFoundError"));
+				}
 			}
 			// fall through: not a task we service → treat as a plain message.
 		}
 		await this.onMessage?.(msg);
+	}
+
+	private async dispatchReceipt(receipt: AgxIncomingReceipt): Promise<void> {
+		this.receiptListeners.forEach((listener) => listener(receipt));
+		await this.onReceipt?.(receipt);
+	}
+
+	private async dispatchLiveEvent(
+		kind: "message" | "receipt",
+		event: AgxIncomingMessage | AgxIncomingReceipt,
+	): Promise<void> {
+		if (event.createdAt > Math.floor(Date.now() / 1000) + MAX_FUTURE_SKEW_SEC) {
+			return;
+		}
+		try {
+			await this.dispatchOnce(event, async () => {
+				if (this.ignore?.(event) === true) {
+					return;
+				}
+				if ("receipt" in event) {
+					await this.dispatchReceipt(event);
+				} else {
+					await this.dispatchMessage(event);
+				}
+			});
+		} catch (err) {
+			this.log.error?.(`AGX: live ${kind} dispatch failed; poll will retry`, {
+				eventId: event.eventId,
+				from: event.from,
+				error: String(err),
+			});
+		}
 	}
 
 	private async handleTaskRequest(
@@ -764,6 +1175,18 @@ export class AgxClient {
 				return;
 			}
 		}
+		const peer = this.normalizeId(msg.from);
+		const activeTaskKey = this.activeInboundTaskKey(peer, env.taskId);
+		if (this.activeInboundTasks.has(activeTaskKey)) {
+			this.log.warn?.("AGX: duplicate active task ID; dropping", {
+				taskId: env.taskId,
+				from: msg.from,
+			});
+			return;
+		}
+		this.activeInboundTasks.set(activeTaskKey, {
+			canceled: false,
+		});
 		// Best-effort delivery receipt (the task was accepted for processing).
 		await this.transport
 			.publishReceipt(msg.from, {
@@ -783,22 +1206,30 @@ export class AgxClient {
 			transportId: msg.transportId,
 			sentAt: msg.sentAt,
 		};
-		if (this.maxConcurrentTasks === 1) {
-			await this.runTask(msg, env, registered, task);
-			return;
+		try {
+			const scheduled = this.scheduleTask(
+				(onInputRequired, releaseSlot, acquireSlot) =>
+					this.runTask(
+						msg,
+						env,
+						registered,
+						task,
+						onInputRequired,
+						releaseSlot,
+						acquireSlot,
+					),
+				env.taskId,
+			);
+			if (!(await scheduled.started)) {
+				throw new Error("AGX client stopped before the task handler started");
+			}
+			if (this.maxConcurrentTasks === 1) {
+				await Promise.race([scheduled.completion, scheduled.inputRequired]);
+			}
+		} catch (error) {
+			this.activeInboundTasks.delete(activeTaskKey);
+			throw error;
 		}
-		while (this.runningTasks.size >= this.maxConcurrentTasks) {
-			await Promise.race(this.runningTasks);
-		}
-		const running: Promise<void> = this.runTask(msg, env, registered, task)
-			.catch((err) =>
-				this.log.error?.("AGX: task failed outside its handler", {
-					taskId: env.taskId,
-					error: String(err),
-				}),
-			)
-			.finally(() => this.runningTasks.delete(running));
-		this.runningTasks.add(running);
 	}
 
 	/** Resolves once no task handler is running outside `pump()`. */
@@ -808,15 +1239,218 @@ export class AgxClient {
 		}
 	}
 
+	private scheduleTask(
+		run: (
+			onInputRequired: () => void,
+			releaseSlot: () => void,
+			acquireSlot: () => Promise<void>,
+		) => Promise<void>,
+		taskId: string,
+	): {
+		completion: Promise<void>;
+		inputRequired: Promise<void>;
+		started: Promise<boolean>;
+	} {
+		let resolveCompletion!: () => void;
+		let resolveInputRequired!: () => void;
+		let resolveStarted!: (started: boolean) => void;
+		const completion = new Promise<void>((resolve) => {
+			resolveCompletion = resolve;
+		});
+		const inputRequired = new Promise<void>((resolve) => {
+			resolveInputRequired = resolve;
+		});
+		const started = new Promise<boolean>((resolve) => {
+			resolveStarted = resolve;
+		});
+		const scheduled = { completion, inputRequired, started };
+		this.runningTasks.add(completion);
+
+		let holdingSlot = false;
+		const releaseSlot = () => {
+			if (!holdingSlot) return;
+			holdingSlot = false;
+			this.activeTaskCount -= 1;
+			this.queuedTaskRuns.shift()?.start();
+		};
+		const acquireSlot = (): Promise<void> => {
+			if (this.stopping) {
+				// NOT AgxTaskCanceled: that error suppresses the task's result
+				// (runTask treats it as a requester cancel). A stop that breaks a
+				// mid-task slot wait must FAIL the task — a published `failed`
+				// result — or the requester is left to time out in the dark.
+				return Promise.reject(
+					new Error("AGX client stopped while waiting for a task slot"),
+				);
+			}
+			if (holdingSlot) return Promise.resolve();
+			if (this.activeTaskCount < this.maxConcurrentTasks) {
+				holdingSlot = true;
+				this.activeTaskCount += 1;
+				return Promise.resolve();
+			}
+			return new Promise<void>((resolve, reject) => {
+				if (this.queuedTaskRuns.length >= MAX_QUEUED_TASK_RUNS) {
+					reject(new AgxTaskQueueFull("AGX task queue is full"));
+					return;
+				}
+				this.queuedTaskRuns.push({
+					start: () => {
+						holdingSlot = true;
+						this.activeTaskCount += 1;
+						resolve();
+					},
+					// Same rule as the check above: a stop that breaks this wait
+					// fails the task with a result, never silently.
+					cancel: () =>
+						reject(
+							new Error("AGX client stopped while waiting for a task slot"),
+						),
+				});
+			});
+		};
+		const start = () => {
+			resolveStarted(true);
+			holdingSlot = true;
+			this.activeTaskCount += 1;
+			void run(() => {
+				releaseSlot();
+				resolveInputRequired();
+			}, releaseSlot, acquireSlot)
+				.catch((err) =>
+					this.log.error?.("AGX: task failed outside its handler", {
+						taskId,
+						error: String(err),
+					}),
+				)
+				.finally(() => {
+					releaseSlot();
+					this.runningTasks.delete(completion);
+					resolveCompletion();
+				});
+		};
+		const cancel = () => {
+			resolveStarted(false);
+			this.runningTasks.delete(completion);
+			resolveCompletion();
+		};
+
+		if (this.stopping) {
+			cancel();
+		} else if (this.activeTaskCount < this.maxConcurrentTasks) {
+			start();
+		} else {
+			if (this.queuedTaskRuns.length >= MAX_QUEUED_TASK_RUNS) {
+				this.runningTasks.delete(completion);
+				resolveCompletion();
+				throw new AgxTaskQueueFull("AGX task queue is full");
+			}
+			this.queuedTaskRuns.push({ start, cancel });
+		}
+		return scheduled;
+	}
+
 	/** Run a task's handler and send its result. */
 	private async runTask(
 		msg: AgxIncomingMessage,
 		env: TaskRequestEnvelope,
 		registered: RegisteredTaskHandler,
 		task: Task,
+		onInputRequired: () => void,
+		releaseSlot: () => void,
+		acquireSlot: () => Promise<void>,
 	): Promise<void> {
+		const active = this.activeInboundTasks.get(
+			this.activeInboundTaskKey(this.normalizeId(msg.from), env.taskId),
+		);
+		const deadline =
+			env.timeoutMs && env.timeoutMs > 0
+				? Date.now() + env.timeoutMs
+				: undefined;
+		let waitingForInput = false;
 		try {
-			const output = await registered.handler(task);
+			if (active?.canceled) return;
+			const output = await registered.handler(task, {
+				from: msg.from,
+				capability: env.capability,
+				eventId: msg.eventId,
+				requestInput: async (requirement) => {
+					if (env.supportsInput !== true) {
+						throw new AgxPublicError(INPUT_UNSUPPORTED_ERROR);
+					}
+					if (active?.canceled) {
+						throw new AgxTaskCanceled();
+					}
+					if (waitingForInput) {
+						throw new AgxPublicError(
+							"Only one input requirement may be pending per task",
+						);
+					}
+					waitingForInput = true;
+					const inputRequestId = randomId();
+					if (this.pendingTaskInputs.size >= this.maxPendingTaskInputs) {
+						waitingForInput = false;
+						throw new AgxPublicError(
+							"Agent has reached its limit for pending input requirements",
+						);
+					}
+					const remainingTaskMs =
+						deadline === undefined ? undefined : deadline - Date.now();
+					if (remainingTaskMs !== undefined && remainingTaskMs <= 0) {
+						waitingForInput = false;
+						throw new Error("AGX task timed out while waiting for input");
+					}
+					const requestedTimeout =
+						requirement.timeoutMs && requirement.timeoutMs > 0
+							? requirement.timeoutMs
+							: this.requestTimeoutMs > 0
+								? this.requestTimeoutMs
+								: this.maxInputTimeoutMs;
+					const timeoutMs = Math.max(
+						1,
+						Math.min(
+							requestedTimeout,
+							this.maxInputTimeoutMs,
+							remainingTaskMs ?? Number.POSITIVE_INFINITY,
+						),
+					);
+					const inputPromise = this.waitForTaskInput(
+						env.taskId,
+						inputRequestId,
+						msg.from,
+						timeoutMs,
+					);
+					releaseSlot();
+					const effectiveRequirement = {
+						...requirement,
+						timeoutMs,
+					};
+					const sent = await this.sendResult(msg.from, env.taskId, {
+						status: "input-required",
+						inputRequestId,
+						requirement: effectiveRequirement,
+					});
+					if (!sent) {
+						this.rejectTaskInput(
+							env.taskId,
+							inputRequestId,
+							new Error("AGX failed to send the input requirement"),
+						);
+					}
+					onInputRequired();
+					try {
+						const input = await inputPromise;
+						await acquireSlot();
+						if (active?.canceled) {
+							throw new AgxTaskCanceled();
+						}
+						return input;
+					} finally {
+						waitingForInput = false;
+					}
+				},
+			});
+			if (active?.canceled) return;
 			if (registered.contract?.outputSchema) {
 				const problem = validateAgxJsonPayload(
 					registered.contract.outputSchema,
@@ -840,6 +1474,9 @@ export class AgxClient {
 				output,
 			});
 		} catch (err) {
+			if (err instanceof AgxTaskCanceled || active?.canceled) {
+				return;
+			}
 			if (err instanceof AgxTaskDeclined) {
 				// The host left this task to something else that will answer it: no
 				// result from here, and the pump records it as handled.
@@ -869,6 +1506,10 @@ export class AgxClient {
 					? (err as AgxPublicError).message
 					: "handler failed",
 			});
+		} finally {
+			this.activeInboundTasks.delete(
+				this.activeInboundTaskKey(this.normalizeId(msg.from), env.taskId),
+			);
 		}
 	}
 
@@ -876,25 +1517,32 @@ export class AgxClient {
 		to: string,
 		taskId: string,
 		result: {
-			status: "completed" | "failed";
+			status: "input-required";
+			inputRequestId: string;
+			requirement: InputRequirement;
+		} | {
+			status: "completed";
 			output?: unknown;
+		} | {
+			status: "failed";
 			error?: string;
 		},
-	): Promise<void> {
-		let env: TaskEnvelope = {
+	): Promise<boolean> {
+		let env: TaskResultEnvelope = {
 			t: "res",
 			taskId,
-			status: result.status,
-			output: result.output,
-			error: result.error,
+			...result,
 		};
 		let text = encodeTaskEnvelope(env);
-		// A too-large result would be truncated into an unparseable envelope, so the
-		// initiator would time out. Reply with a clean failure instead.
+		// Never truncate an envelope. Terminal results fall back to a compact
+		// failure; an oversized input requirement is reported to the waiting handler.
 		if (!this.fitsWire(text)) {
-			this.log.warn?.("AGX: task result too large; sending failure", {
+			this.log.warn?.("AGX: task result exceeds the transport size limit", {
 				taskId,
 			});
+			if (result.status === "input-required") {
+				return false;
+			}
 			env = {
 				t: "res",
 				taskId,
@@ -903,24 +1551,26 @@ export class AgxClient {
 			};
 			text = encodeTaskEnvelope(env);
 		}
-		await this.transport
+		const sent = await this.transport
 			.publishMessage(to, {
 				text,
 				contextId: taskId,
 				contentType: TASK_CONTENT_TYPE,
 			})
-			.catch((e) =>
+			.catch((e) => {
 				this.log.error?.("AGX: failed to publish task result", {
 					taskId,
 					error: String(e),
-				}),
-			);
+				});
+				return { ok: false };
+			});
+		return sent.ok;
 	}
 
-	private resolvePending(
+	private async resolvePending(
 		msg: AgxIncomingMessage,
 		env: TaskResultEnvelope,
-	): void {
+	): Promise<void> {
 		const p = this.pending.get(env.taskId);
 		if (!p) {
 			return; // unknown or already-settled result
@@ -937,6 +1587,25 @@ export class AgxClient {
 			});
 			return;
 		}
+
+		if (msg.contextId !== env.taskId) {
+			this.log.warn?.("AGX: task result context mismatch; dropping", {
+				taskId: env.taskId,
+				contextId: msg.contextId,
+			});
+			return;
+		}
+
+		p.onUpdate?.(env);
+		if (env.status === "input-required") {
+			if (!p.onUpdate) {
+				await this.sendTaskCancel(p.peer, env.taskId);
+				this.settlePending(env.taskId, new Error(INPUT_UNSUPPORTED_ERROR));
+				return;
+			}
+			return; // don't delete or settle the task
+		}
+
 		this.pending.delete(env.taskId);
 		if (p.timer) {
 			clearTimeout(p.timer);
@@ -945,6 +1614,176 @@ export class AgxClient {
 			p.resolve(env.output);
 		} else {
 			p.reject(new Error(env.error ?? "task failed"));
+		}
+	}
+
+	private waitForTaskInput(
+		taskId: string,
+		inputRequestId: string,
+		peer: string,
+		timeoutMs: number,
+	): Promise<unknown> {
+		const key = this.taskInputKey(taskId, inputRequestId);
+		if (this.pendingTaskInputs.has(key)) {
+			throw new Error("AGX input request is already pending");
+		}
+		let pending!: PendingTaskInput;
+		const answer = new Promise<unknown>((resolve, reject) => {
+			pending = {
+				taskId,
+				inputRequestId,
+				peer: this.normalizeId(peer),
+				resolve,
+				reject,
+			};
+			if (timeoutMs > 0) {
+				pending.timer = setTimeout(() => {
+					if (this.pendingTaskInputs.get(key) !== pending) return;
+					this.pendingTaskInputs.delete(key);
+					pending.reject(
+						new Error(`AGX input request timed out after ${timeoutMs}ms`),
+					);
+				}, timeoutMs);
+			}
+			this.pendingTaskInputs.set(key, pending);
+		});
+		answer.catch(() => undefined);
+		return answer;
+	}
+
+	private taskInputKey(taskId: string, inputRequestId: string): string {
+		return JSON.stringify([taskId, inputRequestId]);
+	}
+
+	private activeInboundTaskKey(peer: string, taskId: string): string {
+		return JSON.stringify([peer, taskId]);
+	}
+
+	private resolveTaskInput(
+		msg: AgxIncomingMessage,
+		env: TaskInputEnvelope,
+	): void {
+		const key = this.taskInputKey(env.taskId, env.inputRequestId);
+		const pending = this.pendingTaskInputs.get(key);
+		if (!pending) return;
+		if (msg.contextId !== env.taskId) {
+			this.log.warn?.("AGX: task input context mismatch; dropping", {
+				taskId: env.taskId,
+				contextId: msg.contextId,
+			});
+			return;
+		}
+		if (this.normalizeId(msg.from) !== pending.peer) {
+			this.log.warn?.("AGX: task input from unexpected peer; dropping", {
+				taskId: env.taskId,
+				inputRequestId: env.inputRequestId,
+				from: msg.from,
+			});
+			return;
+		}
+		this.pendingTaskInputs.delete(key);
+		if (pending.timer) clearTimeout(pending.timer);
+		pending.resolve(env.input);
+	}
+
+	private cancelInboundTask(
+		msg: AgxIncomingMessage,
+		env: TaskCancelEnvelope,
+	): void {
+		const peer = this.normalizeId(msg.from);
+		const active = this.activeInboundTasks.get(
+			this.activeInboundTaskKey(peer, env.taskId),
+		);
+		if (!active) {
+			// Expected in the common timeout race: the task already completed
+			// (its entry was cleaned up) or never started here. Ignore it —
+			// consumed, never replied to, never surfaced as a plain message.
+			this.log.debug?.(
+				"AGX: cancellation for unknown or finished task; ignoring",
+				{ taskId: env.taskId, from: msg.from },
+			);
+			return;
+		}
+		if (msg.contextId !== env.taskId) {
+			this.log.warn?.("AGX: task cancellation context mismatch; dropping", {
+				taskId: env.taskId,
+				from: msg.from,
+			});
+			return;
+		}
+		active.canceled = true;
+		for (const pending of this.pendingTaskInputs.values()) {
+			if (pending.taskId === env.taskId && pending.peer === peer) {
+				this.rejectTaskInput(
+					env.taskId,
+					pending.inputRequestId,
+					new AgxTaskCanceled(),
+				);
+			}
+		}
+	}
+
+	private sendTaskCancel(to: string, taskId: string): Promise<void> {
+		const env: TaskCancelEnvelope = { t: "cancel", taskId };
+		const text = encodeTaskEnvelope(env);
+		const operation = (async () => {
+			try {
+				const sent = await this.transport.publishMessage(to, {
+					text,
+					contextId: taskId,
+					contentType: TASK_CONTENT_TYPE,
+				});
+				if (!sent.ok) {
+					this.log.warn?.("AGX: task cancellation could not be sent", { taskId });
+				}
+			} catch (error) {
+				this.log.warn?.("AGX: task cancellation could not be sent", {
+					taskId,
+					error: String(error),
+				});
+			}
+		})();
+		this.cancellationSends.add(operation);
+		void operation.finally(() => this.cancellationSends.delete(operation));
+		return operation;
+	}
+
+	private rejectTaskInput(
+		taskId: string,
+		inputRequestId: string,
+		error: Error,
+	): void {
+		const key = this.taskInputKey(taskId, inputRequestId);
+		const pending = this.pendingTaskInputs.get(key);
+		if (!pending) return;
+		this.pendingTaskInputs.delete(key);
+		if (pending.timer) clearTimeout(pending.timer);
+		pending.reject(error);
+	}
+
+	private async sendTaskInput(
+		to: string,
+		taskId: string,
+		inputRequestId: string,
+		input: unknown,
+	): Promise<void> {
+		const env: TaskInputEnvelope = {
+			t: "input",
+			taskId,
+			inputRequestId,
+			input,
+		};
+		const text = encodeTaskEnvelope(env);
+		if (!this.fitsWire(text)) {
+			throw new Error("AGX task input exceeds the transport size limit");
+		}
+		const sent = await this.transport.publishMessage(to, {
+			text,
+			contextId: taskId,
+			contentType: TASK_CONTENT_TYPE,
+		});
+		if (!sent.ok) {
+			throw new Error(`AGX task input could not be sent to ${to}`);
 		}
 	}
 
@@ -959,5 +1798,224 @@ export class AgxClient {
 			clearTimeout(p.timer);
 		}
 		p.reject(error);
+		p.onError?.(error);
+	}
+
+	private async startMessageListener(): Promise<void> {
+		const unsubscribers: Unsubscribe[] = [];
+		const listenerOptions: AgxTransportListenerOptions = {
+			isKnown: async (transportIds) => {
+				if (this.seen.hasMany) {
+					return this.seen.hasMany(transportIds);
+				}
+				const known = new Set<string>();
+				for (const id of transportIds) {
+					if (await this.seen.has(id)) {
+						known.add(id);
+					}
+				}
+				return known;
+			},
+			onDiscarded: async (transportIds) => {
+				if (this.seen.addMany) {
+					await this.seen.addMany(transportIds);
+					return;
+				}
+				for (const id of transportIds) {
+					await this.seen.add(id);
+				}
+			},
+		};
+		try {
+			const unsubscribeMessage = await this.transport.onMessage?.(
+				async (msg: AgxIncomingMessage) => {
+					await this.dispatchLiveEvent("message", msg);
+				},
+				listenerOptions,
+			);
+			if (typeof unsubscribeMessage === "function") {
+				unsubscribers.push(unsubscribeMessage);
+			}
+			const unsubscribeReceipt = await this.transport.onReceipt?.(
+				async (receipt: AgxIncomingReceipt) => {
+					await this.dispatchLiveEvent("receipt", receipt);
+				},
+				listenerOptions,
+			);
+			if (typeof unsubscribeReceipt === "function") {
+				unsubscribers.push(unsubscribeReceipt);
+			}
+			this.listenerUnsubscribers = unsubscribers;
+		} catch (error) {
+			for (const unsubscribe of unsubscribers) {
+				unsubscribe();
+			}
+			throw error;
+		}
+	}
+
+	private unsubscribeTransportListeners(): void {
+		const unsubscribers = this.listenerUnsubscribers;
+		this.listenerUnsubscribers = [];
+		for (const unsubscribe of unsubscribers) {
+			unsubscribe();
+		}
+	}
+}
+
+type StreamEventData<Output> = {
+	completed: Output;
+	statusUpdate: "delivered" | "input-required" | "completed" | "failed";
+	inputRequired: InputRequiredUpdate;
+	error: string;
+};
+
+
+/** Progress events and the final result of a streaming task request. */
+export class StreamResponse<Output> {
+	private events = new Map<
+		keyof StreamEventData<Output>,
+		Array<(data: unknown) => unknown>
+	>();
+	private earlyEvents = new Map<
+		keyof StreamEventData<Output>,
+		unknown[]
+	>();
+	private readonly pendingInputs = new Set<string>();
+
+	constructor(
+		taskId: string,
+		/** Resolves with the final output; rejects on failure, timeout, or client stop. */
+		readonly result: Promise<Output>,
+		subscribeToReceipts: (
+			listener: (receipt: AgxIncomingReceipt) => void,
+		) => () => void,
+		private readonly sendInput: (
+			inputRequestId: string,
+			input: unknown,
+		) => Promise<void>,
+		private readonly log: AgxLogger,
+	) {
+		this.result.catch(() => undefined);
+		this.unsubscribeReceipt = subscribeToReceipts((receipt) => {
+			if (
+				receipt.receipt.contextId === taskId &&
+				receipt.receipt.status === "delivered"
+			) {
+				this.emit('statusUpdate', 'delivered');
+			}
+		});
+	}
+	private readonly unsubscribeReceipt: () => void;
+
+	on<Event extends keyof StreamEventData<Output>>(
+		event: Event,
+		listener: (data: StreamEventData<Output>[Event]) => void,
+	): StreamResponse<Output> {
+		const listeners = this.events.get(event) ?? [];
+		listeners.push((data) =>
+			listener(data as StreamEventData<Output>[Event]),
+		);
+		this.events.set(event, listeners);
+		const early = this.earlyEvents.get(event);
+		if (early) {
+			early.forEach((data) =>
+				this.invoke(
+					(value) => listener(value as StreamEventData<Output>[Event]),
+					data,
+					event,
+				),
+			);
+			this.earlyEvents.delete(event);
+		}
+		return this;
+	}
+
+	private emit(
+		event: "completed",
+		data: Output,
+	): void;
+	private emit(
+		event: "statusUpdate",
+		data: StreamEventData<Output>["statusUpdate"],
+	): void;
+	private emit(
+		event: "inputRequired",
+		data: InputRequiredUpdate,
+	): void;
+	private emit(event: "error", data: string): void;
+	private emit(
+		event: keyof StreamEventData<Output>,
+		data: StreamEventData<Output>[keyof StreamEventData<Output>],
+	): void {
+		const listeners = this.events.get(event);
+		if (!listeners?.length) {
+			const early = this.earlyEvents.get(event) ?? [];
+			early.push(data);
+			this.earlyEvents.set(event, early);
+			return;
+		}
+		listeners.forEach((listener) => this.invoke(listener, data, event));
+	}
+
+	private invoke(
+		listener: (data: unknown) => unknown,
+		data: unknown,
+		event: keyof StreamEventData<Output>,
+	): void {
+		try {
+			const result = listener(data);
+			if (result instanceof Promise) {
+				void result.catch((error: unknown) =>
+					this.log.error?.("AGX: stream listener failed", {
+						event,
+						error: String(error),
+					}),
+				);
+			}
+		} catch (error) {
+			this.log.error?.("AGX: stream listener failed", {
+				event,
+				error: String(error),
+			});
+		}
+	}
+
+	[STREAM_HANDLE_UPDATE](update: TaskResultEnvelope): void {
+		this.emit("statusUpdate", update.status);
+		switch (update.status) {
+			case "input-required":
+				this.pendingInputs.add(update.inputRequestId);
+				this.emit("inputRequired", {
+					inputRequestId: update.inputRequestId,
+					requirement: update.requirement,
+				});
+				break;
+			case "completed":
+				this.pendingInputs.clear();
+				this.emit("completed", update.output as Output);
+				this.unsubscribeReceipt();
+				break;
+			case "failed":
+				this.pendingInputs.clear();
+				this.emit("error", update.error ?? "task failed");
+				this.unsubscribeReceipt();
+				break;
+		}
+	}
+
+	[STREAM_HANDLE_ERROR](error: Error): void {
+		this.pendingInputs.clear();
+		this.emit("error", error.message);
+		this.unsubscribeReceipt();
+	}
+
+	/** Send an answer for an input requirement reported by this task. */
+	async provideInput(inputRequestId: string, input: unknown): Promise<void> {
+		if (!this.pendingInputs.has(inputRequestId)) {
+			throw new Error("AGX input request is not pending");
+		}
+		await this.sendInput(inputRequestId, input);
+		this.pendingInputs.delete(inputRequestId);
 	}
 }

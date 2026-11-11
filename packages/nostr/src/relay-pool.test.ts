@@ -21,6 +21,13 @@ let responder: (filter: Filter) => {
 /** Every REQ filter the pool sent, in order. The relay is configured with
  * `filterValidation`, so the exact shape is a production contract, not detail. */
 let sentFilters: Filter[] = [];
+let subscriptionHandlers: Array<{
+	onevent: (event: Event) => void | Promise<void>;
+	onclose?: (reason: string) => void;
+}> = [];
+const { connectRelay } = vi.hoisted(() => ({
+	connectRelay: vi.fn(),
+}));
 /** Per-relay publish outcome. `publishToRelays` is the CLASSIFIER behind the
  * whole `deliveredToPeer` tri-state and had no direct test — nostr-transport
  * mocks it out and hands `kind` in by hand — which is exactly how a fix whose
@@ -34,35 +41,7 @@ vi.mock("nostr-tools", () => ({
 }));
 vi.mock("nostr-tools/relay", () => ({
 	Relay: {
-		connect: vi.fn(async (url: string) => ({
-			onauth: undefined,
-			close: vi.fn(),
-			publish: (_ev: Event) => publisher(url),
-			subscribe(
-				filters: Filter[],
-				h: {
-					onevent: (e: Event) => void;
-					oneose: () => void;
-					onclose?: (reason: string) => void;
-				},
-			) {
-				sentFilters.push(filters[0]);
-				const { events, eose, closed } = responder(filters[0]);
-				queueMicrotask(() => {
-					if (closed !== undefined) {
-						h.onclose?.(closed);
-						return;
-					}
-					for (const ev of events) {
-						h.onevent(ev);
-					}
-					if (eose) {
-						h.oneose();
-					}
-				});
-				return { close: vi.fn() };
-			},
-		})),
+		connect: connectRelay,
 	},
 }));
 
@@ -76,6 +55,7 @@ import {
 	DEFAULT_POLL_LIMIT,
 	fetchByAuthor,
 	fetchByAuthorWithStatus,
+	listenEvents,
 	pollInbox,
 	publishToRelays,
 } from "./relay-pool";
@@ -100,12 +80,148 @@ beforeEach(() => {
 	mockVerify.mockReset();
 	mockVerify.mockReturnValue(true);
 	mockHash.mockImplementation((ev: Event) => ev.id);
+	connectRelay.mockReset();
+	connectRelay.mockImplementation(async (url: string) => ({
+		onauth: undefined,
+		close: vi.fn(),
+		publish: (_ev: Event) => publisher(url),
+		subscribe(
+			filters: Filter[],
+			h: {
+				onevent: (event: Event) => void | Promise<void>;
+				oneose?: () => void;
+				onclose?: (reason: string) => void;
+			},
+		) {
+			subscriptionHandlers.push(h);
+			sentFilters.push(filters[0]);
+			const { events, eose, closed } = responder(filters[0]);
+			queueMicrotask(() => {
+				if (closed !== undefined) {
+					h.onclose?.(closed);
+					return;
+				}
+				for (const event of events) {
+					void h.onevent(event);
+				}
+				if (eose) {
+					h.oneose?.();
+				}
+			});
+			return { close: vi.fn() };
+		},
+	}));
 	responder = () => ({ events: [], eose: true });
 	sentFilters = [];
+	subscriptionHandlers = [];
 	publisher = async () => {};
 });
 afterEach(() => {
 	vi.useRealTimers();
+});
+
+describe("listenEvents", () => {
+	it("subscribes once per relay for gift wraps addressed to the requested pubkey", async () => {
+		const callback = vi.fn();
+		const subscriptions = await listenEvents(
+			undefined as never,
+			["wss://a", "wss://b"],
+			{ pubkey: ME },
+			callback,
+		);
+
+		expect(subscriptions).toHaveLength(2);
+		expect(connectRelay).toHaveBeenNthCalledWith(
+			1,
+			"wss://a",
+			{ enableReconnect: true },
+		);
+		expect(sentFilters).toHaveLength(2);
+		for (const filter of sentFilters) {
+			expect(filter).toMatchObject({
+				kinds: [GIFT_WRAP_KIND],
+				"#p": [ME],
+				since: expect.any(Number),
+				limit: DEFAULT_POLL_LIMIT,
+			});
+			expect(filter.since).toBeGreaterThan(
+				Math.floor(Date.now() / 1000) - 3 * 24 * 60 * 60,
+			);
+		}
+		expect(callback).not.toHaveBeenCalled();
+	});
+
+	it("skips known and expired wraps before decryption and records expirations", async () => {
+		const expired = ev({
+			id: "expired",
+			tags: [["p", ME], ["expiration", "1"]],
+		});
+		const known = ev({ id: "known" });
+		responder = () => ({ events: [expired, known], eose: true });
+		const isKnown = vi.fn(async () => new Set(["known"]));
+		const onDiscarded = vi.fn();
+		const callback = vi.fn();
+		const getPublicKey = vi.fn();
+		await listenEvents(
+			{ getPublicKey } as never,
+			["wss://a"],
+			{ pubkey: ME, isKnown, onDiscarded },
+			callback,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(isKnown).toHaveBeenCalledWith(["expired"]);
+		expect(isKnown).toHaveBeenCalledWith(["known"]);
+		expect(onDiscarded).toHaveBeenCalledWith(["expired"]);
+		expect(callback).not.toHaveBeenCalled();
+		expect(getPublicKey).not.toHaveBeenCalled();
+	});
+
+	it("records unopenable wraps and reports subscription close through the logger", async () => {
+		const onDiscarded = vi.fn();
+		const warn = vi.fn();
+		responder = () => ({ events: [ev({ id: "bad-wrap" })], eose: true });
+		await listenEvents(
+			undefined as never,
+			["wss://a"],
+			{ pubkey: ME, onDiscarded, logger: { warn } },
+			vi.fn(),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(onDiscarded).toHaveBeenCalledWith(["bad-wrap"]);
+
+		subscriptionHandlers[0]?.onclose?.("relay closed the subscription");
+		expect(warn).toHaveBeenCalledWith(
+			"AGX: live relay subscription closed",
+			expect.objectContaining({ relay: "wss://a" }),
+		);
+	});
+
+	it("reports relay connection failures through the configured logger", async () => {
+		const warn = vi.fn();
+		connectRelay.mockRejectedValueOnce(new Error("offline"));
+
+		await expect(
+			listenEvents(
+				undefined as never,
+				["wss://offline"],
+				{ pubkey: ME, logger: { warn } },
+				vi.fn(),
+			),
+		).resolves.toEqual([]);
+
+		expect(warn).toHaveBeenCalledWith(
+			"AGX: failed to subscribe to relay",
+			{ relay: "wss://offline", error: "offline" },
+		);
+	});
+
+	it("returns no subscriptions when no relays are configured", async () => {
+		await expect(
+			listenEvents(undefined as never, [], { pubkey: ME }, vi.fn()),
+		).resolves.toEqual([]);
+		expect(sentFilters).toEqual([]);
+	});
 });
 
 describe("pollInbox client-side filter re-enforcement (untrusted relay)", () => {

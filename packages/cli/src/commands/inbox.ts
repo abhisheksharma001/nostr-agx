@@ -85,7 +85,11 @@ export async function inboxCommand(options: InboxOptions): Promise<void> {
 			},
 			onReceipt: (receipt) => collector.onReceipt(receipt),
 		});
-		await client.start({ pollIntervalMs: 0, advertise: false });
+		await client.start({
+			pollIntervalMs: 0,
+			advertise: false,
+			liveDispatch: false,
+		});
 
 		let truncated = false;
 		let cursor = state.cursor;
