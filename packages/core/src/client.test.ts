@@ -662,6 +662,42 @@ describe("AgxClient task request/response", () => {
 			await expect(stream.result).rejects.toThrow("AGX client stopped");
 		});
 
+		it("sends no working update after the requester cancels the task", async () => {
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+			});
+			let release: () => void = () => undefined;
+			const released = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			bob.handle("long.task", async (_task, ctx) => {
+				await ctx.report("before cancel");
+				await released;
+				await ctx.report("after cancel");
+				return "done";
+			});
+			pushTaskEnvelope(BOB, ALICE, {
+				t: "req",
+				taskId: "cancel-w",
+				capability: "long.task",
+				payload: {},
+				supportsWorking: true,
+				timeoutMs: 0,
+			});
+			await bob.pump();
+			pushTaskEnvelope(BOB, ALICE, { t: "cancel", taskId: "cancel-w" });
+			await bob.pump();
+			release();
+			await bob.tasksSettled();
+
+			const wire = (bus.inbox.get(ALICE) ?? []).map((message) => parseTaskEnvelope(message.text));
+			expect(wire).toEqual([
+				{ t: "res", taskId: "cancel-w", status: "working", seq: 1, message: "before cancel" },
+			]);
+		});
+
 		it("keeps a plain request() without onTaskStatus free of working updates end to end", async () => {
 			const alice = new AgxClient({ transport: bus.transport(ALICE) });
 			const bob = reportingBob();
