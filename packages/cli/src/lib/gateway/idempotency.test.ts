@@ -121,6 +121,42 @@ describe("TaskOperationStore", () => {
 		restarted.close();
 	});
 
+	it("keeps waiting request correlation across store reconstruction and shutdown", async () => {
+		const store = new TaskOperationStore("test");
+		let release: (() => void) | undefined;
+		store.submit("credential-a", "waiting", {}, async (operationId: string) => {
+			const base = {
+				key: operationId,
+				taskId: "agx-task-1",
+				peer: "a".repeat(64),
+				capability: "invoice.waiting",
+				deadlineAt: Date.now() + 60_000,
+			};
+			store.save({ ...base, phase: "publishing" });
+			store.save({ ...base, phase: "waiting" });
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { status: "completed" };
+		});
+		store.close();
+
+		const restarted = new TaskOperationStore("test");
+		expect(restarted.list()).toEqual([
+			expect.objectContaining({
+				taskId: "agx-task-1",
+				peer: "a".repeat(64),
+				capability: "invoice.waiting",
+				phase: "waiting",
+			}),
+		]);
+		restarted.close();
+		const third = new TaskOperationStore("test");
+		expect(third.list()).toEqual([expect.objectContaining({ taskId: "agx-task-1", phase: "waiting" })]);
+		release?.();
+		third.close();
+	});
+
 	it("retries failures that prove no task was published", async () => {
 		const store = new TaskOperationStore("test");
 		const failures = [

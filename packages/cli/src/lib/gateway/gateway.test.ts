@@ -517,7 +517,7 @@ describe("agx gateway: outbound", () => {
 		}
 	}, 30_000);
 
-	it("restores completed idempotent results and reports unresolved work after restart", async () => {
+	it("restores completed and pending idempotent results after restart", async () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 4 });
 		let completedRuns = 0;
 		reviewer.client.handle("invoice.saved", () => ({ run: ++completedRuns }));
@@ -546,7 +546,7 @@ describe("agx gateway: outbound", () => {
 			});
 			return { run: pendingRuns };
 		});
-		const pendingBody = JSON.stringify({ peer: reviewer.npub, capability: "invoice.unknown", timeoutSec: 1 });
+		const pendingBody = JSON.stringify({ peer: reviewer.npub, capability: "invoice.unknown", timeoutSec: 20 });
 		const pending = api("/v1/tasks", {
 			method: "POST",
 			headers: { "idempotency-key": "restart-pending" },
@@ -557,21 +557,15 @@ describe("agx gateway: outbound", () => {
 		await gateway.close();
 		await expect(pending).rejects.toThrow();
 		gateway = await startGateway(gatewayOptions());
-		const unknown = await api("/v1/tasks", {
+		const retry = api("/v1/tasks", {
 			method: "POST",
 			headers: { "idempotency-key": "restart-pending" },
 			body: pendingBody,
 		});
-		expect(unknown.status).toBe(409);
-		expect(await json(unknown)).toMatchObject({ error: { code: "result_unknown" } });
 		release();
-		await new Promise((resolve) => setTimeout(resolve, 1200));
-		const stillUnknown = await api("/v1/tasks", {
-			method: "POST",
-			headers: { "idempotency-key": "restart-pending" },
-			body: pendingBody,
-		});
-		expect(stillUnknown.status).toBe(409);
+		const recovered = await pumping(retry, reviewer.client);
+		expect(recovered.status).toBe(200);
+		expect(await json(recovered)).toMatchObject({ status: "completed", output: { run: 1 } });
 		expect(pendingRuns).toBe(1);
 	}, 45_000);
 
@@ -669,7 +663,7 @@ describe("agx gateway: outbound", () => {
 		expect(await backgroundTask(failedId)).toEqual(failed);
 	}, 45_000);
 
-	it("reports interrupted background work as unknown without rerunning it", async () => {
+	it("recovers interrupted background work without rerunning it", async () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
 		let runs = 0;
 		let release: () => void = () => undefined;
@@ -689,11 +683,14 @@ describe("agx gateway: outbound", () => {
 		await waitForPeer(() => runs === 1, reviewer.client);
 		await gateway.close();
 		gateway = await startGateway(gatewayOptions());
-		const unknown = await backgroundTask(id);
-		expect(unknown).toMatchObject({ id, status: "failed", error: { code: "result_unknown" } });
+		expect(await backgroundTask(id)).toMatchObject({ id, status: "running" });
 		release();
-		await new Promise((resolve) => setTimeout(resolve, 1200));
-		expect(await backgroundTask(id)).toEqual(unknown);
+		const completed = await settledBackgroundTask(id, reviewer.client);
+		expect(completed).toMatchObject({
+			id,
+			status: "completed",
+			result: { status: "completed", output: { run: 1 } },
+		});
 		expect(runs).toBe(1);
 	}, 45_000);
 });
