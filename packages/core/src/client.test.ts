@@ -737,6 +737,45 @@ describe("AgxClient task request/response", () => {
 			]);
 		});
 
+		it("sends a pending working update before input-required, not after it", async () => {
+			const base = bus.transport(BOB);
+			// A slow relay for working updates: a report still publishing when the
+			// handler asks for input must land before the input-required result.
+			const slowWorking: AgxTransport = {
+				...base,
+				async publishMessage(to, message) {
+					const envelope = parseTaskEnvelope(message.text);
+					const isWorking = envelope?.t === "res" && envelope.status === "working";
+					await new Promise((resolve) => setTimeout(resolve, isWorking ? 30 : 10));
+					return base.publishMessage(to, message);
+				},
+			};
+			const bob = new AgxClient({ transport: slowWorking, authorize: "accept-all" });
+			bob.handle("ask", async (_task, ctx) => {
+				void ctx.report("prep"); // still publishing when the input is requested
+				return ctx.requestInput({ prompt: "Continue?" });
+			});
+			pushTaskEnvelope(BOB, ALICE, {
+				t: "req",
+				taskId: "race-input",
+				capability: "ask",
+				payload: {},
+				supportsInput: true,
+				supportsWorking: true,
+				timeoutMs: 0,
+			});
+			await bob.pump();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			const statuses = (bus.inbox.get(ALICE) ?? []).map((message) => {
+				const envelope = parseTaskEnvelope(message.text);
+				return envelope?.t === "res" ? envelope.status : envelope?.t;
+			});
+			expect(statuses).toEqual(["working", "input-required"]);
+			await bob.stop();
+			await bob.tasksSettled();
+		});
+
 		it("sends no working update after the requester cancels the task", async () => {
 			const bob = new AgxClient({
 				transport: bus.transport(BOB),
