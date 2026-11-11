@@ -222,6 +222,37 @@ describe("TaskOperationStore", () => {
 		older.close();
 	});
 
+	it("loads stored waiting work over every operation limit without throwing or dropping it", async () => {
+		const store = new TaskOperationStore("test");
+		const keys: string[] = [];
+		for (let index = 0; index < 4; index++) {
+			store.submit("credential-a", `waiting-${index}`, {}, async (operationId: string) => {
+				keys.push(operationId);
+				const base = {
+					key: operationId,
+					taskId: `agx-task-${index}`,
+					peer: "a".repeat(64),
+					capability: "invoice.waiting",
+					deadlineAt: Date.now() + 60_000,
+				};
+				store.save({ ...base, phase: "publishing" });
+				store.save({ ...base, phase: "waiting" });
+				return new Promise<Record<string, unknown>>(() => undefined);
+			});
+		}
+		store.close();
+		// Limits lowered since the work was admitted. Recoverable work is never trimmed,
+		// and restore must not throw: the gateway would then fail on every start.
+		const restarted = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 3,
+			maxOperations: 3,
+			maxInFlight: 1,
+			maxBackgroundInFlight: 1,
+		});
+		expect(restarted.list().map((record) => record.key).sort()).toEqual([...keys].sort());
+		restarted.close();
+	});
+
 	it("refuses to remove waiting correlation once closed, so a restart can still recover it", async () => {
 		const store = new TaskOperationStore("test");
 		let operationKey = "";
