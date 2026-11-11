@@ -27,21 +27,37 @@ type RecoveringClient = AgxClient & {
 class MemoryPendingStore {
 	readonly records = new Map<string, PendingRecord>();
 	readonly removed: string[] = [];
+	readonly saves: PendingPhase[] = [];
 	failSavePhase?: PendingPhase;
 	failRemove = false;
+	/** Refuse to save a key that was already removed, as a settled gateway operation does. */
+	rejectSaveAfterRemove = false;
+	/** When set, the next list() or remove() waits for it (an asynchronous store). */
+	listGate?: Promise<void>;
+	removeGate?: Promise<void>;
 
-	list(): PendingRecord[] {
-		return [...this.records.values()].map((record) => ({ ...record }));
+	list(): PendingRecord[] | Promise<PendingRecord[]> {
+		const read = () => [...this.records.values()].map((record) => ({ ...record }));
+		const gate = this.listGate;
+		this.listGate = undefined;
+		return gate ? gate.then(read) : read();
 	}
 
 	save(record: PendingRecord): void {
+		this.saves.push(record.phase);
 		if (this.failSavePhase === record.phase) {
 			throw new Error("disk full");
+		}
+		if (this.rejectSaveAfterRemove && this.removed.includes(record.key)) {
+			throw new Error("operation already settled");
 		}
 		this.records.set(record.key, { ...record });
 	}
 
-	remove(key: string): void {
+	remove(key: string): void | Promise<void> {
+		const gate = this.removeGate;
+		this.removeGate = undefined;
+		if (gate) return gate.then(() => this.remove(key));
 		if (this.failRemove) {
 			throw new Error("read-only disk");
 		}
@@ -351,5 +367,156 @@ describe("durable pending-request recovery", () => {
 		seed(malformed, { key: "local-1", taskId: "task-1", peer: "" });
 		const client = durableClient(bus, malformed);
 		await expect(restore(client)).rejects.toThrow(/invalid|record/i);
+	});
+});
+
+/** Holds task requests (not cancels) until released, like a slow relay acknowledgement. */
+function gatedTransport(bus: MemoryTransport) {
+	const base = bus.transport();
+	let gate: Promise<void> | undefined;
+	let open: () => void = () => undefined;
+	const transport: AgxTransport = {
+		...base,
+		publishMessage: async (to, message) => {
+			if (gate && parseTaskEnvelope(message.text)?.t === "req") await gate;
+			return base.publishMessage(to, message);
+		},
+	};
+	return {
+		transport,
+		hold() {
+			gate = new Promise<void>((resolve) => {
+				open = resolve;
+			});
+		},
+		release: () => open(),
+	};
+}
+
+function clientOn(transport: AgxTransport, store: MemoryPendingStore): RecoveringClient {
+	return new AgxClient({
+		transport,
+		pendingRequests: store,
+		startCursor: 0,
+	} as unknown as ConstructorParameters<typeof AgxClient>[0]) as RecoveringClient;
+}
+
+function cancels(bus: MemoryTransport): number {
+	return bus.sent.filter((message) => parseTaskEnvelope(message.text)?.t === "cancel").length;
+}
+
+function gate(): { promise: Promise<void>; open: () => void } {
+	let open: () => void = () => undefined;
+	const promise = new Promise<void>((resolve) => {
+		open = resolve;
+	});
+	return { promise, open };
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+describe("durable pending-request races", () => {
+	it("keeps the waiting record and sends no cancel when a restart stop lands during publish", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const gated = gatedTransport(bus);
+		const store = new MemoryPendingStore();
+		const first = clientOn(gated.transport, store);
+		await restore(first);
+		gated.hold();
+		const original = first.request(BOB, "math.add", {}, { timeoutMs: 0 });
+		original.catch(() => undefined);
+		await waitFor(() => store.records.size === 1);
+		await first.stop({ preservePending: true });
+		gated.release();
+		await expect(original).rejects.toThrow("AGX client stopped");
+		await waitFor(() => bus.requests(BOB).length === 1);
+		await settle();
+		const [taskId] = bus.requests(BOB);
+		expect([...store.records.values()]).toEqual([expect.objectContaining({ taskId, phase: "waiting" })]);
+		expect(cancels(bus)).toBe(0);
+
+		const second = durableClient(bus, store);
+		const [recovered] = await restore(second);
+		bus.result(ALICE, BOB, taskId);
+		await second.pump();
+		await expect(recovered.result).resolves.toEqual({ ok: true });
+		expect(bus.requests(BOB)).toEqual([taskId]);
+		await second.stop();
+	});
+
+	it("does not write back or cancel a request whose result beats the publish acknowledgement", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const gated = gatedTransport(bus);
+		const store = new MemoryPendingStore();
+		store.rejectSaveAfterRemove = true;
+		const client = clientOn(gated.transport, store);
+		await restore(client);
+		gated.hold();
+		const result = client.request(BOB, "math.add", {}, { timeoutMs: 0 });
+		await waitFor(() => store.records.size === 1);
+		const [{ taskId }] = [...store.records.values()];
+		bus.result(ALICE, BOB, taskId);
+		await client.pump();
+		gated.release();
+		await expect(result).resolves.toEqual({ ok: true });
+		await settle();
+		expect(store.saves).toEqual(["publishing"]);
+		expect(store.records.size).toBe(0);
+		expect(cancels(bus)).toBe(0);
+		await client.stop();
+	});
+
+	it("lets a genuine result win when the deadline passes while its record is being removed", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		seed(store, { key: "local-1", taskId: "task-1", deadlineAt: Date.now() + 60 });
+		const client = durableClient(bus, store);
+		const [recovered] = await restore(client);
+		const removal = gate();
+		store.removeGate = removal.promise;
+		bus.result(ALICE, BOB, "task-1");
+		const pumping = client.pump();
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		removal.open();
+		await pumping;
+		await expect(recovered.result).resolves.toEqual({ ok: true });
+		expect(store.records.size).toBe(0);
+		expect(cancels(bus)).toBe(0);
+		await client.stop();
+	});
+
+	it("does not register restored requests on a client stopped during restore", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		seed(store, { key: "local-1", taskId: "task-1", deadlineAt: null });
+		const listing = gate();
+		store.listGate = listing.promise;
+		const client = durableClient(bus, store);
+		const restoring = restore(client);
+		restoring.catch(() => undefined);
+		await client.stop({ preservePending: true });
+		listing.open();
+		await expect(restoring).rejects.toThrow("AGX client stopped");
+		expect(store.records.has("local-1")).toBe(true);
+	});
+
+	it("says whether a storage failure happened before anything was published", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		store.failSavePhase = "publishing";
+		const client = durableClient(bus, store);
+		await restore(client);
+		await expect(client.request(BOB, "math.add", {}, { timeoutMs: 0 })).rejects.toMatchObject({
+			code: "pending_request_store_failed",
+			mayHavePublished: false,
+		});
+		expect(bus.requests(BOB)).toEqual([]);
+		store.failSavePhase = "waiting";
+		await expect(client.request(BOB, "math.add", {}, { timeoutMs: 0 })).rejects.toMatchObject({
+			code: "pending_request_store_failed",
+			mayHavePublished: true,
+		});
+		expect(bus.requests(BOB)).toHaveLength(1);
+		await client.stop();
 	});
 });
