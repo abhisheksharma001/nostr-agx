@@ -451,6 +451,142 @@ describe("AgxClient task request/response", () => {
 		await expect(pending).rejects.toThrow(/timed out/);
 	});
 
+	describe("contract checks keep their place in the task lifecycle", () => {
+		const invoiceContract = {
+			description: "Review an invoice",
+			inputSchema: {
+				type: "object",
+				required: ["amount"],
+				properties: { amount: { type: "number" } },
+			},
+			outputSchema: {
+				type: "object",
+				required: ["approved"],
+				properties: { approved: { type: "boolean" } },
+			},
+		};
+		const sendFromAlice = (envelope: Parameters<typeof encodeTaskEnvelope>[0]) =>
+			bus.transport(ALICE).publishMessage(BOB, {
+				text: encodeTaskEnvelope(envelope),
+				contextId: envelope.taskId,
+				contentType: TASK_CONTENT_TYPE,
+			});
+		const resultsSentToAlice = () =>
+			(bus.inbox.get(ALICE) ?? []).flatMap((message) => {
+				const envelope = parseTaskEnvelope(message.text);
+				return envelope?.t === "res" ? [envelope] : [];
+			});
+		function gate() {
+			let open: () => void = () => undefined;
+			const opened = new Promise<void>((resolve) => {
+				open = resolve;
+			});
+			return { opened, open };
+		}
+
+		it("accepts a retry under the same task id after invalid_input", async () => {
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			const handler = vi.fn(() => ({ approved: true }));
+			bob.handle("invoice.review", handler, invoiceContract);
+			const request = (payload: unknown) => ({
+				t: "req" as const,
+				taskId: "retry-1",
+				capability: "invoice.review",
+				payload,
+			});
+
+			await sendFromAlice(request({ amount: "hello" }));
+			await bob.pump();
+			await bob.tasksSettled();
+			expect(handler).not.toHaveBeenCalled();
+			expect(resultsSentToAlice()).toEqual([
+				expect.objectContaining({ status: "failed", error: "invalid_input" }),
+			]);
+
+			await sendFromAlice(request({ amount: 5 }));
+			await bob.pump();
+			await bob.tasksSettled();
+			expect(handler).toHaveBeenCalledTimes(1);
+			expect(resultsSentToAlice().at(-1)).toEqual(
+				expect.objectContaining({ status: "completed", output: { approved: true } }),
+			);
+		});
+
+		it("answers invalid input at once instead of queueing it for a free slot", async () => {
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+			});
+			const slow = gate();
+			bob.handle("slow", () => slow.opened.then(() => "ok"));
+			bob.handle("invoice.review", () => ({ approved: true }), invoiceContract);
+			await sendFromAlice({ t: "req", taskId: "slow-1", capability: "slow", payload: {} });
+			await sendFromAlice({ t: "req", taskId: "slow-2", capability: "slow", payload: {} });
+			await sendFromAlice({
+				t: "req",
+				taskId: "bad-1",
+				capability: "invoice.review",
+				payload: { amount: "hello" },
+			});
+
+			let pumped = false;
+			const pumping = bob.pump().then(() => {
+				pumped = true;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			// Both slots are held by slow tasks, yet the bad request is already answered.
+			expect(pumped).toBe(true);
+			expect(resultsSentToAlice()).toEqual([
+				expect.objectContaining({
+					taskId: "bad-1",
+					status: "failed",
+					error: "invalid_input",
+				}),
+			]);
+			slow.open();
+			await pumping;
+			await bob.tasksSettled();
+		});
+
+		it("sends no invalid_output for a task canceled while its handler ran", async () => {
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+			});
+			const running = gate();
+			const release = gate();
+			bob.handle(
+				"invoice.review",
+				async () => {
+					running.open();
+					await release.opened;
+					return { approved: "yes" };
+				},
+				invoiceContract,
+			);
+			await sendFromAlice({
+				t: "req",
+				taskId: "cancel-1",
+				capability: "invoice.review",
+				payload: { amount: 5 },
+			});
+			await bob.pump();
+			await running.opened;
+
+			await sendFromAlice({ t: "cancel", taskId: "cancel-1" });
+			await bob.pump();
+			release.open();
+			await bob.tasksSettled();
+
+			expect(resultsSentToAlice()).toEqual([]);
+		});
+	});
+
 	it("rejects an invalid handler schema at registration", () => {
 		const bob = new AgxClient({ transport: bus.transport(BOB) });
 		expect(() =>
