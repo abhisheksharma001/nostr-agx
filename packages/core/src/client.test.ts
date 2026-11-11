@@ -495,7 +495,7 @@ describe("AgxClient task request/response", () => {
 			return "done";
 		});
 
-		const pending = alice.request(BOB, "long.task", {});
+		const pending = alice.request(BOB, "long.task", {}, { onTaskStatus: vi.fn() });
 		await bob.pump();
 		await alice.pump();
 		expect(await pending).toBe("done");
@@ -516,7 +516,7 @@ describe("AgxClient task request/response", () => {
 			return "done";
 		});
 
-		const pending = alice.request(BOB, "long.task", {});
+		const pending = alice.request(BOB, "long.task", {}, { onTaskStatus: vi.fn() });
 		await bob.pump();
 		await alice.pump();
 		expect(await pending).toBe("done");
@@ -539,7 +539,7 @@ describe("AgxClient task request/response", () => {
 			return "done";
 		});
 
-		const pending = alice.request(BOB, "long.task", {});
+		const pending = alice.request(BOB, "long.task", {}, { onTaskStatus: vi.fn() });
 		await bob.pump();
 		await alice.pump();
 		expect(await pending).toBe("done");
@@ -580,6 +580,97 @@ describe("AgxClient task request/response", () => {
 		expect(error).toHaveBeenCalledTimes(1); // the pump saw no dispatch failure
 		await alice.stop();
 		await expect(pending).rejects.toThrow("AGX client stopped");
+	});
+
+	describe("working updates are opt-in", () => {
+		const statusesSentTo = (peer: string, taskId?: string) =>
+			(bus.inbox.get(peer) ?? []).flatMap((message) => {
+				const envelope = parseTaskEnvelope(message.text);
+				return envelope?.t === "res" && (taskId === undefined || envelope.taskId === taskId)
+					? [envelope.status]
+					: [];
+			});
+		const reportingBob = () => {
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			bob.handle("long.task", async (_task, ctx) => {
+				await ctx.report("started");
+				await ctx.report("almost done");
+				return "done";
+			});
+			return bob;
+		};
+
+		it("sends no working update to a requester that did not opt in, as main's request() and streamRequest() send", async () => {
+			const bob = reportingBob();
+			// The exact request shapes a requester on main (before working) publishes.
+			pushTaskEnvelope(BOB, ALICE, {
+				t: "req",
+				taskId: "plain-1",
+				capability: "long.task",
+				payload: {},
+				supportsInput: false,
+				timeoutMs: 30_000,
+			});
+			pushTaskEnvelope(BOB, ALICE, {
+				t: "req",
+				taskId: "stream-1",
+				capability: "long.task",
+				payload: {},
+				supportsInput: true,
+				timeoutMs: 30_000,
+			});
+			await bob.pump();
+			await bob.tasksSettled();
+
+			expect(statusesSentTo(ALICE, "plain-1")).toEqual(["completed"]);
+			expect(statusesSentTo(ALICE, "stream-1")).toEqual(["completed"]);
+		});
+
+		it("sends working updates to a requester that opted in with supportsWorking", async () => {
+			const bob = reportingBob();
+			pushTaskEnvelope(BOB, ALICE, {
+				t: "req",
+				taskId: "opted-1",
+				capability: "long.task",
+				payload: {},
+				supportsWorking: true,
+				timeoutMs: 30_000,
+			});
+			await bob.pump();
+			await bob.tasksSettled();
+
+			expect(statusesSentTo(ALICE, "opted-1")).toEqual(["working", "working", "completed"]);
+		});
+
+		it("opts in only from streamRequest() and request() with onTaskStatus", async () => {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const plain = alice.request(BOB, "long.task", {}, { timeoutMs: 1_000 });
+			expect(outboundRequest().supportsWorking).toBeUndefined();
+			const withStatus = alice.request(BOB, "long.task", {}, {
+				timeoutMs: 1_000,
+				onTaskStatus: vi.fn(),
+			});
+			expect(outboundRequest().supportsWorking).toBe(true);
+			const stream = await alice.streamRequest(BOB, "long.task", {}, { timeoutMs: 1_000 });
+			expect(outboundRequest().supportsWorking).toBe(true);
+			await alice.stop();
+			await expect(plain).rejects.toThrow("AGX client stopped");
+			await expect(withStatus).rejects.toThrow("AGX client stopped");
+			await expect(stream.result).rejects.toThrow("AGX client stopped");
+		});
+
+		it("keeps a plain request() without onTaskStatus free of working updates end to end", async () => {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = reportingBob();
+			const pending = alice.request(BOB, "long.task", {});
+			await bob.pump();
+			expect(statusesSentTo(ALICE)).toEqual(["completed"]);
+			await alice.pump();
+			expect(await pending).toBe("done");
+		});
 	});
 
 	it("preflights a typed peer skill before publishing", async () => {
