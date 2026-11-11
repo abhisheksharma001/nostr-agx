@@ -1499,6 +1499,9 @@ export class AgxClient {
 						...requirement,
 						timeoutMs,
 					};
+					// A `working` publish still in flight must land first, or a requester
+					// would see `working` after `input-required`.
+					await reportsInFlight;
 					const sent = await this.sendResult(msg.from, env.taskId, {
 						status: "input-required",
 						inputRequestId,
