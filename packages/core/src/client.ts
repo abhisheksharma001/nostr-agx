@@ -66,9 +66,10 @@ export type HandlerContext = {
 	/** Ask the task requester for input and resume when it replies. */
 	requestInput(requirement: InputRequirement): Promise<unknown>;
 	/** Publish a best-effort public `working` update (at most 2000 characters; never
-	 * raw reasoning or internal error detail). Sends nothing once the task has
-	 * finished or been canceled. A failed or oversized publish is logged and
-	 * dropped; it never fails the task. */
+	 * raw reasoning or internal error detail). Sends nothing unless the request
+	 * opted in with `supportsWorking`, and nothing once the task has finished or
+	 * been canceled. A failed or oversized publish is logged and dropped; it never
+	 * fails the task. */
 	report(message?: string): Promise<void>;
 };
 
@@ -172,6 +173,7 @@ interface SendRequestOptions {
 	timeoutMs?: number;
 	taskId?: string;
 	supportsInput?: boolean;
+	supportsWorking?: boolean;
 	onTaskStatus?: (update: TaskStatusUpdate) => void | Promise<void>;
 	onUpdate?: (update: TaskResultEnvelope) => void;
 	onError?: (error: Error) => void;
@@ -465,7 +467,12 @@ export class AgxClient {
 			peer,
 			capability,
 			payload,
-			{ ...opts, supportsInput: false },
+			{
+				...opts,
+				supportsInput: false,
+				// Ask for working updates only when the caller can receive them.
+				supportsWorking: typeof opts?.onTaskStatus === "function",
+			},
 		);
 		return result;
 	}
@@ -503,6 +510,7 @@ export class AgxClient {
 				...opts,
 				taskId,
 				supportsInput: true,
+				supportsWorking: true,
 				onUpdate: (update) => stream[STREAM_HANDLE_UPDATE](update),
 				onError: (error) => stream[STREAM_HANDLE_ERROR](error),
 			});
@@ -532,6 +540,9 @@ export class AgxClient {
 			capability,
 			payload,
 			supportsInput: opts?.supportsInput === true,
+			// Omitted unless true, so a request that does not opt in is byte-for-byte
+			// what a requester that predates `working` sends.
+			...(opts?.supportsWorking === true ? { supportsWorking: true } : {}),
 			timeoutMs: timeoutMs > 0 ? timeoutMs : 0,
 		};
 		const text = encodeTaskEnvelope(envelope);
@@ -1416,6 +1427,9 @@ export class AgxClient {
 				capability: env.capability,
 				eventId: msg.eventId,
 				report: async (message) => {
+					// A requester that did not opt in may predate `working` and would
+					// misread it, so send nothing at all.
+					if (env.supportsWorking !== true) return;
 					// Only while this run is the live task: not after a cancel, not once
 					// the handler has returned and the task entry is gone.
 					if (active?.canceled || this.activeInboundTasks.get(activeKey) !== active) {

@@ -42,6 +42,8 @@ export const taskRequestSchema = z.object({
 	capability: z.string().min(1).max(200),
 	payload: z.unknown(),
 	supportsInput: z.boolean().optional(),
+	/** Opt-in to nonterminal `working` updates; absent means false. */
+	supportsWorking: z.boolean().optional(),
 	timeoutMs: z.number().int().min(0).optional(),
 });
 export type TaskRequestEnvelope = z.infer<typeof taskRequestSchema>;

@@ -493,7 +493,9 @@ gateway does not execute it again automatically.
 `GET /v1/tasks/<id>/events` with the same API credential returns `text/event-stream`. Each `working`
 event has a numeric SSE `id` and the remote update's `seq` and optional public `message`. A comment
 heartbeat keeps idle connections alive. The stream ends with one `completed` or `failed` event whose
-data is the stored task view. For example:
+data is the stored task view. The gateway asks the remote agent for `working` updates
+(`supportsWorking`); an agent that predates them sends none, so its stream carries only the terminal
+event. For example:
 
 ```bash
 curl -N -H "Authorization: Bearer $AGX_GATEWAY_KEY" \

@@ -24,7 +24,7 @@ const agx = new AgxClient({
 
 // The runtime only writes handlers; the library owns dispatch → lifecycle → result → receipt.
 agx.handle("invoice.review", async (task, ctx) => {
-  await ctx.report("reviewing"); // Optional public `working` update.
+  await ctx.report("reviewing"); // Optional public `working` update (only if the requester opted in).
   return paperclip.run(task.payload);
 }, {
   description: "Review an invoice against approval policy",
@@ -69,7 +69,9 @@ An input-waiting handler releases its concurrency slot, and pending input count
 and per-prompt duration are bounded by `maxPendingTaskInputs` and
 `maxInputTimeoutMs`. A nonzero request timeout is the end-to-end task deadline.
 The requester uses `streamRequest()` to observe `inputRequired`, `statusUpdate`,
-`progress` (the ordered `working` updates a handler publishes with `ctx.report`),
+`progress` (the ordered `working` updates a handler publishes with `ctx.report`;
+`streamRequest()` and `request()` with `onTaskStatus` ask for them with `supportsWorking`,
+and a responder sends none to a request that did not ask),
 `completed`, and `error`; its `result` promise resolves with the final output or
 rejects on failure, timeout, or client stop. Stream updates use the same dispatch
 path as polling, so live transport hooks are optional. The requester obtains an
