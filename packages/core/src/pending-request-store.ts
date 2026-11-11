@@ -32,12 +32,15 @@ export class AgxRequestUnknownError extends Error {
 	}
 }
 
-/** Durable correlation could not be written or removed safely. */
+/** Durable correlation could not be written or removed safely. `mayHavePublished`
+ * is false only when the first write failed, so the task was never sent. */
 export class AgxPendingRequestStoreError extends Error {
 	readonly code = "pending_request_store_failed";
+	readonly mayHavePublished: boolean;
 
-	constructor() {
+	constructor(options: { mayHavePublished?: boolean } = {}) {
 		super("AGX request storage failed");
 		this.name = "AgxPendingRequestStoreError";
+		this.mayHavePublished = options.mayHavePublished ?? true;
 	}
 }

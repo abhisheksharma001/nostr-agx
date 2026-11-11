@@ -145,6 +145,7 @@ interface Pending {
 	 * responder legitimately knows the `taskId`. */
 	peer: string;
 	durableKey?: string;
+	deadlineAt?: number | null;
 	timeoutMs?: number;
 	restored?: boolean;
 	published?: boolean;
@@ -274,6 +275,8 @@ export class AgxClient {
 	private readonly maxRestoredRequests: number;
 	private needsRestore: boolean;
 	private restorePromise?: Promise<RecoveredPendingRequest[]>;
+	/** Bumped by every stop(), so a restore that awaited the store can tell. */
+	private stopCount = 0;
 	private readonly authorize?: AgxAuthorize | "accept-all";
 	private readonly log: AgxLogger;
 	/** One-time guard for the no-authorization warning (default-deny in effect). */
@@ -504,22 +507,26 @@ export class AgxClient {
 				reject,
 				peer: options.peer,
 				durableKey: options.durableKey,
+				deadlineAt: options.deadlineAt,
 				timeoutMs: options.timeoutMs,
 				restored: options.restored,
 				published: options.published,
 				onUpdate: options.onUpdate,
 				onError: options.onError,
 			};
-			if (options.deadlineAt !== null) {
-				pending.timer = setTimeout(
-					() => void this.expirePending(options.taskId, pending),
-					Math.max(0, options.deadlineAt - Date.now()),
-				);
-			}
+			this.armDeadline(options.taskId, pending);
 			this.pending.set(options.taskId, pending);
 		});
 		result.catch(() => undefined);
 		return { pending, result };
+	}
+
+	private armDeadline(taskId: string, pending: Pending): void {
+		if (pending.deadlineAt === null || pending.deadlineAt === undefined) return;
+		pending.timer = setTimeout(
+			() => void this.expirePending(taskId, pending),
+			Math.max(0, pending.deadlineAt - Date.now()),
+		);
 	}
 
 	private async expirePending(taskId: string, pending: Pending): Promise<void> {
@@ -575,6 +582,9 @@ export class AgxClient {
 		}
 	}
 
+	/** Re-register stored waiting requests without publishing them again. Concurrent
+	 * calls share one restore and later calls return []: attach the returned handles
+	 * exactly once. A stop() during the restore rejects it with nothing registered. */
 	async restorePendingRequests(): Promise<RecoveredPendingRequest[]> {
 		if (!this.pendingRequests) {
 			this.needsRestore = false;
@@ -597,8 +607,13 @@ export class AgxClient {
 		const store = this.pendingRequests;
 		if (!store) return [];
 		const restored: Pending[] = [];
+		const stopCount = this.stopCount;
+		const assertNotStopped = () => {
+			if (this.stopCount !== stopCount) throw new Error("AGX client stopped");
+		};
 		try {
 			const records: unknown = await store.list();
+			assertNotStopped();
 			if (!Array.isArray(records) || records.length > this.maxRestoredRequests) {
 				throw new Error("AGX durable request restore limit exceeded or store returned invalid data");
 			}
@@ -617,6 +632,7 @@ export class AgxClient {
 			for (const record of records as PendingRequestRecord[]) {
 				if (record.phase === "publishing") {
 					await store.remove(record.key);
+					assertNotStopped();
 					recovered.push({
 						key: record.key,
 						taskId: record.taskId,
@@ -626,6 +642,7 @@ export class AgxClient {
 				}
 				if (record.deadlineAt !== null && record.deadlineAt <= Date.now()) {
 					await store.remove(record.key);
+					assertNotStopped();
 					recovered.push({
 						key: record.key,
 						taskId: record.taskId,
@@ -711,7 +728,7 @@ export class AgxClient {
 			try {
 				await this.pendingRequests.save(record("publishing"));
 			} catch {
-				await this.settlePending(taskId, new AgxPendingRequestStoreError());
+				await this.settlePending(taskId, new AgxPendingRequestStoreError({ mayHavePublished: false }));
 				return { taskId, result };
 			}
 			if (this.pending.get(taskId) !== pending) {
@@ -735,7 +752,10 @@ export class AgxClient {
 		}
 
 		pending.published = true;
-		if (durableKey && this.pendingRequests) {
+		// A result, the deadline or an ordinary stop() may have settled the request
+		// during the publish and removed its record: do not write it back. A restart
+		// stop keeps it, so the next process can still collect the result.
+		if (durableKey && this.pendingRequests && (this.pending.get(taskId) === pending || pending.preservePending)) {
 			try {
 				await this.pendingRequests.save(record("waiting"));
 			} catch {
@@ -743,7 +763,7 @@ export class AgxClient {
 				await this.settlePending(taskId, new AgxPendingRequestStoreError());
 				return { taskId, result };
 			}
-			if (this.pending.get(taskId) !== pending) {
+			if (this.pending.get(taskId) !== pending && !pending.preservePending) {
 				await Promise.resolve(this.pendingRequests.remove(durableKey)).catch(() => undefined);
 			}
 		}
@@ -1165,6 +1185,7 @@ export class AgxClient {
 	async stop(opts?: { preservePending?: boolean }): Promise<void> {
 		this.running = false;
 		this.stopping = true;
+		this.stopCount += 1;
 		for (const queued of this.queuedTaskRuns.splice(0)) {
 			queued.cancel();
 		}
@@ -1767,9 +1788,18 @@ export class AgxClient {
 		}
 
 		if (p.durableKey && this.pendingRequests) {
-			// Keep the in-memory entry and cursor retryable when storage fails. The
-			// result must not settle locally while a restart could recover it again.
-			await this.pendingRequests.remove(p.durableKey);
+			// The genuine result is here: its deadline must not race the removal.
+			if (p.timer) clearTimeout(p.timer);
+			try {
+				await this.pendingRequests.remove(p.durableKey);
+			} catch (error) {
+				// Keep the in-memory entry, its deadline and the cursor retryable. The
+				// result must not settle locally while a restart could recover it again.
+				if (this.pending.get(env.taskId) === p) this.armDeadline(env.taskId, p);
+				throw error;
+			}
+			// A stop() settled it while the record was being removed.
+			if (this.pending.get(env.taskId) !== p) return;
 		}
 		p.onUpdate?.(env);
 		this.pending.delete(env.taskId);
@@ -1964,7 +1994,7 @@ export class AgxClient {
 			try {
 				await this.pendingRequests.remove(p.durableKey);
 			} catch {
-				settledError = new AgxPendingRequestStoreError();
+				settledError = error instanceof AgxPendingRequestStoreError ? error : new AgxPendingRequestStoreError();
 			}
 		}
 		this.pending.delete(taskId);
