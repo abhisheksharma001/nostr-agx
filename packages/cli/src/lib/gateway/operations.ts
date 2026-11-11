@@ -136,7 +136,7 @@ export async function runTaskRequest(
 			throw new ApiError(
 				422,
 				"input_required",
-				`${npub} requires interactive input to continue this task`,
+				`${req.npub} requires interactive input to continue this task`,
 				"This gateway task endpoint cannot answer interactive prompts. Use an input-capable AGX client.",
 			);
 		}
