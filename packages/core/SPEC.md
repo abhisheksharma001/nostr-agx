@@ -129,10 +129,10 @@ them like any message:
   interactive input; it defaults to false. `timeoutMs` is the requester's end-to-end deadline in
   milliseconds; zero means no requester deadline.
 - **result/update** — `{ t: "res", taskId, status: "input-required", inputRequestId, requirement }`
-  is a nonterminal update; `{ t: "res", taskId, status: "completed", output? }` and
-  `{ t: "res", taskId, status: "failed", error? }` are terminal results.
-- **status** — `{ t: "status", taskId, status: "working", seq, message? }`, a nonterminal public
-  progress update correlated to the request by `taskId` and ordered by `seq` starting at 1.
+  and `{ t: "res", taskId, status: "working", seq, message? }` are nonterminal updates;
+  `{ t: "res", taskId, status: "completed", output? }` and `{ t: "res", taskId, status: "failed", error? }`
+  are terminal results. `seq` is a positive integer, starting at 1 and increasing per task, that
+  orders `working` updates; `message` is optional public text of at most 2,000 characters.
 - **input continuation** — `{ t: "input", taskId, inputRequestId, input }` supplies the answer to an
   outstanding input requirement. It is a new message/event, but continues the same task and uses
   the same `taskId` as its transport `contextId`.
@@ -156,14 +156,18 @@ already finished, never started here, or was issued by a different peer — is i
 reply: it is consumed, **MUST NOT** be delivered to the host as a plain message, and **MUST NOT**
 trigger any reply.
 
-A handler calls `task.report(message?)` to publish best-effort `working` updates. A requester supplies
-`onTaskStatus` to receive them while its original request remains pending. Updates bind to both task
-ID and original peer. Duplicate or older sequence numbers are ignored; a later terminal result still
-settles the request normally. Status updates do not extend the request deadline. Messages are limited
-to 2,000 characters and contain handler-supplied public text, never raw reasoning or internal error
-details. Transport failure drops an update without failing the task. Unknown, late, and post-terminal
-status traffic receives no automatic reply and follows the plain-message trust path. Typed contracts
-advertise the `working` feature; this is not token-by-token model streaming.
+A handler calls `ctx.report(message?)` to publish best-effort `working` updates, and a requester sees
+them while its original request remains pending (`statusUpdate` and `progress` on `streamRequest()`,
+`onTaskStatus` on `request()`). A `working` update is nonterminal and does not need `supportsInput`; it
+**MUST NOT** settle the request, cancel it, or extend its deadline. A requester **MUST** accept one only
+from the peer the request was sent to, for the pending `taskId`, with the transport `contextId` equal to
+that `taskId`, exactly as for `input-required`. Duplicate or older `seq` values are ignored; a later
+terminal result still settles the request normally. A responder **MUST NOT** send `working` after the
+task has finished or been canceled. The message is handler-supplied public text, never raw reasoning or
+internal error details. A transport failure or oversized message drops the update without failing the
+task. Unknown, late, and post-terminal updates receive no automatic reply and follow the plain-message
+trust path. A requester that predates `working` does not recognize the update and treats it the same
+way. Typed contracts advertise the `working` feature; this is not token-by-token model streaming.
 
 **Responder shutdown.** A responder that stops **MUST NOT** treat it as a requester cancellation: a
 handler already running still publishes its terminal result, and a task waiting for input or to

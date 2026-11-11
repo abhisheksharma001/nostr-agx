@@ -1,12 +1,12 @@
 # S-06 — Implement `working` status updates
 
 **PR:** one, stacked on S-04.
-**Depends on:** S-04; S-05 structured errors is independent.
+**Depends on:** S-04, PR #19 (`input-required` in the `res` envelope); S-05 structured errors is independent.
 **Files:** packages/core/src/task.ts, packages/core/src/client.ts, core client tests and documentation, packages/core/SPEC.md, and the real-relay integration test.
 
 **Today:** A requester waits for a terminal result with no authenticated progress updates from the handler.
 
-**Change:** add `{ t: "status", taskId, status: "working", seq, message? }`. Give each client-created task a `report(message?)` function. Assign increasing sequence numbers starting at 1. Add per-request `onTaskStatus`; bind updates to the pending task and original peer, ignore duplicate or older sequence numbers, and leave the request pending. Do not extend its deadline. Add `working` to registered typed skill features. Unknown, late, and post-terminal status traffic follows the existing plain-message trust path and receives no automatic reply.
+**Change:** add a `working` variant to the `t:"res"` envelope, `{ t: "res", taskId, status: "working", seq, message? }`, next to `input-required` (PR #19). A handler publishes it with `ctx.report(message?)`, next to `ctx.requestInput`. Sequence numbers start at 1 and increase. A requester sees it as `statusUpdate` `"working"` plus a `progress` event on `streamRequest()`, and through a per-request `onTaskStatus` on `request()`. `resolvePending` treats `working` as nonterminal: same original-peer and `contextId` binding as `input-required`, duplicate or older sequence numbers ignored, the request left pending, the deadline not extended, and no cancellation even on a plain `request()`. Add `working` to registered typed skill features. Unknown, late, and post-terminal updates follow the existing plain-message trust path and receive no automatic reply.
 
 **Acceptance:** WHEN an authorized handler reports `working` THEN the requester SHALL receive the ordered public update and SHALL keep the original request pending until a terminal result or its original deadline.
 
@@ -16,8 +16,8 @@
 
 ## Options considered
 
-1. Additive status envelope: preserves the terminal-only result contract and lets older peers fall through safely. Selected.
-2. Nonterminal result envelopes: weakens the existing completed/failed result invariant. Rejected.
+1. `working` inside the `t:"res"` envelope, reusing #19's pending-request handling: one non-terminal mechanism, one set of peer and `contextId` checks. Selected. Its cost is that a requester older than this change does not recognize the update and treats it as a plain message.
+2. A separate `t:"status"` envelope (the first version of this step): additive and safe for older peers, but a second dispatch path beside #19's, with its own weaker binding. Rejected after #19 merged.
 3. Plain text messages: cannot provide task correlation, ordering, or terminal-state rules. Rejected.
 
 ## Public boundary

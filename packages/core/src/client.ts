@@ -16,8 +16,8 @@ import {
 	type TaskResultEnvelope,
 	type InputRequirement,
 	type InputRequiredUpdate,
-	type TaskStatusEnvelope,
 	type TaskStatusUpdate,
+	type TaskWorkingUpdate,
 } from "./task";
 import type {
 	AgxAgentSkill,
@@ -65,6 +65,11 @@ export type HandlerContext = {
 	eventId: string;
 	/** Ask the task requester for input and resume when it replies. */
 	requestInput(requirement: InputRequirement): Promise<unknown>;
+	/** Publish a best-effort public `working` update (at most 2000 characters; never
+	 * raw reasoning or internal error detail). Sends nothing once the task has
+	 * finished or been canceled. A failed or oversized publish is logged and
+	 * dropped; it never fails the task. */
+	report(message?: string): Promise<void>;
 };
 
 /** Context for the trust/authorization hook, evaluated before a task runs. */
@@ -173,6 +178,7 @@ interface SendRequestOptions {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_WORKING_MESSAGE_CHARS = 2000;
 const DEFAULT_MAX_PENDING_TASK_INPUTS = 32;
 const DEFAULT_MAX_INPUT_TIMEOUT_MS = 5 * 60_000;
 const MAX_QUEUED_TASK_RUNS = 100;
@@ -1062,10 +1068,10 @@ export class AgxClient {
 		if (msg.contentType === TASK_CONTENT_TYPE) {
 			// `contentType` is peer-supplied, so a task label can't be trusted to mean
 			// "this is task traffic for me". Consume it as a task ONLY when we can
-			// actually service it: a request for a capability WE registered, a
-			// status/result correlated to a pending request of OURS, or an input
+			// actually service it: a request for a capability WE registered, a result
+			// or update correlated to a pending request of OURS, or an input
 			// correlated to a handler waiting for it. Anything else — an unknown
-			// capability, an unmatched/late status/result, a malformed envelope — is
+			// capability, an unmatched/late result or update, a malformed envelope — is
 			// deliberately NOT auto-replied to (a reply would let any peer coax a
 			// signed event out of this identity) and NOT silently dropped; it falls
 			// through to `onMessage` so the host's own trust flow triages it exactly
@@ -1074,10 +1080,6 @@ export class AgxClient {
 			const env = parseTaskEnvelope(msg.text);
 			if (env?.t === "req" && this.handlers.has(env.capability)) {
 				await this.handleTaskRequest(msg, env);
-				return;
-			}
-			if (env?.t === "status" && this.pending.has(env.taskId)) {
-				await this.receiveTaskStatus(msg, env);
 				return;
 			}
 			if (env?.t === "res" && this.pending.has(env.taskId)) {
@@ -1227,7 +1229,6 @@ export class AgxClient {
 			})
 			.catch(() => undefined);
 
-		let statusSeq = 0;
 		const task: Task = {
 			taskId: env.taskId,
 			capability: env.capability,
@@ -1237,10 +1238,6 @@ export class AgxClient {
 			eventId: msg.eventId,
 			transportId: msg.transportId,
 			sentAt: msg.sentAt,
-			report: async (message) => {
-				statusSeq += 1;
-				await this.sendTaskStatus(msg.from, env.taskId, statusSeq, message);
-			},
 		};
 		try {
 			const scheduled = this.scheduleTask(
@@ -1404,12 +1401,26 @@ export class AgxClient {
 				? Date.now() + env.timeoutMs
 				: undefined;
 		let waitingForInput = false;
+		let statusSeq = 0;
+		const activeKey = this.activeInboundTaskKey(
+			this.normalizeId(msg.from),
+			env.taskId,
+		);
 		try {
 			if (active?.canceled) return;
 			const output = await registered.handler(task, {
 				from: msg.from,
 				capability: env.capability,
 				eventId: msg.eventId,
+				report: async (message) => {
+					// Only while this run is the live task: not after a cancel, not once
+					// the handler has returned and the task entry is gone.
+					if (active?.canceled || this.activeInboundTasks.get(activeKey) !== active) {
+						return;
+					}
+					statusSeq += 1;
+					await this.sendTaskStatus(msg.from, env.taskId, statusSeq, message);
+				},
 				requestInput: async (requirement) => {
 					if (env.supportsInput !== true) {
 						throw new AgxPublicError(INPUT_UNSUPPORTED_ERROR);
@@ -1549,21 +1560,23 @@ export class AgxClient {
 		}
 	}
 
+	/** Best-effort `working` update: an oversized or unpublishable update is logged
+	 * and dropped, never turned into a failed task. */
 	private async sendTaskStatus(
 		to: string,
 		taskId: string,
 		seq: number,
 		message?: string,
 	): Promise<void> {
-		const env: TaskStatusEnvelope = {
-			t: "status",
+		const env: TaskResultEnvelope = {
+			t: "res",
 			taskId,
 			status: "working",
 			seq,
 			...(message === undefined ? {} : { message }),
 		};
 		const text = encodeTaskEnvelope(env);
-		if ((message?.length ?? 0) > 2000 || !this.fitsWire(text)) {
+		if ((message?.length ?? 0) > MAX_WORKING_MESSAGE_CHARS || !this.fitsWire(text)) {
 			this.log.warn?.("AGX: task status too large; dropping update", {
 				taskId,
 				seq,
@@ -1583,39 +1596,6 @@ export class AgxClient {
 					error: String(error),
 				}),
 			);
-	}
-
-	private async receiveTaskStatus(
-		msg: AgxIncomingMessage,
-		env: TaskStatusEnvelope,
-	): Promise<void> {
-		const pending = this.pending.get(env.taskId);
-		if (!pending) {
-			return;
-		}
-		if (this.normalizeId(msg.from) !== pending.peer) {
-			this.log.warn?.("AGX: task status from unexpected peer; dropping", {
-				taskId: env.taskId,
-				from: msg.from,
-				expected: pending.peer,
-			});
-			return;
-		}
-		if (env.seq <= pending.lastStatusSeq) {
-			this.log.debug?.("AGX: dropping duplicate or older task status", {
-				taskId: env.taskId,
-				seq: env.seq,
-				lastStatusSeq: pending.lastStatusSeq,
-			});
-			return;
-		}
-		await pending.onTaskStatus?.({
-			taskId: env.taskId,
-			status: env.status,
-			seq: env.seq,
-			...(env.message === undefined ? {} : { message: env.message }),
-		});
-		pending.lastStatusSeq = env.seq;
 	}
 
 	private async sendResult(
@@ -1701,6 +1681,14 @@ export class AgxClient {
 			return;
 		}
 
+		if (env.status === "working") {
+			// Non-terminal progress: never settles the request, never touches its
+			// timer, and cannot cancel it (unlike input-required, which a plain
+			// request() cannot answer).
+			await this.receiveWorkingUpdate(p, env);
+			return;
+		}
+
 		p.onUpdate?.(env);
 		if (env.status === "input-required") {
 			if (!p.onUpdate) {
@@ -1719,6 +1707,38 @@ export class AgxClient {
 			p.resolve(env.output);
 		} else {
 			p.reject(new Error(env.error ?? "task failed"));
+		}
+	}
+
+	private async receiveWorkingUpdate(
+		p: Pending,
+		env: TaskWorkingUpdate,
+	): Promise<void> {
+		if (env.seq <= p.lastStatusSeq) {
+			this.log.debug?.("AGX: dropping duplicate or older task status", {
+				taskId: env.taskId,
+				seq: env.seq,
+				lastStatusSeq: p.lastStatusSeq,
+			});
+			return;
+		}
+		// Record the sequence number first so a failing listener cannot make the
+		// same update replay, and never lets the listener break the inbox.
+		p.lastStatusSeq = env.seq;
+		p.onUpdate?.(env);
+		try {
+			await p.onTaskStatus?.({
+				taskId: env.taskId,
+				status: env.status,
+				seq: env.seq,
+				...(env.message === undefined ? {} : { message: env.message }),
+			});
+		} catch (error) {
+			this.log.error?.("AGX: task status listener failed", {
+				taskId: env.taskId,
+				seq: env.seq,
+				error: String(error),
+			});
 		}
 	}
 
@@ -1970,7 +1990,15 @@ export class AgxClient {
 
 type StreamEventData<Output> = {
 	completed: Output;
-	statusUpdate: "delivered" | "input-required" | "completed" | "failed";
+	statusUpdate:
+		| "delivered"
+		| "working"
+		| "input-required"
+		| "completed"
+		| "failed";
+	/** Ordered public `working` updates; duplicates and older ones are dropped
+	 * before they get here. */
+	progress: { seq: number; message?: string };
 	inputRequired: InputRequiredUpdate;
 	error: string;
 };
@@ -2048,6 +2076,10 @@ export class StreamResponse<Output> {
 		event: "inputRequired",
 		data: InputRequiredUpdate,
 	): void;
+	private emit(
+		event: "progress",
+		data: StreamEventData<Output>["progress"],
+	): void;
 	private emit(event: "error", data: string): void;
 	private emit(
 		event: keyof StreamEventData<Output>,
@@ -2089,6 +2121,12 @@ export class StreamResponse<Output> {
 	[STREAM_HANDLE_UPDATE](update: TaskResultEnvelope): void {
 		this.emit("statusUpdate", update.status);
 		switch (update.status) {
+			case "working":
+				this.emit("progress", {
+					seq: update.seq,
+					...(update.message === undefined ? {} : { message: update.message }),
+				});
+				break;
 			case "input-required":
 				this.pendingInputs.add(update.inputRequestId);
 				this.emit("inputRequired", {

@@ -46,8 +46,23 @@ export const taskRequestSchema = z.object({
 });
 export type TaskRequestEnvelope = z.infer<typeof taskRequestSchema>;
 
+/** A non-terminal `working` update: public progress text from the handler,
+ * ordered by `seq` (starting at 1) so a requester can drop duplicates and older
+ * updates. Rides in the `res` envelope next to `input-required`. */
+export const taskWorkingUpdateSchema = z.object({
+	t: z.literal("res"),
+	taskId: z.string().min(1).max(200),
+	status: z.literal("working"),
+	seq: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+	message: z.string().max(2000).optional(),
+});
+export type TaskWorkingUpdate = z.infer<typeof taskWorkingUpdateSchema>;
+/** A `working` update as handed to a requester callback (no wire tag). */
+export type TaskStatusUpdate = Omit<TaskWorkingUpdate, "t">;
+
 /** Wire envelope for a task status update or terminal result. */
 export const taskResultSchema = z.discriminatedUnion("status", [
+	taskWorkingUpdateSchema,
 	z.object({
 		t: z.literal("res"),
 		taskId: z.string().min(1).max(200),
@@ -70,17 +85,6 @@ export const taskResultSchema = z.discriminatedUnion("status", [
 ]);
 export type TaskResultEnvelope = z.infer<typeof taskResultSchema>;
 
-/** Nonterminal progress for a pending task. */
-export const taskStatusSchema = z.object({
-	t: z.literal("status"),
-	taskId: z.string().min(1).max(200),
-	status: z.literal("working"),
-	seq: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-	message: z.string().max(2000).optional(),
-});
-export type TaskStatusEnvelope = z.infer<typeof taskStatusSchema>;
-export type TaskStatusUpdate = Omit<TaskStatusEnvelope, "t">;
-
 /** Cancel a task when its requester can no longer continue the conversation. */
 export const taskCancelSchema = z.object({
 	t: z.literal("cancel"),
@@ -100,7 +104,6 @@ export type TaskInputEnvelope = z.infer<typeof taskInputSchema>;
 export const taskEnvelopeSchema = z.discriminatedUnion("t", [
 	taskRequestSchema,
 	taskResultSchema,
-	taskStatusSchema,
 	taskCancelSchema,
 	taskInputSchema,
 ]);
@@ -126,9 +129,6 @@ export interface Task<Payload = unknown> {
 	/** When the sender says it sent the request (unix seconds), if the transport
 	 * carries that. Sender-declared. */
 	sentAt?: number;
-	/** Publish a best-effort public `working` update. Client-created tasks always
-	 * provide this; optional for host-created task fixtures. */
-	report?: (message?: string) => Promise<void>;
 }
 
 /** Serialize a task envelope for the message text field. */
