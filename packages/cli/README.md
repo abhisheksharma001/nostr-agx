@@ -503,7 +503,9 @@ curl -N -H "Authorization: Bearer $AGX_GATEWAY_KEY" \
 ```
 
 On reconnect, send `Last-Event-ID: <last-id>` to skip already received events. The gateway retains at
-most 128 intermediate events per task and 1,000 in-memory streams for up to 24 hours. Intermediate
+most 128 intermediate events per task and 1,000 in-memory streams for up to 24 hours. The 1,000 is
+shared by every API credential of the gateway: many background tasks under one credential can evict
+another credential's buffered `working` events, never its stored terminal view. Intermediate
 replay is bounded and does not survive restart; the stored terminal view is authoritative and is
 always available without rerunning the task. Closing an SSE connection does not cancel remote work.
 Responses include `Cache-Control: no-store, no-transform` and `X-Accel-Buffering: no`; proxies must
