@@ -520,11 +520,11 @@ describe("AgxClient task request/response", () => {
 		await bob.pump();
 		await alice.pump();
 		expect(await pending).toBe("done");
-		const working = (bus.inbox.get(ALICE) ?? []).filter((message) => {
-			const env = parseTaskEnvelope(message.text);
-			return env?.t === "res" && env.status === "working";
-		});
-		expect(working).toHaveLength(0);
+		// Read the raw statuses: an oversized update would not even parse.
+		const statuses = (bus.inbox.get(ALICE) ?? []).map(
+			(message) => (JSON.parse(message.text) as { status: string }).status,
+		);
+		expect(statuses).toEqual(["completed"]);
 	});
 
 	it("sends no working update once the handler has finished", async () => {
@@ -573,7 +573,11 @@ describe("AgxClient task request/response", () => {
 		await expect(alice.pump()).resolves.toBeDefined();
 
 		expect(onTaskStatus).toHaveBeenCalledTimes(2);
-		expect(error).toHaveBeenCalled();
+		expect(error).toHaveBeenCalledWith(
+			"AGX: task status listener failed",
+			expect.objectContaining({ seq: 1, error: expect.stringContaining("listener broke") }),
+		);
+		expect(error).toHaveBeenCalledTimes(1); // the pump saw no dispatch failure
 		await alice.stop();
 		await expect(pending).rejects.toThrow("AGX client stopped");
 	});
