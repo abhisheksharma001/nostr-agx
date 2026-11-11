@@ -157,6 +157,32 @@ describe("TaskOperationStore", () => {
 		third.close();
 	});
 
+	it("rejects correlation changes and a waiting-to-publishing regression", async () => {
+		const store = new TaskOperationStore("test");
+		await store.execute("credential-a", "guarded", {}, async (operationId: string) => {
+			const base = {
+				key: operationId,
+				taskId: "agx-task-1",
+				peer: "a".repeat(64),
+				capability: "invoice.guarded",
+				deadlineAt: Date.now() + 60_000,
+			};
+			store.save({ ...base, phase: "publishing" });
+			for (const changed of [
+				{ taskId: "agx-task-2" },
+				{ peer: "b".repeat(64) },
+				{ capability: "invoice.other" },
+				{ deadlineAt: base.deadlineAt + 1 },
+			]) {
+				expect(() => store.save({ ...base, ...changed, phase: "waiting" })).toThrow(/correlation/i);
+			}
+			store.save({ ...base, phase: "waiting" });
+			expect(() => store.save({ ...base, phase: "publishing" })).toThrow(/phase|publishing/i);
+			return { status: "completed" };
+		});
+		store.close();
+	});
+
 	it("retries failures that prove no task was published", async () => {
 		const store = new TaskOperationStore("test");
 		const failures = [

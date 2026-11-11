@@ -29,7 +29,7 @@ import { messageEvent, receiptEvent, taskEvent } from "./events.js";
 import { ApiError, readJson, sendError, sendJson } from "./http.js";
 import { parseIdempotencyKey, TaskOperationStore } from "./idempotency.js";
 import { verifyGatewayKey } from "./keys.js";
-import { type OperationDeps, parseTaskRequest, readCard, runTaskRequest, sendMessage } from "./operations.js";
+import { type OperationDeps, parseTaskRequest, readCard, runRecoveredTaskRequest, runTaskRequest, sendMessage } from "./operations.js";
 import { Requester } from "./requester.js";
 import { KeyedSlots } from "./slots.js";
 import {
@@ -172,7 +172,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			onFailure: (subscription, eventId, detail) =>
 				log(`DROP  delivery of ${eventId.slice(0, 8)} to ${subscription.id} failed: ${detail}`),
 		});
-		const requester = new Requester(transport, options.logger);
+		const requester = new Requester(transport, options.logger, taskOperations);
 		const deps: OperationDeps = {
 			npub: identity.npub,
 			publicKey: identity.publicKey,
@@ -542,7 +542,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				try {
 					const body = await readJson(req);
 					const taskRequest = parseTaskRequest(body);
-					const operation = () => runTaskRequest(deps, taskRequest);
+					const operation = (operationId: string) => runTaskRequest(deps, taskRequest, undefined, operationId);
 					if (taskRequest.background) {
 						sendJson(res, 202, taskOperations.submit(bearer(req), idempotencyKey, body, operation));
 						return;
@@ -652,7 +652,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			} catch (error) {
 				log(`task outcomes could not be saved: ${error instanceof Error ? error.message : String(error)}`);
 			}
-			requester.stop();
+			await requester.stop();
 			// One budget for the whole stop, under the 10 s a container runtime
 			// gives before it kills the process.
 			let timer: ReturnType<typeof setTimeout> | undefined;
@@ -674,6 +674,9 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			}
 			await client.stop().catch(() => undefined);
 		};
+
+		const recovered = await requester.restore();
+		taskOperations.recover(recovered, (operation) => runRecoveredTaskRequest(deps, operation));
 
 		const host = options.host ?? "127.0.0.1";
 		await new Promise<void>((resolve, reject) => {
