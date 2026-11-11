@@ -671,9 +671,9 @@ describe("agx gateway: outbound", () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
 		let runs = 0;
 		let release: () => void = () => undefined;
-		reviewer.client.handle("invoice.background.stream", async (task) => {
+		reviewer.client.handle("invoice.background.stream", async (_task, ctx) => {
 			runs += 1;
-			await task.report?.("reviewing");
+			await ctx.report("reviewing");
 			await new Promise<void>((resolve) => {
 				release = resolve;
 			});
