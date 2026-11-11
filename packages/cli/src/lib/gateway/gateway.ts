@@ -196,9 +196,8 @@ function serveTaskEvents(
 		"connection": "keep-alive",
 		"x-accel-buffering": "no",
 		"x-content-type-options": "nosniff",
-		"retry": "1000",
 	});
-	res.write(": connected\n\n");
+	res.write("retry: 1000\n: connected\n\n");
 	res.on("close", cleanup);
 	terminalTimer = setInterval(() => {
 		try {

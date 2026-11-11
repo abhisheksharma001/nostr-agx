@@ -22,4 +22,4 @@
 
 ## Operational contract
 
-Send `Cache-Control: no-store, no-transform` and `X-Accel-Buffering: no`; proxies must not buffer SSE. A heartbeat is a comment and has no event ID. Intermediate replay is bounded and in-memory; the durable terminal view is authoritative after process restart.
+Send `Cache-Control: no-store, no-transform` and `X-Accel-Buffering: no`; proxies must not buffer SSE. The stream body starts with a `retry: 1000` field. The gateway reads `working` updates through `request({ onTaskStatus })`, not `streamRequest()`, so a task that needs input still fails with 422 `input_required`. A heartbeat is a comment and has no event ID. Intermediate replay is bounded and in-memory; the durable terminal view is authoritative after process restart.
