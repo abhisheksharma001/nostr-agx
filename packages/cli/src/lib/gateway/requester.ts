@@ -6,6 +6,7 @@ import {
 	type RecoveredPendingRequest,
 } from "@nostr-agx/core";
 import { MAX_WRAP_BACKDATE_SEC } from "@nostr-agx/nostr";
+import { MAX_BACKGROUND_TASKS_IN_FLIGHT, MAX_TASK_OPERATIONS_IN_FLIGHT } from "./idempotency.js";
 
 /** How often the inbox is polled for results while requests are waiting. */
 const RESULT_POLL_MS = 1_000;
@@ -36,6 +37,7 @@ export class Requester {
 		private readonly transport: AgxTransport,
 		private readonly logger?: AgxLogger,
 		private readonly pendingRequests?: PendingRequestStore,
+		private readonly maxRestoredRequests = MAX_TASK_OPERATIONS_IN_FLIGHT + MAX_BACKGROUND_TASKS_IN_FLIGHT,
 	) {
 		this.client = this.newClient();
 	}
@@ -46,6 +48,7 @@ export class Requester {
 			logger: this.logger,
 			startCursor: nowSec(),
 			pendingRequests: this.pendingRequests,
+			maxRestoredRequests: this.maxRestoredRequests,
 		});
 	}
 

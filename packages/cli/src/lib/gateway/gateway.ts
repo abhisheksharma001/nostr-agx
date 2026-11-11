@@ -27,7 +27,7 @@ import { AGX_CLI_VERSION } from "../version.js";
 import { DeliveryQueue, deliver } from "./delivery.js";
 import { messageEvent, receiptEvent, taskEvent } from "./events.js";
 import { ApiError, readJson, sendError, sendJson } from "./http.js";
-import { parseIdempotencyKey, TaskOperationStore } from "./idempotency.js";
+import { MAX_BACKGROUND_TASKS_IN_FLIGHT, parseIdempotencyKey, TaskOperationStore } from "./idempotency.js";
 import { verifyGatewayKey } from "./keys.js";
 import { type OperationDeps, parseTaskRequest, readCard, runRecoveredTaskRequest, runTaskRequest, sendMessage } from "./operations.js";
 import { Requester } from "./requester.js";
@@ -172,7 +172,13 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			onFailure: (subscription, eventId, detail) =>
 				log(`DROP  delivery of ${eventId.slice(0, 8)} to ${subscription.id} failed: ${detail}`),
 		});
-		const requester = new Requester(transport, options.logger, taskOperations);
+		const requester = new Requester(
+			transport,
+			options.logger,
+			taskOperations,
+			(options.maxTaskOperationsInFlight ?? MAX_TASK_REQUESTS_WAITING) +
+				(options.maxBackgroundTasksInFlight ?? MAX_BACKGROUND_TASKS_IN_FLIGHT),
+		);
 		const deps: OperationDeps = {
 			npub: identity.npub,
 			publicKey: identity.publicKey,
