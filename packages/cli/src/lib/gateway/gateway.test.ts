@@ -694,11 +694,14 @@ describe("agx gateway: outbound", () => {
 		expect(liveResponse.headers.get("content-type")).toContain("text/event-stream");
 		expect(liveResponse.headers.get("cache-control")).toBe("no-store, no-transform");
 		expect(liveResponse.headers.get("x-accel-buffering")).toBe("no");
+		// `retry` is an SSE field in the stream body, not an HTTP header.
+		expect(liveResponse.headers.get("retry")).toBeNull();
 		const early = await readSse(
 			liveResponse,
 			reviewer.client,
 			(text) => text.includes("event: working") && text.includes(": heartbeat"),
 		);
+		expect(early).toContain("retry: 1000\n");
 		expect(early).toContain("id: 1");
 		expect(early).toContain('"message":"reviewing"');
 		expect(early).not.toContain("event: completed");
