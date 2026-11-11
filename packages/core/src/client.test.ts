@@ -292,6 +292,71 @@ describe("AgxClient task request/response", () => {
 		expect(publishMessage).not.toHaveBeenCalled();
 	});
 
+	describe("streamRequest preflight", () => {
+		function typedPeerTransport() {
+			return {
+				...bus.transport(ALICE),
+				resolvePeer: vi.fn(async () => ({
+					relays: [],
+					card: {
+						displayName: "Billing",
+						capabilities: ["invoice.review"],
+						nip05: null,
+						skills: [{
+							id: "invoice.review",
+							description: "Review an invoice",
+							inputSchema: {
+								type: "object",
+								required: ["amount"],
+								properties: { amount: { type: "number" } },
+							},
+						}],
+					},
+				})),
+			} satisfies AgxTransport;
+		}
+
+		it("rejects a payload the peer's typed skill refuses, before publishing", async () => {
+			const transport = typedPeerTransport();
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			await expect(
+				alice.streamRequest(BOB, "invoice.review", { amount: "hello" }, { validate: true }),
+			).rejects.toThrow(/invalid_input.*expected number/);
+			expect(publishMessage).not.toHaveBeenCalled();
+		});
+
+		it("publishes a payload that satisfies the peer's typed skill", async () => {
+			const transport = typedPeerTransport();
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			const stream = await alice.streamRequest(
+				BOB,
+				"invoice.review",
+				{ amount: 5 },
+				{ validate: true, timeoutMs: 20 },
+			);
+			expect(publishMessage).toHaveBeenCalledTimes(1);
+			await expect(stream.result).rejects.toThrow(/timed out/);
+		});
+
+		it("does not look the peer up unless validate is set", async () => {
+			const transport = typedPeerTransport();
+			const alice = new AgxClient({ transport });
+
+			const stream = await alice.streamRequest(
+				BOB,
+				"invoice.review",
+				{ amount: "hello" },
+				{ timeoutMs: 20 },
+			);
+			expect(transport.resolvePeer).not.toHaveBeenCalled();
+			await expect(stream.result).rejects.toThrow(/timed out/);
+		});
+	});
+
 	it("returns invalid_input for an authorized bad payload without invoking the handler", async () => {
 		const alice = new AgxClient({ transport: bus.transport(ALICE) });
 		const handler = vi.fn(() => ({ approved: true }));
