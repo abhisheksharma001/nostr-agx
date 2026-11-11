@@ -56,8 +56,11 @@ const operationSchema = z.object({
 	request: requestSchema.optional(),
 	outcome: outcomeSchema.nullable(),
 });
+// Still version 1: `request` is optional, and gateways from before it strip the
+// unknown field and report that work as result_unknown. A version they do not
+// know would make them quarantine the file and forget every completed key.
 const fileSchema = z.object({
-	version: z.union([z.literal(1), z.literal(2)]),
+	version: z.literal(1),
 	operations: z.array(operationSchema).default([]),
 });
 
@@ -383,6 +386,17 @@ export class TaskOperationStore implements PendingRequestStore {
 
 	save(record: PendingRequestRecord): void {
 		this.assertOpen();
+		const parsed = requestSchema.safeParse({
+			taskId: record.taskId,
+			peer: record.peer,
+			capability: record.capability,
+			deadlineAt: record.deadlineAt,
+			phase: record.phase,
+		});
+		if (!parsed.success) {
+			// The reader would quarantine the whole file over one bad record.
+			throw new ApiError(500, "idempotency_store_failed", "Pending request correlation is invalid");
+		}
 		const operation = this.records.get(record.key);
 		if (!operation || operation.outcome !== null) {
 			throw new ApiError(500, "idempotency_store_failed", "The pending task operation is unavailable");
@@ -397,16 +411,13 @@ export class TaskOperationStore implements PendingRequestStore {
 		)) {
 			throw new ApiError(500, "idempotency_store_failed", "Pending request correlation or phase change is invalid");
 		}
-		this.writeRequest(operation, {
-			taskId: record.taskId,
-			peer: record.peer,
-			capability: record.capability,
-			deadlineAt: record.deadlineAt,
-			phase: record.phase,
-		});
+		this.writeRequest(operation, parsed.data);
 	}
 
 	remove(key: string): void {
+		// After close() the outcome can no longer be saved; keeping the waiting
+		// record lets the next start recover the result instead of reporting unknown.
+		this.assertOpen();
 		const operation = this.records.get(key);
 		if (!operation?.request) return;
 		this.writeRequest(operation, undefined);
@@ -841,7 +852,7 @@ export class TaskOperationStore implements PendingRequestStore {
 
 	private persist(): void {
 		writePrivateJson(this.path, {
-			version: 2,
+			version: 1,
 			operations: Array.from(this.records.values()),
 		});
 	}

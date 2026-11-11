@@ -176,8 +176,14 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			transport,
 			options.logger,
 			taskOperations,
-			(options.maxTaskOperationsInFlight ?? MAX_TASK_REQUESTS_WAITING) +
-				(options.maxBackgroundTasksInFlight ?? MAX_BACKGROUND_TASKS_IN_FLIGHT),
+			// Stored work was admitted under the limits of an earlier run: restore all
+			// of it even when the limits were lowered since, rather than refuse to start.
+			// New work waits until the in-flight count drops below the current limits.
+			Math.max(
+				(options.maxTaskOperationsInFlight ?? MAX_TASK_REQUESTS_WAITING) +
+					(options.maxBackgroundTasksInFlight ?? MAX_BACKGROUND_TASKS_IN_FLIGHT),
+				taskOperations.list().length,
+			),
 		);
 		const deps: OperationDeps = {
 			npub: identity.npub,

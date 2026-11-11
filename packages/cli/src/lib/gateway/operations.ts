@@ -113,7 +113,10 @@ async function awaitTaskResult(
 		output = await result;
 	} catch (error) {
 		const message = messageOf(error);
-		if (error instanceof AgxRequestUnknownError || message === "AGX request outcome unknown") {
+		// By type or code only: a remote peer's failure is a plain Error carrying the
+		// peer's own text, so matching text would let it pose as a local condition.
+		const code = (error as { code?: unknown } | null)?.code;
+		if (error instanceof AgxRequestUnknownError || code === "result_unknown") {
 			throw new ApiError(
 				409,
 				"result_unknown",
@@ -121,12 +124,14 @@ async function awaitTaskResult(
 				"The remote agent may have executed the task. Check its effects before submitting new work.",
 			);
 		}
-		if (error instanceof AgxPendingRequestStoreError || message === "AGX request storage failed") {
+		if (error instanceof AgxPendingRequestStoreError || code === "pending_request_store_failed") {
 			throw new ApiError(
 				500,
 				"idempotency_store_failed",
 				"The task's pending correlation could not be stored",
-				"Do not retry with a different key until you have checked whether the remote agent executed the task.",
+				(error as { mayHavePublished?: unknown }).mayHavePublished === false
+					? "Nothing was sent to the remote agent. Retry with a new key once the gateway can write its task store."
+					: "Do not retry with a different key until you have checked whether the remote agent executed the task.",
 			);
 		}
 		if (message.startsWith("AGX task requires input")) {
