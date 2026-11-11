@@ -1166,6 +1166,17 @@ export class AgxClient {
 			// Guard defensively and, crucially, do NOT auto-reply.
 			return;
 		}
+		// Refuse a reused active task id before validating its payload, so a
+		// duplicate never answers for (or terminates) the task already running.
+		const peer = this.normalizeId(msg.from);
+		const activeTaskKey = this.activeInboundTaskKey(peer, env.taskId);
+		if (this.activeInboundTasks.has(activeTaskKey)) {
+			this.log.warn?.("AGX: duplicate active task ID; dropping", {
+				taskId: env.taskId,
+				from: msg.from,
+			});
+			return;
+		}
 		if (registered.contract?.inputSchema) {
 			const problem = validateAgxJsonPayload(
 				registered.contract.inputSchema,
@@ -1184,15 +1195,6 @@ export class AgxClient {
 				});
 				return;
 			}
-		}
-		const peer = this.normalizeId(msg.from);
-		const activeTaskKey = this.activeInboundTaskKey(peer, env.taskId);
-		if (this.activeInboundTasks.has(activeTaskKey)) {
-			this.log.warn?.("AGX: duplicate active task ID; dropping", {
-				taskId: env.taskId,
-				from: msg.from,
-			});
-			return;
 		}
 		this.activeInboundTasks.set(activeTaskKey, {
 			canceled: false,

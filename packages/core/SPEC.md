@@ -271,8 +271,10 @@ schema-driven fetch beyond normal peer-card resolution.
 After authorization succeeds, a receiver with an input schema validates before invoking its handler.
 Invalid input produces only the safe `invalid_input` failure; detailed paths remain in local logs.
 Denied requesters receive no validation response and follow the normal plain-message trust path.
-An invalid request is answered before it is registered as an active task or takes a concurrency slot,
-so a retry under the same task ID is accepted. A task the requester has canceled sends no result, so
+A request reusing the task ID of a task that is still active is refused before its payload is
+validated, so a duplicate never answers for the running task. Otherwise an invalid request is answered
+before it is registered as an active task or takes a concurrency slot, so a retry under the same task
+ID is accepted. A task the requester has canceled sends no result, so
 it never sends `invalid_output` either.
 A handler result that violates its registered `outputSchema` produces `invalid_output` instead of a
 completed result. Structured error codes and requester-side validation of remote results remain
