@@ -141,6 +141,58 @@ async function readSse(
 	return pumping(reading, client);
 }
 
+/** Read one SSE connection in steps, keeping it open between them. */
+function sseConnection(res: Response) {
+	if (!res.body) {
+		throw new Error("SSE response has no body");
+	}
+	const reader = res.body.getReader();
+	const decoder = new TextDecoder();
+	let text = "";
+	let ended = false;
+	const read = (client: AgxClient, until: (text: string) => boolean) =>
+		pumping(
+			(async () => {
+				const deadline = Date.now() + 10_000;
+				while (!ended && !until(text)) {
+					const remaining = deadline - Date.now();
+					if (remaining <= 0) {
+						await reader.cancel().catch(() => undefined);
+						throw new Error(`SSE did not reach expected state: ${text}`);
+					}
+					let timer: ReturnType<typeof setTimeout> | undefined;
+					const chunk = await Promise.race([
+						reader.read(),
+						new Promise<null>((resolve) => {
+							timer = setTimeout(() => resolve(null), remaining);
+						}),
+					]).finally(() => clearTimeout(timer));
+					if (chunk === null) {
+						continue;
+					}
+					if (chunk.done) {
+						ended = true;
+						break;
+					}
+					text += decoder.decode(chunk.value, { stream: true });
+				}
+				return text;
+			})(),
+			client,
+		);
+	return {
+		readUntil: read,
+		/** Read until the server ends the connection; fails if it never does. */
+		readToEnd: async (client: AgxClient) => {
+			const all = await read(client, () => false);
+			if (!ended) {
+				throw new Error(`SSE connection did not end: ${all}`);
+			}
+			return all;
+		},
+	};
+}
+
 /** Pump `client` until `promise` settles. */
 async function pumping<T>(promise: Promise<T>, client: AgxClient): Promise<T> {
 	let settled = false;
@@ -696,8 +748,8 @@ describe("agx gateway: outbound", () => {
 		expect(liveResponse.headers.get("x-accel-buffering")).toBe("no");
 		// `retry` is an SSE field in the stream body, not an HTTP header.
 		expect(liveResponse.headers.get("retry")).toBeNull();
-		const early = await readSse(
-			liveResponse,
+		const live = sseConnection(liveResponse);
+		const early = await live.readUntil(
 			reviewer.client,
 			(text) => text.includes("event: working") && text.includes(": heartbeat"),
 		);
@@ -708,6 +760,11 @@ describe("agx gateway: outbound", () => {
 		expect(await backgroundTask(id)).toMatchObject({ status: "running" });
 
 		release();
+		// The connection opened while the task ran sees the terminal event, once, and then ends.
+		const liveEnd = await live.readToEnd(reviewer.client);
+		expect(liveEnd.match(/event: completed/g)).toHaveLength(1);
+		expect(liveEnd.indexOf("event: completed")).toBeGreaterThan(liveEnd.indexOf("event: working"));
+		expect(liveEnd).toContain('"run":1');
 		const completed = await settledBackgroundTask(id, reviewer.client);
 		expect(completed).toMatchObject({ status: "completed", result: { output: { run: 1 } } });
 		const replayResponse = await api(`/v1/tasks/${id}/events`, {
