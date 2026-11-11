@@ -515,6 +515,43 @@ describe("AgxClient task request/response", () => {
 			);
 		});
 
+		it("refuses a bad-payload duplicate of a running task instead of answering invalid_input", async () => {
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+				maxConcurrentTasks: 2,
+			});
+			const running = gate();
+			const handler = vi.fn(() => running.opened.then(() => ({ approved: true })));
+			bob.handle("invoice.review", handler, invoiceContract);
+			const request = (payload: unknown) => ({
+				t: "req" as const,
+				taskId: "dup-1",
+				capability: "invoice.review",
+				payload,
+			});
+
+			await sendFromAlice(request({ amount: 5 }));
+			await bob.pump();
+			expect(handler).toHaveBeenCalledTimes(1);
+
+			// Same peer, same task id, payload that fails the input schema, while dup-1 runs.
+			await sendFromAlice(request({ amount: "hello" }));
+			await bob.pump();
+			expect(resultsSentToAlice()).toEqual([]);
+
+			running.open();
+			await bob.tasksSettled();
+			expect(handler).toHaveBeenCalledTimes(1);
+			expect(resultsSentToAlice()).toEqual([
+				expect.objectContaining({
+					taskId: "dup-1",
+					status: "completed",
+					output: { approved: true },
+				}),
+			]);
+		});
+
 		it("answers invalid input at once instead of queueing it for a free slot", async () => {
 			const bob = new AgxClient({
 				transport: bus.transport(BOB),
