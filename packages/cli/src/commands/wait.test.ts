@@ -5,8 +5,10 @@ import { EXIT } from "../lib/errors.js";
 import { loadIdentity } from "../lib/identity.js";
 import { INBOX_SCHEMA, INBOX_SUMMARY_SCHEMA, type InboxReport, type InboxSummary } from "../lib/inbox.js";
 import { setJsonMode } from "../lib/output.js";
+import { profileDir } from "../lib/paths.js";
 import { toHexPubkey } from "../lib/peer.js";
 import { loadState } from "../lib/state.js";
+import { MessageStore } from "../lib/store/message-store.js";
 import { createTransport, makeLogger } from "../lib/transport.js";
 import { type RunningRelay, startRelay } from "../relay/server.js";
 import { agx, capture, jsonDocuments, sandbox } from "../test/helpers.js";
@@ -146,6 +148,7 @@ describe("agx wait", () => {
 		expect(run.code).toBe(EXIT.ok);
 		expect(report(run)).toMatchObject({ timedOut: false, truncated: false });
 		expect(report(run).messages.map((message) => message.text)).toEqual(["live arrival"]);
+		expect(new MessageStore(profileDir("receiver")).listMessages().map((message) => message.text)).toEqual(["live arrival"]);
 	});
 
 	it("wakes for a receipt matched to a sent message", async () => {
