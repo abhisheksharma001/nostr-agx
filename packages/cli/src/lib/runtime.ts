@@ -56,9 +56,10 @@ export function setRuntimeForTests(patch: Partial<Runtime>): () => void {
 
 /**
  * The timeout signals `timeoutSignal` hands out, kept reachable for as long as
- * the combined signal is. Node 20 holds a timeout source only weakly from
- * `AbortSignal.any`, so without this a garbage collection can drop the timeout
- * and the deadline never fires; Node 22 and later keep it themselves.
+ * the combined signal is. `AbortSignal.any` holds its sources only weakly, so on
+ * Node 20 (and early 22.x) a garbage collection can drop the timeout and the
+ * deadline never fires. Later Node versions pin it themselves (nodejs/node#57867);
+ * keeping our own reference costs nothing there.
  */
 const timeoutSources = new WeakMap<AbortSignal, AbortSignal>();
 

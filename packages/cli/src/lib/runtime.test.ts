@@ -7,6 +7,7 @@ import { timeoutSignal } from "./runtime.js";
 function collectGarbage(): void {
 	setFlagsFromString("--expose-gc");
 	const gc = runInNewContext("gc") as () => void;
+	setFlagsFromString("--no-expose-gc");
 	gc();
 }
 
@@ -19,7 +20,7 @@ describe("timeoutSignal", () => {
 		// The caller holds only the combined signal, as `fetch` does. On Node 20
 		// the combined signal keeps its timeout source weakly, so a collection
 		// could drop the timeout and the deadline never came.
-		const signal = timeoutSignal(100, new AbortController().signal);
+		const signal = timeoutSignal(300, new AbortController().signal);
 		let aborted = false;
 		signal.addEventListener("abort", () => {
 			aborted = true;
@@ -28,7 +29,7 @@ describe("timeoutSignal", () => {
 			collectGarbage();
 			await tick();
 		}
-		await wait(400);
+		await wait(1000);
 		expect(aborted).toBe(true);
 		expect((signal.reason as Error).name).toBe("TimeoutError");
 	});
