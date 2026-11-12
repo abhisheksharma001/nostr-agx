@@ -1,10 +1,7 @@
+import { parseAgxAgentSkill } from "./agent-card";
 import { AgxPublicError, AgxTaskDeclined, AgxTaskFailedError } from "./errors";
 import { randomId } from "./id";
-import {
-	agxWireJson,
-	validateAgxJsonPayload,
-	validateAgxJsonSchema,
-} from "./json-schema";
+import { agxWireJson, validateAgxJsonPayload } from "./json-schema";
 import { type AgxLogger, noopLogger } from "./logger";
 import { InMemorySeenStore, type SeenStore } from "./seen-store";
 import {
@@ -49,6 +46,16 @@ export type TaskHandler<Payload = unknown, Output = unknown> = (
 ) => Output | Promise<Output>;
 
 export type AgxTaskContract = Omit<AgxAgentSkill, "id">;
+
+const taskContractFields = new Set([
+	"description",
+	"tags",
+	"inputModes",
+	"outputModes",
+	"inputSchema",
+	"outputSchema",
+	"features",
+]);
 
 interface RegisteredTaskHandler {
 	handler: TaskHandler;
@@ -394,27 +401,39 @@ export class AgxClient {
 		return new TextEncoder().encode(text).length <= MAX_BODY_BYTES;
 	}
 
-	/** Register a capability handler and, optionally, its public typed contract. */
+	/** Register a capability handler and, optionally, its public typed contract.
+	 * The contract must pass the same rules the Agent Card applies to a typed
+	 * skill, so a contract accepted here can always be published. The client
+	 * keeps its own copy: changing `contract` afterwards has no effect. */
 	handle<Payload = unknown, Output = unknown>(
 		capability: string,
 		handler: TaskHandler<Payload, Output>,
 		contract?: AgxTaskContract,
 	): this {
-		for (const keyword of ["inputSchema", "outputSchema"] as const) {
-			const schema = contract?.[keyword];
-			if (!schema) {
-				continue;
-			}
-			const problem = validateAgxJsonSchema(schema);
-			if (problem) {
+		let registered: AgxTaskContract | undefined;
+		if (contract) {
+			// Stricter than a card reader, which ignores unknown fields: here an
+			// unknown field is most likely a typo such as `inputschema`.
+			const unknownField = Object.keys(contract).find(
+				(field) => !taskContractFields.has(field),
+			);
+			if (unknownField !== undefined) {
 				throw new Error(
-					`AGX handler ${capability} ${keyword}: ${problem}`,
+					`AGX handler ${capability} contract: unknown field ${unknownField.slice(0, 120)}`,
 				);
 			}
+			const parsed = parseAgxAgentSkill({ ...contract, id: capability });
+			if ("problem" in parsed) {
+				throw new Error(
+					`AGX handler ${capability} contract: ${parsed.problem}`,
+				);
+			}
+			const { id: _id, ...copy } = parsed.skill;
+			registered = copy;
 		}
 		this.handlers.set(capability, {
 			handler: handler as TaskHandler,
-			contract,
+			contract: registered,
 		});
 		return this;
 	}
