@@ -26,7 +26,8 @@ export function withHandshakeTimeout(timeoutMs: number) {
 /**
  * Build the Nostr transport for this profile.
  *
- * `ws` is injected explicitly: Node 20 has no global WebSocket, and
+ * `ws` is injected explicitly: Node 20 has no global WebSocket, and Node's
+ * later native implementation is refused because a relay can crash it.
  * `NostrTransport.create` registers whatever it is given process-wide.
  *
  * The relay URLs configured here are the agent's OWN, and are never SSRF-guarded

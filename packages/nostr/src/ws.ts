@@ -1,8 +1,9 @@
 import { useWebSocketImplementation } from "nostr-tools/relay";
 
 /**
- * WebSocket injection. nostr-tools uses the global `WebSocket` in browsers/edge,
- * but Node has none — the host injects one (`ws`). Call once before dialing.
+ * WebSocket injection. Browsers and edge runtimes can use their global. Node
+ * hosts must inject the `ws` package: Node's own WebSocket comes from undici,
+ * where relay-controlled frames and handshake headers have caused process exits.
  */
 
 /** A WHATWG-compatible WebSocket constructor (e.g. the Node `ws` package's
@@ -12,11 +13,32 @@ export type WebSocketImpl = unknown;
 
 let configured = false;
 
-/** Configure the WebSocket implementation for relay connections. Pass a Node `ws`
- * constructor; omit in a browser/edge runtime where a global `WebSocket` exists.
- * Idempotent — a repeat call with the same intent is a no-op. */
+function globalWebSocket(): unknown {
+	return typeof globalThis === "undefined"
+		? undefined
+		: (globalThis as { WebSocket?: unknown }).WebSocket;
+}
+
+function isNodeNativeWebSocket(impl: unknown): boolean {
+	return (
+		impl === globalWebSocket() &&
+		(globalThis as { process?: { versions?: { undici?: string } } }).process?.versions?.undici !== undefined &&
+		typeof (impl as { prototype?: { on?: unknown } }).prototype?.on !== "function"
+	);
+}
+
+function assertSafeNodeWebSocket(impl: unknown): void {
+	if (isNodeNativeWebSocket(impl)) {
+		throw new Error("Node's own WebSocket is refused (a relay can crash it): pass ws (the ws package's WebSocket)");
+	}
+}
+
+/** Configure the WebSocket implementation for relay connections. On Node, pass
+ * the `ws` package; its native `WebSocket` is refused. In a browser/edge runtime,
+ * omit to use the global. Idempotent — a repeat call with the same intent is a no-op. */
 export function configureWebSocket(impl?: WebSocketImpl): void {
 	if (impl) {
+		assertSafeNodeWebSocket(impl);
 		useWebSocketImplementation(
 			impl as Parameters<typeof useWebSocketImplementation>[0],
 		);
@@ -26,11 +48,9 @@ export function configureWebSocket(impl?: WebSocketImpl): void {
 	if (configured) {
 		return;
 	}
-	if (
-		typeof globalThis !== "undefined" &&
-		typeof (globalThis as { WebSocket?: unknown }).WebSocket !== "undefined"
-	) {
-		// A global WebSocket exists (browser/edge/Node 21+) — nostr-tools uses it.
+	const globalImpl = globalWebSocket();
+	if (globalImpl !== undefined) {
+		assertSafeNodeWebSocket(globalImpl);
 		configured = true;
 	}
 }
