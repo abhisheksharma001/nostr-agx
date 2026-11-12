@@ -22,10 +22,11 @@ function globalWebSocket(): unknown {
 }
 
 function isNodeNativeWebSocket(impl: unknown): boolean {
+	const prototype = (impl as { prototype?: { on?: unknown; [Symbol.toStringTag]?: unknown } }).prototype;
 	return (
-		impl === globalWebSocket() &&
 		(globalThis as { process?: { versions?: { undici?: string } } }).process?.versions?.undici !== undefined &&
-		typeof (impl as { prototype?: { on?: unknown } }).prototype?.on !== "function"
+		prototype?.[Symbol.toStringTag] === "WebSocket" &&
+		typeof prototype.on !== "function"
 	);
 }
 
