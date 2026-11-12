@@ -91,6 +91,10 @@ describe("AGX JSON Schema validation", () => {
 		expectInvalid({ type: "number", exclusiveMaximum: 2 }, 2, /exclusiveMaximum/);
 	});
 
+	it("fails multipleOf when the quotient overflows instead of passing", () => {
+		expectInvalid({ type: "number", multipleOf: 1e-300 }, 1e300, /multipleOf/);
+	});
+
 	it("compares const and enum values as JSON, independent of object key order", () => {
 		expectValid({ const: { a: 1, b: [true] } }, { b: [true], a: 1 });
 		expectValid({ enum: ["new", { a: 1 }] }, { a: 1 });
