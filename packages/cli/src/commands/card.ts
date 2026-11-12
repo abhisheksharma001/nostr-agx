@@ -191,8 +191,8 @@ export async function cardCommand(
 		? typedMetadata.skills?.find((skill) => skill.id === options.skill)
 		: undefined;
 	if (options.skill && !selectedSkill) {
-		const warning = typedMetadata.warning
-			? ` ${typedMetadata.warning.message}`
+		const warning = typedMetadata.warnings
+			? ` ${typedMetadata.warnings.map((entry) => entry.message).join(" ")}`
 			: "";
 		throw new AgxCliError(
 			`No valid typed skill "${options.skill}" found on this Agent Card.${warning}`,
@@ -220,8 +220,8 @@ export async function cardCommand(
 			"The signature does not verify. Anything on this card is unattributable.",
 		);
 	}
-	if (typedMetadata.warning) {
-		warn(typedMetadata.warning.message);
+	for (const warning of typedMetadata.warnings ?? []) {
+		warn(warning.message);
 	}
 	if (typedMetadata.skills?.length) {
 		say("");

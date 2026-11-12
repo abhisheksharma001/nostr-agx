@@ -68,8 +68,8 @@ export function buildCard(params: {
 		(params.extensions ?? []).map((extension) => extension.uri),
 	);
 	const typed = parseAgentCardMetadata(params, declaredExtensions);
-	if (typed.warning) {
-		throw new Error(typed.warning.message);
+	if (typed.warnings) {
+		throw new Error(typed.warnings.map((warning) => warning.message).join("; "));
 	}
 	const hasTypedMetadata =
 		params.skills !== undefined || params.extensions !== undefined;
@@ -239,9 +239,9 @@ function parsePeerCard(latest: Event | undefined): PeerCard | null {
 		...(typed.extensions === undefined
 			? {}
 			: { extensions: typed.extensions }),
-		...(typed.warning === undefined
+		...(typed.warnings === undefined
 			? {}
-			: { typedMetadataWarning: typed.warning }),
+			: { typedMetadataWarnings: typed.warnings }),
 	};
 }
 

@@ -34,7 +34,8 @@ const typedMetadataSchema = z.object({
 export interface TypedAgentCardMetadata {
 	skills?: AgentSkill[];
 	extensions?: AgentCardExtension[];
-	warning?: AgentCardMetadataWarning;
+	/** Why typed metadata, or part of it, was left out. Absent when none was. */
+	warnings?: AgentCardMetadataWarning[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -54,11 +55,25 @@ function utf8Size(value: unknown): number | null {
 
 function invalid(detail: string): TypedAgentCardMetadata {
 	return {
-		warning: {
-			code: "invalid_typed_metadata",
-			message: `Typed Agent Card metadata ignored: ${detail}`,
-		},
+		warnings: [
+			{
+				code: "invalid_typed_metadata",
+				message: `Typed Agent Card metadata ignored: ${detail}`,
+			},
+		],
 	};
+}
+
+/** `skills.3 ("invoice.review")`: where an entry sat, and its name if it has one. */
+function entryLabel(
+	list: "skills" | "extensions",
+	index: number,
+	entry: unknown,
+): string {
+	const name = isRecord(entry) ? entry[list === "skills" ? "id" : "uri"] : undefined;
+	return typeof name === "string"
+		? `${list}.${index} (${JSON.stringify(name.slice(0, 120))})`
+		: `${list}.${index}`;
 }
 
 export function parseAgentCardMetadata(
@@ -104,52 +119,96 @@ function parseAgentCardMetadataUnsafe(
 		return invalid(`${path}${issue?.message ?? "invalid metadata"}`);
 	}
 
-	const skills: AgentSkill[] = [];
-	const skillIds = new Set<string>();
-	for (const [index, entry] of (parsed.data.skills ?? []).entries()) {
-		const result = parseAgxAgentSkill(entry);
-		if ("problem" in result) {
-			return invalid(`skills.${index}: ${result.problem}`);
-		}
-		const skill = result.skill;
-		if (skillIds.has(skill.id)) {
-			return invalid(`duplicate skill ID: ${skill.id}`);
-		}
-		skillIds.add(skill.id);
-		skills.push(skill);
-	}
+	const warnings: AgentCardMetadataWarning[] = [];
 
-	const extensions: AgentCardExtension[] = [];
-	const extensionUris = new Set<string>();
+	// Extensions: an invalid entry hides only itself, unless it says
+	// `required: true`; then it counts as an unsupported required extension.
+	const extensionsByUri = new Map<string, AgentCardExtension>();
+	const invalidRequired: string[] = [];
 	for (const [index, entry] of (parsed.data.extensions ?? []).entries()) {
-		const result = parseAgxAgentCardExtension(entry);
-		if ("problem" in result) {
-			return invalid(`extensions.${index}: ${result.problem}`);
+		const label = entryLabel("extensions", index, entry);
+		const parsedExtension = parseAgxAgentCardExtension(entry);
+		if ("problem" in parsedExtension) {
+			warnings.push({
+				code: "invalid_typed_extension",
+				message: `Typed extension ignored: ${label}: ${parsedExtension.problem}`,
+			});
+			if (isRecord(entry) && entry.required === true) {
+				invalidRequired.push(label);
+			}
+			continue;
 		}
-		const extension = result.extension;
-		if (extensionUris.has(extension.uri)) {
-			return invalid(`duplicate extension URI: ${extension.uri}`);
+		const extension = parsedExtension.extension;
+		const declared = extensionsByUri.get(extension.uri);
+		if (!declared) {
+			extensionsByUri.set(extension.uri, extension);
+			continue;
 		}
-		extensionUris.add(extension.uri);
-		extensions.push(extension);
+		warnings.push({
+			code: "invalid_typed_extension",
+			message: `Typed extension declared more than once, merged: ${label}`,
+		});
+		if (extension.required === true) {
+			declared.required = true;
+		}
 	}
-	const unsupportedRequired = extensions.filter(
-		(extension) =>
-			extension.required === true && !supportedExtensions.has(extension.uri),
-	);
+	const extensions = [...extensionsByUri.values()];
+	const unsupportedRequired = [
+		...extensions
+			.filter(
+				(extension) =>
+					extension.required === true &&
+					!supportedExtensions.has(extension.uri),
+			)
+			.map((extension) => extension.uri),
+		...invalidRequired,
+	];
 	const result: TypedAgentCardMetadata = {};
-	if (parsed.data.extensions !== undefined) {
+	if (extensions.length > 0) {
 		result.extensions = extensions;
 	}
 	if (unsupportedRequired.length > 0) {
-		result.warning = {
+		warnings.push({
 			code: "unsupported_required_extension",
-			message: `Typed skills ignored because required extensions are unsupported: ${unsupportedRequired.map((extension) => extension.uri).join(", ")}`,
-		};
+			message: `Typed skills ignored because required extensions are unsupported: ${unsupportedRequired.join(", ")}`,
+		});
+		result.warnings = warnings;
 		return result;
 	}
-	if (parsed.data.skills !== undefined) {
+
+	// Skills: an invalid entry hides only itself. A duplicated ID drops every
+	// copy, since there is no telling which one the publisher meant.
+	const parsedSkills: AgentSkill[] = [];
+	const idCounts = new Map<string, number>();
+	for (const [index, entry] of (parsed.data.skills ?? []).entries()) {
+		const parsedSkill = parseAgxAgentSkill(entry);
+		if ("problem" in parsedSkill) {
+			warnings.push({
+				code: "invalid_typed_skill",
+				message: `Typed skill ignored: ${entryLabel("skills", index, entry)}: ${parsedSkill.problem}`,
+			});
+			continue;
+		}
+		parsedSkills.push(parsedSkill.skill);
+		idCounts.set(
+			parsedSkill.skill.id,
+			(idCounts.get(parsedSkill.skill.id) ?? 0) + 1,
+		);
+	}
+	for (const [id, count] of idCounts) {
+		if (count > 1) {
+			warnings.push({
+				code: "invalid_typed_skill",
+				message: `Typed skills ignored: duplicate skill ID: ${id.slice(0, 120)}`,
+			});
+		}
+	}
+	const skills = parsedSkills.filter((skill) => idCounts.get(skill.id) === 1);
+	if (skills.length > 0) {
 		result.skills = skills;
+	}
+	if (warnings.length > 0) {
+		result.warnings = warnings;
 	}
 	return result;
 }
