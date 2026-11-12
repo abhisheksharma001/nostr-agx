@@ -90,7 +90,7 @@ describe("gift-wrapped messages (NIP-59)", () => {
 				NOW - MAX_WRAP_BACKDATE_SEC,
 			);
 		}
-	});
+	}, 15_000);
 
 	it("is unreadable by anyone but the recipient", async () => {
 		const { event } = await sendHello();

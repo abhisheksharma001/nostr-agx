@@ -24,7 +24,7 @@ import {
 	removePrivateFile,
 } from "../lib/paths.js";
 import { runtime } from "../lib/runtime.js";
-import { loadState } from "../lib/state.js";
+import { FileSeenStore, loadState } from "../lib/state.js";
 
 /** A login closer to expiry than this is worth a warning. */
 const EXPIRY_WARNING_MS = 7 * 24 * 60 * 60 * 1000;
@@ -451,8 +451,24 @@ export async function doctorCommand(options: DoctorOptions): Promise<void> {
 	}
 
 	// 6. Listing health — the two states that make discovery silently return nothing.
-	const state = loadState(profileName);
-	if (state.listingId && creds && apiStatus !== null) {
+	// The state files hold the poll cursor and the replay memory. A damaged one is
+	// a finding to report, not a reason to lose the rest of the report.
+	let state: ReturnType<typeof loadState> | null = null;
+	try {
+		state = loadState(profileName);
+		void new FileSeenStore(profileName);
+	} catch (error) {
+		if (!(error instanceof AgxCliError)) {
+			throw error;
+		}
+		checks.push({
+			name: "state files",
+			verdict: "fail",
+			detail: error.message,
+			remediation: error.remediation ?? undefined,
+		});
+	}
+	if (state?.listingId && creds && apiStatus !== null) {
 		try {
 			const client = createApiClient(creds);
 			const { listing } = await client.agentIndex.getListing({

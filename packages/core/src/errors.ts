@@ -20,6 +20,19 @@ export class AgxPublicError extends Error {
 }
 
 /**
+ * How a request's result promise rejects when the peer reports the task
+ * failed. The message is the peer's own text (or "task failed"), so it is
+ * untrusted: classify by this type, never by matching the message, which a
+ * peer could word like one of this client's local errors.
+ */
+export class AgxTaskFailedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "AgxTaskFailedError";
+	}
+}
+
+/**
  * Thrown by a task handler to leave a task unanswered: no result goes back, not
  * even a failure, and the task is recorded as handled so this client does not
  * run it again. For a host that runs the same identity in more than one place

@@ -234,7 +234,7 @@ reaches the peer as a bare `handler failed`, with the real message logged only
 locally — an internal error must not leak hostnames, table names or credentials
 across a trust boundary. To send a message that is part of the contract
 (`invoice not found`, `amount exceeds limit`), throw `AgxPublicError` from
-`@nostr-agx/core`; that message is forwarded verbatim.
+`@nostr-agx/core`; that message is forwarded verbatim, up to 2000 characters.
 
 ## What `serve` prints for a message
 

@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { AgxClient, DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
+import { AgxClient, AgxPublicError, DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
 import { generateKeypair, localSigner, NostrTransport, toNpub } from "@nostr-agx/nostr";
 import WebSocket from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -442,6 +442,58 @@ describe("agx gateway: outbound", () => {
 		const res = await pumping(retry, reviewer.client);
 		expect(res.status).toBe(200);
 		expect(await json(res)).toMatchObject({ status: "completed", output: { run: 1 } });
+		expect(runs).toBe(1);
+	}, 30_000);
+
+	it("keeps the idempotency key when a peer's failure text reads like a local error", async () => {
+		// The peer's own words: read as this gateway's "payload exceeds" error, they
+		// would give a retryable 413, free the key, and a retry would send the task again.
+		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
+		let runs = 0;
+		reviewer.client.handle("invoice.peer-text", () => {
+			runs += 1;
+			throw new AgxPublicError("AGX request: encoded payload exceeds the transport size limit");
+		});
+		const call = (background: boolean) => api("/v1/tasks", {
+			method: "POST",
+			headers: { "idempotency-key": background ? "peer-text-background" : "peer-text" },
+			body: JSON.stringify({ peer: reviewer.npub, capability: "invoice.peer-text", background, timeoutSec: 20 }),
+		});
+		const first = await pumping(call(false), reviewer.client);
+		const retry = await pumping(call(false), reviewer.client);
+		expect(runs).toBe(1);
+		expect([first.status, retry.status]).toEqual([502, 502]);
+		const failed = await json(first);
+		expect(failed).toMatchObject({ error: { code: "task_failed" } });
+		expect(await json(retry)).toEqual(failed);
+
+		const accepted = await call(true);
+		expect(accepted.status).toBe(202);
+		const id = (await json(accepted)).id as string;
+		const settled = await settledBackgroundTask(id, reviewer.client);
+		expect(settled).toMatchObject({ id, status: "failed", error: { code: "task_failed" } });
+		const backgroundRetry = await call(true);
+		expect(backgroundRetry.status).toBe(202);
+		expect(await json(backgroundRetry)).toEqual(settled);
+		expect(runs).toBe(2);
+	}, 30_000);
+
+	it("frees the idempotency key when the payload is too large to send", async () => {
+		const reviewer = await peer({ authorize: "accept-all" });
+		let runs = 0;
+		reviewer.client.handle("invoice.too-large", () => ({ run: ++runs }));
+		const call = (payload: unknown) => api("/v1/tasks", {
+			method: "POST",
+			headers: { "idempotency-key": "too-large" },
+			body: JSON.stringify({ peer: reviewer.npub, capability: "invoice.too-large", payload, timeoutSec: 20 }),
+		});
+		const tooLarge = await call({ notes: "x".repeat(40_000) });
+		expect(tooLarge.status).toBe(413);
+		expect(await json(tooLarge)).toMatchObject({ error: { code: "payload_too_large" } });
+		// Nothing was sent, so the same key is free for the corrected request.
+		const corrected = await pumping(call({ notes: "short" }), reviewer.client);
+		expect(corrected.status).toBe(200);
+		expect(await json(corrected)).toMatchObject({ status: "completed", output: { run: 1 } });
 		expect(runs).toBe(1);
 	}, 30_000);
 
