@@ -51,9 +51,15 @@ await transport.publishDiscovery({
 });
 ```
 
-`resolvePeerCard` returns bounded, validated typed metadata plus `typedMetadataWarning` when fallback
-occurs. Invalid typed metadata never hides valid legacy capabilities. Unknown required extensions hide
-typed skills but leave legacy fields usable; optional extensions are retained. `AgxClient` can enforce
+`resolvePeerCard` returns bounded, validated typed metadata plus `typedMetadataWarnings` listing what
+was left out. Invalid typed metadata never hides valid legacy capabilities. An invalid skill is dropped
+on its own (`invalid_typed_skill`) and the card's other skills stay usable; a structural failure or
+typed metadata over 32 KiB, measured inside the event's escaped `content`, ignores the whole typed unit
+(`invalid_typed_metadata`). Unknown fields on skills and extensions are ignored, and the schema
+annotations `description`, `title`, `$schema`, `default` and `examples` are accepted and ignored.
+Unknown required extensions hide typed skills but leave legacy fields usable; optional extensions are
+retained. `buildCard` and `publishDiscovery` leave an invalid skill off the card instead of refusing
+it (`buildCardWithWarnings` returns why; `publishDiscovery` logs it). `AgxClient` can enforce
 these schemas for authorized task input and handler output, and offers opt-in requester preflight.
 Validation never fetches references or treats claims as proof of quality. Agent Cards and schemas are
 public and unencrypted.

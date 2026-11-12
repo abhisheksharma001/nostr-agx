@@ -46,8 +46,13 @@ const result = await agx.request(peer, "invoice.review", { amount: 25 }, {
 });
 ```
 
-Contracts are optional. Authorized invalid input returns `invalid_input` without running the handler;
-invalid handler output returns `invalid_output`. Detailed validation paths stay local. Legacy handlers
+Contracts are optional. `handle()` refuses a contract the Agent Card would refuse, and keeps its own
+copy. Values are validated as the JSON they become on the wire, so an `undefined` member, a `Date` or a
+class instance is checked as its encoding. Authorized invalid input returns `invalid_input` without
+running the handler; invalid handler output returns `invalid_output`. With `validate: true`, a payload
+the peer's valid input schema refuses throws `AgxInvalidInputError` before anything is sent; with no
+usable schema the request is sent unchecked, and a peer's own `invalid_input` arrives as
+`AgxTaskFailedError`. Detailed validation paths stay local. Legacy handlers
 and peers without typed schemas keep working, and validation never fetches a referenced schema.
 
 Live transport listeners are registered by `start()` and removed by `stop()`.
