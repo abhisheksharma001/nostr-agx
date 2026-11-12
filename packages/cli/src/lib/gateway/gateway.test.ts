@@ -622,6 +622,45 @@ describe("agx gateway: outbound", () => {
 		expect(pendingRuns).toBe(1);
 	}, 45_000);
 
+	it("keeps the idempotency key when a recovered task's peer failure text reads like a local error", async () => {
+		// The recovered path's twin of the live-path test: read as this gateway's
+		// "payload exceeds" error, the peer's words would give a retryable 413, free
+		// the key, and a retry would send the task again.
+		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
+		let runs = 0;
+		let release: () => void = () => undefined;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		reviewer.client.handle("invoice.recovered.peer-text", async () => {
+			runs += 1;
+			await held;
+			throw new AgxPublicError("AGX request: encoded payload exceeds the transport size limit");
+		});
+		const body = JSON.stringify({ peer: reviewer.npub, capability: "invoice.recovered.peer-text", timeoutSec: 20 });
+		const call = () => api("/v1/tasks", {
+			method: "POST",
+			headers: { "idempotency-key": "recovered-peer-text" },
+			body,
+		});
+		const pending = call();
+		pending.catch(() => undefined);
+		await waitForPeer(() => runs === 1, reviewer.client);
+		await gateway.close();
+		await expect(pending).rejects.toThrow();
+		gateway = await startGateway(gatewayOptions());
+		const rejoined = call();
+		release();
+		const recovered = await pumping(rejoined, reviewer.client);
+		expect(recovered.status).toBe(502);
+		const failed = await json(recovered);
+		expect(failed).toMatchObject({ error: { code: "task_failed" } });
+		const retry = await pumping(call(), reviewer.client);
+		expect(retry.status).toBe(502);
+		expect(await json(retry)).toEqual(failed);
+		expect(runs).toBe(1);
+	}, 45_000);
+
 	it("returns a background handle before completion and its stored result after reconnect", async () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 4 });
 		let runs = 0;
