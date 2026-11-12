@@ -6,6 +6,7 @@ import { loadIdentity } from "../lib/identity.js";
 import { INBOX_SCHEMA, INBOX_SUMMARY_SCHEMA, type InboxReport, type InboxSummary } from "../lib/inbox.js";
 import { setJsonMode } from "../lib/output.js";
 import { toHexPubkey } from "../lib/peer.js";
+import { loadState } from "../lib/state.js";
 import { createTransport, makeLogger } from "../lib/transport.js";
 import { type RunningRelay, startRelay } from "../relay/server.js";
 import { agx, capture, jsonDocuments, sandbox } from "../test/helpers.js";
@@ -190,6 +191,7 @@ describe("agx wait", () => {
 		const run = await startWait({ profile: "receiver", timeout: "1" }).done;
 		expect(run.code).toBe(EXIT.network);
 		expect(report(run)).toMatchObject({ timedOut: true, messages: [], relays: [{ url: "ws://127.0.0.1:1", status: "unreachable" }] });
+		expect(loadState("receiver").cursor).toBe(0);
 	});
 
 	it("recovers when the relay starts during the wait", async () => {
