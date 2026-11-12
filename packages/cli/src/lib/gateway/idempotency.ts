@@ -203,6 +203,7 @@ export class TaskOperationStore {
 				}
 			}
 		}
+		// Shipped writers keep files near these limits; hand-made oversized files can make repeated scans expensive.
 		for (const idempotency of [true, false]) {
 			const credentials = new Set<string>();
 			for (const operation of this.records.values()) {
@@ -211,11 +212,17 @@ export class TaskOperationStore {
 				}
 			}
 			for (const credential of credentials) {
-				if (this.makeStorageRoom(credential, idempotency, { reserveSlot: false, enforcePool: false }).length > 0) {
+				if (
+					this.makeStorageRoom(credential, idempotency, {
+						reserveSlot: false,
+						enforcePool: false,
+						throwWhenFull: false,
+					}).length > 0
+				) {
 					changed = true;
 				}
 			}
-			if (this.makeStorageRoom("", idempotency, { reserveSlot: false }).length > 0) {
+			if (this.makeStorageRoom("", idempotency, { reserveSlot: false, throwWhenFull: false }).length > 0) {
 				changed = true;
 			}
 		}
@@ -447,12 +454,13 @@ export class TaskOperationStore {
 	private makeStorageRoom(
 		credentialHash: string,
 		idempotency: boolean,
-		options: { reserveSlot?: boolean; enforcePool?: boolean } = {},
+		options: { reserveSlot?: boolean; enforcePool?: boolean; throwWhenFull?: boolean } = {},
 	): Operation[] {
 		const evicted: Operation[] = [];
 		const samePool = (record: Operation) => holdsIdempotencyKey(record) === idempotency;
 		const reserveSlot = options.reserveSlot ?? true;
 		const enforcePool = options.enforcePool ?? true;
+		const throwWhenFull = options.throwWhenFull ?? true;
 		const credentialLimit = this.maxOperationsPerCredential - (reserveSlot ? 1 : 0);
 		const poolLimit = this.maxOperations - (reserveSlot ? 1 : 0);
 		let credentialOperations = 0;
@@ -471,12 +479,16 @@ export class TaskOperationStore {
 			while (credentialOperations > credentialLimit) {
 				const oldest = this.oldestSettled((record) => samePool(record) && record.credential === credentialHash);
 				if (!oldest) {
-					throw new ApiError(
-						503,
-						"idempotency_store_full",
-						`This API credential already has ${this.maxOperationsPerCredential} task operations running`,
-						"Retry when an operation finishes.",
-					);
+					if (throwWhenFull) {
+						throw new ApiError(
+							503,
+							"idempotency_store_full",
+							`This API credential already has ${this.maxOperationsPerCredential} task operations running`,
+							"Retry when an operation finishes.",
+						);
+					}
+					this.log("AGX: restored task-operation store remains over a count limit; no settled operation can be evicted");
+					break;
 				}
 				this.drop(oldest);
 				evicted.push(oldest);
@@ -489,12 +501,16 @@ export class TaskOperationStore {
 					(credential) => poolCounts.get(credential) ?? 0,
 				);
 				if (!oldest) {
-					throw new ApiError(
-						503,
-						"idempotency_store_full",
-						`The gateway already has ${this.maxOperations} task operations running`,
-						"Retry when an operation finishes.",
-					);
+					if (throwWhenFull) {
+						throw new ApiError(
+							503,
+							"idempotency_store_full",
+							`The gateway already has ${this.maxOperations} task operations running`,
+							"Retry when an operation finishes.",
+						);
+					}
+					this.log("AGX: restored task-operation store remains over a count limit; no settled operation can be evicted");
+					break;
 				}
 				this.drop(oldest);
 				evicted.push(oldest);
