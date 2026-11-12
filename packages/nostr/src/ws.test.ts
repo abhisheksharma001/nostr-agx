@@ -26,9 +26,13 @@ describe("configureWebSocket", () => {
 		vi.stubGlobal("WebSocket", NativeWebSocket);
 		const { configureWebSocket } = await import("./ws");
 
-		expect(() => configureWebSocket()).toThrow("Node's own WebSocket is refused");
-		expect(() => configureWebSocket(NativeWebSocket)).toThrow("Node's own WebSocket is refused");
-		expect(useWebSocketImplementation).not.toHaveBeenCalled();
+		expect(() => configureWebSocket()).not.toThrow();
+		expect(() => configureWebSocket(NativeWebSocket)).not.toThrow();
+		expect(useWebSocketImplementation).toHaveBeenCalledTimes(2);
+		for (const call of useWebSocketImplementation.mock.calls) {
+			const Guarded = call[0] as new (url: string) => unknown;
+			expect(() => new Guarded("ws://relay.invalid")).toThrow("Node's own WebSocket is refused");
+		}
 	});
 
 	it("accepts an injected EventEmitter WebSocket such as ws on Node", async () => {
