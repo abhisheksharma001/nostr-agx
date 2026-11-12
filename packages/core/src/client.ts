@@ -1,4 +1,4 @@
-import { AgxPublicError, AgxTaskDeclined } from "./errors";
+import { AgxPublicError, AgxTaskDeclined, AgxTaskFailedError } from "./errors";
 import { randomId } from "./id";
 import { type AgxLogger, noopLogger } from "./logger";
 import { InMemorySeenStore, type SeenStore } from "./seen-store";
@@ -1534,7 +1534,7 @@ export class AgxClient {
 		if (env.status === "completed") {
 			p.resolve(env.output);
 		} else {
-			p.reject(new Error(env.error ?? "task failed"));
+			p.reject(new AgxTaskFailedError(env.error ?? "task failed"));
 		}
 	}
 
