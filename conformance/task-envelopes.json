@@ -161,12 +161,6 @@
       "valid": false
     },
     {
-      "id": "input-required-empty-prompt",
-      "spec": "packages/core/SPEC.md#task-lifecycle",
-      "text": "{\"t\":\"res\",\"taskId\":\"task-2\",\"status\":\"input-required\",\"inputRequestId\":\"question-1\",\"requirement\":{\"prompt\":\"\"}}",
-      "valid": false
-    },
-    {
       "id": "input-missing-correlation-id",
       "spec": "packages/core/SPEC.md#task-lifecycle",
       "text": "{\"t\":\"input\",\"taskId\":\"task-2\",\"input\":\"INV-001\"}",

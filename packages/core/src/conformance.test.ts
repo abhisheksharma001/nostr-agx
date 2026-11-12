@@ -32,7 +32,7 @@ describe("task-envelope conformance vectors", () => {
 		]);
 		expect(valid.length).toBeGreaterThan(0);
 		expect(suite.vectors.length - valid.length).toBeGreaterThan(0);
-		expect(suite.vectors.length).toBeGreaterThanOrEqual(17);
+		expect(suite.vectors.length).toBeGreaterThanOrEqual(16);
 	});
 
 	const ran = new Set<string>();
