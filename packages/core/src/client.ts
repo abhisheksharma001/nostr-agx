@@ -3,9 +3,18 @@ import {
 	agxEncodedJsonBytes,
 	parseAgxAgentSkill,
 } from "./agent-card";
-import { AgxPublicError, AgxTaskDeclined, AgxTaskFailedError } from "./errors";
+import {
+	AgxInvalidInputError,
+	AgxPublicError,
+	AgxTaskDeclined,
+	AgxTaskFailedError,
+} from "./errors";
 import { randomId } from "./id";
-import { agxWireJson, validateAgxJsonPayload } from "./json-schema";
+import {
+	agxWireJson,
+	validateAgxJsonPayload,
+	validateAgxJsonSchema,
+} from "./json-schema";
 import { type AgxLogger, noopLogger } from "./logger";
 import { InMemorySeenStore, type SeenStore } from "./seen-store";
 import {
@@ -23,6 +32,7 @@ import type {
 	AgxAgentSkill,
 	AgxIncomingMessage,
 	AgxIncomingReceipt,
+	AgxPeerCard,
 	AgxTransportListenerOptions,
 	AgxTransport,
 	Unsubscribe,
@@ -471,7 +481,10 @@ export class AgxClient {
 	}
 
 	/** Check the payload against the peer's typed skill before anything is
-	 * published or registered. A peer with no matching skill schema passes.
+	 * published or registered, throwing {@link AgxInvalidInputError} on a
+	 * failure. It checks only when the peer's card has a valid input schema
+	 * for exactly this capability; with no card, no such skill or schema, an
+	 * invalid schema, or a failed lookup, the payload is sent unchecked.
 	 * Callers await this only when `validate` is set, so a plain request still
 	 * publishes in the same tick. The peer lookup runs before the request's
 	 * `timeoutMs` deadline starts, so that deadline does not cover it. */
@@ -480,15 +493,30 @@ export class AgxClient {
 		capability: string,
 		payload: unknown,
 	): Promise<unknown> {
-		const card = (await this.transport.resolvePeer(peer)).card;
-		const skill = card?.skills?.find((candidate) => candidate.id === capability);
-		if (!skill?.inputSchema) return payload;
+		let card: AgxPeerCard | null;
+		try {
+			card = (await this.transport.resolvePeer(peer)).card;
+		} catch (error) {
+			this.log.debug?.("AGX: peer card lookup failed; sending unchecked", {
+				peer,
+				capability,
+				error: String(error),
+			});
+			return payload;
+		}
+		const schema = card?.skills?.find(
+			(candidate) => candidate.id === capability,
+		)?.inputSchema;
+		// A transport need not run the card reader's checks, so make sure the
+		// schema is one this client can apply before trusting its verdict.
+		if (!schema || validateAgxJsonSchema(schema)) return payload;
 		const wire = agxWireJson(payload);
-		const problem = wire.ok
-			? validateAgxJsonPayload(skill.inputSchema, wire.value)
-			: `$: ${wire.problem}`;
-		if (!wire.ok || problem) {
-			throw new Error(`AGX request: invalid_input: ${problem}`);
+		if (!wire.ok) {
+			throw new AgxInvalidInputError(`$: ${wire.problem}`);
+		}
+		const problem = validateAgxJsonPayload(schema, wire.value);
+		if (problem) {
+			throw new AgxInvalidInputError(problem);
 		}
 		// Send the value that was checked, so a toJSON that answers differently
 		// on a second call cannot put something else on the wire.
