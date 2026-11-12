@@ -136,10 +136,10 @@ describe("a state file the CLI cannot read", () => {
 		});
 
 		it("does not put the file's text in the error", () => {
-			plant(statePath("default"), "SECRETCANARY not json");
+			plant(statePath("default"), "CANARY not json");
 			const error = refusal(() => loadState("default"), statePath("default"));
 			expect(`${error.message}\n${error.remediation}`).not.toContain(
-				"SECRETCANARY",
+				"CANARY",
 			);
 		});
 
