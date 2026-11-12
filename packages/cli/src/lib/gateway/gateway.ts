@@ -664,13 +664,16 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			} catch (error) {
 				log(`task outcomes could not be saved: ${error instanceof Error ? error.message : String(error)}`);
 			}
-			await requester.stop();
 			// One budget for the whole stop, under the 10 s a container runtime
-			// gives before it kills the process.
+			// gives before it kills the process. It includes the requester's stop,
+			// which waits for a task request still publishing.
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const deadline = new Promise<void>((resolve) => {
 				timer = setTimeout(resolve, SHUTDOWN_WAIT_MS);
 			});
+			const requesterStopped = requester.stop();
+			requesterStopped.catch(() => undefined);
+			await Promise.race([requesterStopped, deadline]);
 			await Promise.race([pumpLoop, deadline]);
 			// On disk before waiting for running tasks: a kill from here on loses
 			// nothing (a running task is already recorded as handled).
