@@ -3,7 +3,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { AgxClient, DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
+import { AgxClient, DEFAULT_CONTENT_TYPE, TASK_CONTENT_TYPE } from "@nostr-agx/core";
 import { generateKeypair, localSigner, NostrTransport, toNpub } from "@nostr-agx/nostr";
 import WebSocket from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -745,11 +745,16 @@ describe("agx gateway: outbound", () => {
 			this: NostrTransport,
 			...args: Parameters<NostrTransport["publishMessage"]>
 		) {
+			// Only the task request is held: a receipt or a message must not start the count.
+			if (args[1].contentType !== TASK_CONTENT_TYPE) {
+				return original.apply(this, args);
+			}
 			publishes += 1;
 			await held;
 			return original.apply(this, args);
 		});
 		let closing: Promise<void> | undefined;
+		let limit: ReturnType<typeof setTimeout> | undefined;
 		try {
 			const call = api("/v1/tasks", {
 				method: "POST",
@@ -763,11 +768,14 @@ describe("agx gateway: outbound", () => {
 			// The gateway's promise: stopped under the 10 s a container runtime gives.
 			const outcome = await Promise.race([
 				closing.then(() => "stopped"),
-				new Promise((resolve) => setTimeout(() => resolve("still stopping"), 10_000)),
+				new Promise((resolve) => {
+					limit = setTimeout(() => resolve("still stopping"), 10_000);
+				}),
 			]);
 			expect(outcome).toBe("stopped");
 			expect(Date.now() - started).toBeLessThan(10_000);
 		} finally {
+			clearTimeout(limit);
 			release();
 			spy.mockRestore();
 			await closing;
