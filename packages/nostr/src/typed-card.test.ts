@@ -161,6 +161,24 @@ describe("parseAgentCardMetadata", () => {
 		expect(parsed.warning).toBeUndefined();
 	});
 
+	it("drops unknown fields on a skill and keeps it typed", () => {
+		const parsed = parseAgentCardMetadata({
+			skills: [{ ...skill(), futureField: { x: 1 } }],
+		});
+		expect(parsed.warning).toBeUndefined();
+		expect(parsed.skills).toEqual([skill()]);
+		expect(parsed.skills?.[0]).not.toHaveProperty("futureField");
+	});
+
+	it("drops unknown fields on an extension", () => {
+		const parsed = parseAgentCardMetadata({
+			extensions: [{ uri: "agx.x.v1", required: false, since: "1.2.0" }],
+		});
+		expect(parsed.warning).toBeUndefined();
+		expect(parsed.extensions).toEqual([{ uri: "agx.x.v1", required: false }]);
+		expect(parsed.extensions?.[0]).not.toHaveProperty("since");
+	});
+
 	it("invalidates the whole typed unit for malformed entries", () => {
 		expectInvalid({
 			skills: [skill(), { id: 42, description: "bad" }],
