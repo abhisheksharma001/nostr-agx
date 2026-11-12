@@ -32,10 +32,10 @@ This section preserves the earlier inspection of `elladex-chatgpt-plugins` (no l
 2. If global `agx` is missing or lacks task support, the user installs:
 
    ```sh
-   npm install -g @nostr-agx/cli@0.5.0
+   npm install -g @nostr-agx/cli@0.6.0
    ```
 
-   Keep compatible existing installations. This optional integration uses published 0.5.0 for new installations; the self-contained examples deliberately retain their tested 0.3.0 lockfiles.
+   Keep compatible existing installations. This optional integration uses published 0.6.0 for new installations; the self-contained examples deliberately retain their tested 0.3.0 lockfiles.
 3. If the plugin is absent, do not offer a marketplace install command. The public repository this section was written against, `ellavox-ai/elladex-chatgpt-plugins`, returned HTTP 404 on October 24, 2026, so its documented `codex plugin marketplace add` and `codex plugin add` commands could not be re-verified. A user who already has the plugin can keep using it through the host's Plugins UI. Everyone else can use the terminal sample, which needs no plugin.
 
 4. Only after installation, review/trust Elladex hooks in the supported host, then start a new session. Require `Elladex guard active.` for this installed marketplace integration; hook errors remain blockers. Never ask the user to trust nonexistent hooks or write trust settings yourself.
