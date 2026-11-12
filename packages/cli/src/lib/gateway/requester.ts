@@ -1,5 +1,6 @@
 import {
 	AgxClient,
+	AgxPendingRequestStoreError,
 	type AgxLogger,
 	type AgxTransport,
 	type PendingRequestStore,
@@ -80,9 +81,17 @@ export class Requester {
 		if (this.waiting === 0 && nowSec() - this.lastPolledSec > MAX_WRAP_BACKDATE_SEC) {
 			this.client = this.newClient();
 		}
-		const recovered = await this.client.restorePendingRequests();
-		if (recovered.length > 0) {
-			throw new Error("AGX gateway recovered requests must be attached before new work");
+		try {
+			if ((await this.client.restorePendingRequests()).length > 0) {
+				throw new Error("AGX gateway recovered requests must be attached before new work");
+			}
+		} catch (error) {
+			// A local store problem, not the remote agent's failure, and nothing was
+			// sent yet: report it by type so its text stays in the gateway's log.
+			this.logger?.error?.("AGX gateway: stored requests could not be restored before new work", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			throw new AgxPendingRequestStoreError({ mayHavePublished: false });
 		}
 		const result = this.client.request(peer, capability, payload, {
 			timeoutMs,
