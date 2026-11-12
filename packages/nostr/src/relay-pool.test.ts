@@ -25,7 +25,8 @@ let subscriptionHandlers: Array<{
 	onevent: (event: Event) => void | Promise<void>;
 	onclose?: (reason: string) => void;
 }> = [];
-const { connectRelay } = vi.hoisted(() => ({
+const { configureWebSocket, connectRelay } = vi.hoisted(() => ({
+	configureWebSocket: vi.fn(),
 	connectRelay: vi.fn(),
 }));
 /** Per-relay publish outcome. `publishToRelays` is the CLASSIFIER behind the
@@ -44,6 +45,7 @@ vi.mock("nostr-tools/relay", () => ({
 		connect: connectRelay,
 	},
 }));
+vi.mock("./ws", () => ({ configureWebSocket }));
 
 import {
 	GIFT_WRAP_KIND,
@@ -80,6 +82,7 @@ beforeEach(() => {
 	mockVerify.mockReset();
 	mockVerify.mockReturnValue(true);
 	mockHash.mockImplementation((ev: Event) => ev.id);
+	configureWebSocket.mockReset();
 	connectRelay.mockReset();
 	connectRelay.mockImplementation(async (url: string) => ({
 		onauth: undefined,
@@ -118,6 +121,27 @@ beforeEach(() => {
 });
 afterEach(() => {
 	vi.useRealTimers();
+});
+
+describe("standalone relay socket setup", () => {
+	it("configures the global fallback before a one-shot fetch dials", async () => {
+		await fetchByAuthor({ relays: ["wss://relay"], author: OTHER, kinds: [GIFT_WRAP_KIND] });
+		expect(configureWebSocket).toHaveBeenCalledWith();
+		expect(configureWebSocket.mock.invocationCallOrder[0]).toBeLessThan(
+			connectRelay.mock.invocationCallOrder[0],
+		);
+	});
+
+	it("configures the global fallback before a live subscription dials", async () => {
+		const subscriptions = await listenEvents(undefined as never, ["wss://relay"], { pubkey: ME }, vi.fn());
+		expect(configureWebSocket).toHaveBeenCalledWith();
+		expect(configureWebSocket.mock.invocationCallOrder[0]).toBeLessThan(
+			connectRelay.mock.invocationCallOrder[0],
+		);
+		for (const subscription of subscriptions) {
+			subscription.close();
+		}
+	});
 });
 
 describe("listenEvents", () => {
