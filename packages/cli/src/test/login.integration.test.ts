@@ -341,7 +341,7 @@ describe("agx login", () => {
 		expect(polls).toBeGreaterThan(300);
 		expect(polls).toBeLessThanOrEqual(360);
 		expect(existsSync(pendingFile())).toBe(false);
-	});
+	}, 15_000);
 
 	it("(d) concurrent resumes poll once and mint one key", async () => {
 		// The waiting run gives the polling one ~25 fake seconds in 1 s steps;

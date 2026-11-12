@@ -1,6 +1,7 @@
 import {
 	AgxPendingRequestStoreError,
 	AgxRequestUnknownError,
+	AgxTaskFailedError,
 	type AutoReplyGuard,
 	DEFAULT_AUTO_REPLY_LIMITS,
 	DEFAULT_CONTENT_TYPE,
@@ -141,6 +142,16 @@ async function awaitTaskResult(
 				`${req.npub} requires interactive input to continue this task`,
 				"This gateway task endpoint cannot answer interactive prompts. Use an input-capable AGX client.",
 			);
+		}
+		// The peer's own failure report: an `AgxPublicError` message, or `handler
+		// failed` for an error it kept to itself. Its text never reaches the checks
+		// below, which are for this client's own errors: a peer's "AGX request:
+		// encoded payload exceeds..." would get the retryable 413, free the
+		// idempotency key, and let a retry send the task again. (The input check
+		// above does read peer text, as a peer refuses input it cannot ask for that
+		// way; 422 is not retryable, so the key stays.)
+		if (error instanceof AgxTaskFailedError) {
+			throw new ApiError(502, "task_failed", `${req.npub} reported that the task failed: ${message}`);
 		}
 		if (message.startsWith("AGX request timed out")) {
 			throw new ApiError(

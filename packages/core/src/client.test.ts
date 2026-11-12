@@ -948,6 +948,52 @@ describe("AgxClient task request/response", () => {
 		await expect(p2).rejects.not.toThrow(/db-host/);
 	});
 
+	describe("a public error message longer than the 2000-character result limit", () => {
+		/** Run one request whose handler throws `AgxPublicError(message)` and return
+		 * what the requester's promise settled with. The short timeout turns a
+		 * dropped result into a fast, clearly-labelled failure instead of a hang. */
+		async function failureMessage(message: string): Promise<string> {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			bob.handle("long", () => {
+				throw new AgxPublicError(message);
+			});
+			const pending = alice.request(BOB, "long", {}, { timeoutMs: 200 });
+			await bob.pump();
+			await alice.pump();
+			const error = await pending.then(
+				() => new Error("request unexpectedly completed"),
+				(e: unknown) => e as Error,
+			);
+			return error.message;
+		}
+
+		it("delivers the first 2000 characters instead of letting the requester time out", async () => {
+			const got = await failureMessage("x".repeat(2001));
+			expect(got).toBe("x".repeat(2000));
+		});
+
+		it("sends a message of exactly 2000 characters unchanged", async () => {
+			const message = `${"a".repeat(1999)}b`;
+			expect(await failureMessage(message)).toBe(message);
+		});
+
+		it("does not cut a surrogate pair in half", async () => {
+			// "😀" is two UTF-16 units. A cut at 2000 would leave only its first half.
+			const got = await failureMessage(`${"a".repeat(1999)}😀`);
+			expect(got).toBe("a".repeat(1999));
+		});
+
+		it("keeps a surrogate pair that fits whole", async () => {
+			const message = `${"a".repeat(1998)}😀`;
+			expect(message).toHaveLength(2000);
+			expect(await failureMessage(message)).toBe(message);
+		});
+	});
+
 	it("drops a future-dated event so an attacker cannot freeze the inbox (cursor poisoning)", async () => {
 		const onMessage = vi.fn();
 		const bob = new AgxClient({ transport: bus.transport(BOB), onMessage });
