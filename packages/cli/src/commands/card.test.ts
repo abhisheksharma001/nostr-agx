@@ -192,6 +192,38 @@ describe("agx card typed skills over a real local relay", () => {
 		expect(selected.stderr).toContain("duplicate skill ID");
 	}, 30_000);
 
+	it("does not print control characters from a card", async () => {
+		const evil = "\u001b[31mEVIL\u009b";
+		const publisher = generateKeypair();
+		const card = buildCard({
+			org: `Org ${evil}`,
+			pubkey: publisher.publicKey,
+			relays: [relayUrl],
+			capabilities: ["invoice.review"],
+			payloadTypes: ["application/json"],
+			skills: [
+				{
+					...typedSkill,
+					description: `Review ${evil}`,
+					tags: [`tag ${evil}`],
+					inputSchema: { ...typedSkill.inputSchema, title: `Title ${evil}` },
+				},
+			],
+			extensions: [{ uri: `agx.ext.${evil}`, required: false }],
+		});
+		expect(card.skills).toHaveLength(1);
+		expect(card.extensions).toHaveLength(1);
+		await publishCard(card, publisher.secretKey);
+
+		for (const args of [[], ["--skill", "invoice.review"]]) {
+			const run = await agx("card", toNpub(publisher.publicKey), ...args);
+			expect(run.code, run.stderr).toBe(0);
+			expect(run.stdout).not.toContain("\u001b[31mEVIL");
+			expect(run.stdout).not.toContain("\u009b");
+			expect(run.stdout).toContain("\uFFFD[31mEVIL");
+		}
+	}, 30_000);
+
 	it("falls back to legacy capabilities for an unknown required extension", async () => {
 		const publisher = generateKeypair();
 		const card = buildCard({
