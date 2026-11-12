@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import { AgxClient, DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
 import { generateKeypair, localSigner, NostrTransport, toNpub } from "@nostr-agx/nostr";
 import WebSocket from "ws";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { type RunningRelay, startRelay } from "../../relay/server.js";
 import { agx, sandbox } from "../../test/helpers.js";
 import { resolveProfileName } from "../config.js";
@@ -730,6 +730,47 @@ describe("agx gateway: outbound", () => {
 			} else {
 				rmSync(path, { force: true });
 			}
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 45_000);
+
+	it("stops within its shutdown budget while a task request is still publishing", async () => {
+		const original = NostrTransport.prototype.publishMessage;
+		let release: () => void = () => undefined;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let publishes = 0;
+		const spy = vi.spyOn(NostrTransport.prototype, "publishMessage").mockImplementation(async function (
+			this: NostrTransport,
+			...args: Parameters<NostrTransport["publishMessage"]>
+		) {
+			publishes += 1;
+			await held;
+			return original.apply(this, args);
+		});
+		let closing: Promise<void> | undefined;
+		try {
+			const call = api("/v1/tasks", {
+				method: "POST",
+				headers: { "idempotency-key": "shutdown-budget" },
+				body: JSON.stringify({ peer: toNpub(generateKeypair().publicKey), capability: "invoice.slow-relay", timeoutSec: 20 }),
+			});
+			call.catch(() => undefined);
+			await waitFor(() => publishes > 0);
+			const started = Date.now();
+			closing = gateway.close();
+			// The gateway's promise: stopped under the 10 s a container runtime gives.
+			const outcome = await Promise.race([
+				closing.then(() => "stopped"),
+				new Promise((resolve) => setTimeout(() => resolve("still stopping"), 10_000)),
+			]);
+			expect(outcome).toBe("stopped");
+			expect(Date.now() - started).toBeLessThan(10_000);
+		} finally {
+			release();
+			spy.mockRestore();
+			await closing;
 			gateway = await startGateway(gatewayOptions());
 		}
 	}, 45_000);
