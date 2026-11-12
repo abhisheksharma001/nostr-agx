@@ -59,6 +59,16 @@ describe("configureWebSocket", () => {
 		expect(useWebSocketImplementation).toHaveBeenCalledWith(EventEmitterWebSocket);
 	});
 
+	it("accepts a custom EventTarget socket without Node's native WebSocket tag", async () => {
+		vi.stubGlobal("process", { versions: { undici: "6.24.1" } });
+		vi.stubGlobal("WebSocket", NativeWebSocket);
+		class CustomEventTargetWebSocket extends EventTarget {}
+		const { configureWebSocket } = await import("./ws");
+
+		configureWebSocket(CustomEventTargetWebSocket);
+		expect(useWebSocketImplementation).toHaveBeenCalledWith(CustomEventTargetWebSocket);
+	});
+
 	it("keeps a browser-style global WebSocket outside Node", async () => {
 		vi.stubGlobal("process", { versions: {} });
 		vi.stubGlobal("WebSocket", NativeWebSocket);
