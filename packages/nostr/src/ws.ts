@@ -11,6 +11,8 @@ import { useWebSocketImplementation } from "nostr-tools/relay";
  * this stays structural. */
 export type WebSocketImpl = unknown;
 
+type ConfiguredWebSocket = Parameters<typeof useWebSocketImplementation>[0];
+
 let configured = false;
 
 function globalWebSocket(): unknown {
@@ -27,21 +29,23 @@ function isNodeNativeWebSocket(impl: unknown): boolean {
 	);
 }
 
-function assertSafeNodeWebSocket(impl: unknown): void {
-	if (isNodeNativeWebSocket(impl)) {
-		throw new Error("Node's own WebSocket is refused (a relay can crash it): pass ws (the ws package's WebSocket)");
+function guardNodeNativeWebSocket(impl: unknown): unknown {
+	if (!isNodeNativeWebSocket(impl)) {
+		return impl;
 	}
+	return new Proxy(impl as new (...args: unknown[]) => unknown, {
+		construct: () => {
+			throw new Error("Node's own WebSocket is refused (a relay can crash it): pass ws (the ws package's WebSocket)");
+		},
+	});
 }
 
 /** Configure the WebSocket implementation for relay connections. On Node, pass
- * the `ws` package; its native `WebSocket` is refused. In a browser/edge runtime,
- * omit to use the global. Idempotent — a repeat call with the same intent is a no-op. */
+ * the `ws` package; its native `WebSocket` is refused when dialed. In a browser/edge
+ * runtime, omit to use the global. Idempotent — a repeat call with the same intent is a no-op. */
 export function configureWebSocket(impl?: WebSocketImpl): void {
 	if (impl) {
-		assertSafeNodeWebSocket(impl);
-		useWebSocketImplementation(
-			impl as Parameters<typeof useWebSocketImplementation>[0],
-		);
+		useWebSocketImplementation(guardNodeNativeWebSocket(impl) as ConfiguredWebSocket);
 		configured = true;
 		return;
 	}
@@ -50,7 +54,9 @@ export function configureWebSocket(impl?: WebSocketImpl): void {
 	}
 	const globalImpl = globalWebSocket();
 	if (globalImpl !== undefined) {
-		assertSafeNodeWebSocket(globalImpl);
+		if (isNodeNativeWebSocket(globalImpl)) {
+			useWebSocketImplementation(guardNodeNativeWebSocket(globalImpl) as ConfiguredWebSocket);
+		}
 		configured = true;
 	}
 }
