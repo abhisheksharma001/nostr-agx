@@ -185,6 +185,23 @@ const DEFAULT_MAX_DISPATCH_ATTEMPTS = 10;
  * an event dispatched at time `t` is dated no later than `t` plus this. */
 export const MAX_FUTURE_SKEW_SEC = 300;
 
+/** The longest `error` a result may carry: the limit in `taskResultSchema`
+ * (task.ts). A requester drops a result whose `error` is longer, so the task
+ * would only end at its timeout. */
+const MAX_RESULT_ERROR = 2000;
+
+/** Cut a public error message to {@link MAX_RESULT_ERROR} UTF-16 units. If the
+ * cut would split a surrogate pair (an emoji, say), keep one unit fewer so the
+ * cut never separates the two halves of a pair. */
+function fitPublicMessage(message: string): string {
+	if (message.length <= MAX_RESULT_ERROR) {
+		return message;
+	}
+	const last = message.charCodeAt(MAX_RESULT_ERROR - 1);
+	const splitsPair = last >= 0xd800 && last <= 0xdbff;
+	return message.slice(0, splitsPair ? MAX_RESULT_ERROR - 1 : MAX_RESULT_ERROR);
+}
+
 interface TransportLifecycle {
 	clients: Set<object>;
 	started: boolean;
@@ -1424,7 +1441,7 @@ export class AgxClient {
 			await this.sendResult(msg.from, env.taskId, {
 				status: "failed",
 				error: isPublic
-					? (err as AgxPublicError).message
+					? fitPublicMessage((err as AgxPublicError).message)
 					: "handler failed",
 			});
 		} finally {

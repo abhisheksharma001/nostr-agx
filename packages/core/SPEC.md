@@ -183,9 +183,13 @@ client configuration.
 the peer **generically** (`handler failed`) and the real message is logged locally — an internal
 driver/ORM/HTTP error must not leak hostnames, table names, or credentials to another org. To send a
 message that is part of the protocol contract (`invoice not found`, `amount exceeds limit`), throw an
-`AgxPublicError`, whose message is forwarded verbatim. Both the request and result envelopes are
-size-checked before sending; an oversize payload fails fast (request) or is replaced with a
-`result too large` failure (result) rather than truncated into unparseable JSON.
+`AgxPublicError`, whose message is forwarded verbatim, up to the 2000 UTF-16 code units a result's
+`error` may carry; a longer message is cut to its first 2000 units (one fewer if the cut would split a
+surrogate pair), because a requester drops a result whose `error` is longer and the task would end only
+at its timeout.
+Both the request and result envelopes are size-checked before sending; an oversize payload fails fast
+(request) or is replaced with a `result too large` failure (result) rather than truncated into
+unparseable JSON.
 
 ## Capability matching
 
