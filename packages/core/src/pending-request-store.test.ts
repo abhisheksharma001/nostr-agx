@@ -426,8 +426,9 @@ describe("durable pending-request races", () => {
 		const original = first.request(BOB, "math.add", {}, { timeoutMs: 0 });
 		original.catch(() => undefined);
 		await waitFor(() => store.records.size === 1);
-		await first.stop({ preservePending: true });
+		const stopping = first.stop({ preservePending: true });
 		gated.release();
+		await stopping;
 		await expect(original).rejects.toThrow("AGX client stopped");
 		await waitFor(() => bus.requests(BOB).length === 1);
 		await settle();
@@ -441,6 +442,37 @@ describe("durable pending-request races", () => {
 		await second.pump();
 		await expect(recovered.result).resolves.toEqual({ ok: true });
 		expect(bus.requests(BOB)).toEqual([taskId]);
+		await second.stop();
+	});
+
+	it("leaves no orphan record when the same process restarts as soon as a restart stop returns mid-publish", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const gated = gatedTransport(bus);
+		const store = new MemoryPendingStore();
+		const first = clientOn(gated.transport, store);
+		await restore(first);
+		gated.hold();
+		const original = first.request(BOB, "math.add", {}, { timeoutMs: 0 });
+		original.catch(() => undefined);
+		await waitFor(() => store.records.size === 1);
+		// The host builds its next client on the same store the moment stop() returns.
+		const restarted = first.stop({ preservePending: true }).then(async () => {
+			const second = durableClient(bus, store);
+			return { second, recovered: await restore(second) };
+		});
+		await settle();
+		gated.release();
+		const { second, recovered } = await restarted;
+		await settle();
+		const [taskId] = bus.requests(BOB);
+		expect(recovered).toEqual([expect.objectContaining({ taskId })]);
+		bus.result(ALICE, BOB, taskId);
+		await second.pump();
+		await expect(recovered[0].result).resolves.toEqual({ ok: true });
+		expect(store.records.size).toBe(0);
+		expect(await restore(durableClient(bus, store))).toEqual([]);
+		expect(bus.requests(BOB)).toEqual([taskId]);
+		expect(cancels(bus)).toBe(0);
 		await second.stop();
 	});
 
