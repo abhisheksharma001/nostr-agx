@@ -312,6 +312,8 @@ export class AgxClient {
 	private readonly pendingTaskInputs = new Map<string, PendingTaskInput>();
 	private readonly activeInboundTasks = new Map<string, { canceled: boolean }>();
 	private readonly cancellationSends = new Set<Promise<void>>();
+	/** Durable-client request sends, from the first record write to the waiting write. */
+	private readonly requestSends = new Set<Promise<void>>();
 	private cursor: number;
 	private pollTimer?: ReturnType<typeof setTimeout>;
 	private transportRetained = false;
@@ -677,7 +679,22 @@ export class AgxClient {
 		}
 	}
 
-	private async sendRequest<Output = unknown>(
+	private sendRequest<Output = unknown>(
+		peer: string,
+		capability: string,
+		payload: unknown,
+		opts?: SendRequestOptions,
+	): Promise<{ taskId: string; result: Promise<Output> }> {
+		const sending = this.publishRequest<Output>(peer, capability, payload, opts);
+		if (this.pendingRequests) {
+			const done = sending.then(() => undefined, () => undefined);
+			this.requestSends.add(done);
+			void done.finally(() => this.requestSends.delete(done));
+		}
+		return sending;
+	}
+
+	private async publishRequest<Output = unknown>(
 		peer: string,
 		capability: string,
 		payload: unknown,
@@ -1240,6 +1257,12 @@ export class AgxClient {
 			p.reject(new Error("AGX client stopped"));
 		}
 		this.pendingTaskInputs.clear();
+		// A restart stop returns only once each in-flight send has written its record:
+		// a next client on the same store would otherwise see it mid-publish, and the
+		// late waiting write would leave an orphan record behind.
+		while (opts?.preservePending === true && this.requestSends.size > 0) {
+			await Promise.all([...this.requestSends]);
+		}
 		while (this.cancellationSends.size > 0) {
 			await Promise.all([...this.cancellationSends]);
 		}
