@@ -211,7 +211,36 @@ describe("parseAgentCardMetadata", () => {
 		});
 	});
 
-	it.each(["$ref", "$schema", "$id", "pattern", "format", "patternProperties"])(
+	it.each([
+		["description", "an invoice"],
+		["title", "Invoice"],
+		["$schema", "https://json-schema.org/draft/2020-12/schema"],
+		["default", { amount: 1 }],
+		["examples", [{ amount: 2 }]],
+	])("keeps a remote skill whose schema has %s", (keyword, value) => {
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+		try {
+			const parsed = parseAgentCardMetadata({
+				skills: [
+					skill({
+						inputSchema: {
+							type: "object",
+							[keyword]: value,
+							properties: { amount: { type: "number", [keyword]: value } },
+						},
+					}),
+				],
+			});
+			expect(parsed.warning).toBeUndefined();
+			expect(parsed.skills).toHaveLength(1);
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it.each(["$ref", "$id", "pattern", "format", "patternProperties"])(
 		"rejects unsupported schema keyword %s without fetching",
 		(keyword) => {
 			const fetchMock = vi.fn();

@@ -109,6 +109,28 @@ describe("AGX JSON Schema validation", () => {
 		expectInvalid({ pattern: ".*" }, "anything", /invalid schema/);
 	});
 
+	it("accepts and ignores annotation keywords", () => {
+		const annotations = {
+			description: "an invoice",
+			title: 42,
+			$schema: "https://json-schema.org/draft/2020-12/schema",
+			default: { amount: 1 },
+			examples: [{ amount: 2 }],
+		};
+		expect(
+			validateAgxJsonSchema({
+				...annotations,
+				type: "object",
+				properties: { a: { ...annotations, type: "number" } },
+			}),
+		).toBeNull();
+		expectInvalid(
+			{ required: ["a"], properties: { a: { type: "number", default: 5 } } },
+			{},
+			/missing required/,
+		);
+	});
+
 	it("validates values as their JSON encoding", () => {
 		expectValid(
 			{

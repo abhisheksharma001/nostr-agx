@@ -749,6 +749,24 @@ describe("AgxClient task request/response", () => {
 		).toThrow(/unsupported schema keyword/);
 	});
 
+	it("registers a contract whose schemas carry annotations", () => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		expect(() =>
+			bob.handle("invoice.review", () => null, {
+				description: "Review an invoice",
+				inputSchema: {
+					$schema: "https://json-schema.org/draft/2020-12/schema",
+					title: "Invoice",
+					description: "An invoice to review",
+					type: "object",
+					properties: {
+						amount: { type: "number", default: 0, examples: [10] },
+					},
+				},
+			}),
+		).not.toThrow();
+	});
+
 	it("advertises typed contracts without changing legacy capability keys", async () => {
 		const advertise = vi.fn(async () => ({ ok: true }));
 		const bob = new AgxClient({
