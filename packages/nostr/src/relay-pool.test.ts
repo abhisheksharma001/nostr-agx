@@ -1069,3 +1069,67 @@ describe("pollInbox checks each signature once", () => {
 		expect((await poll()).events).toHaveLength(0);
 	});
 });
+
+describe("listenEvents refuses a replayed old gift wrap", () => {
+	// A wrap's outer created_at is backdated by at most MAX_WRAP_BACKDATE_SEC, so a
+	// wrap that arrives live with an older created_at was not made recently. A relay
+	// can ignore the REQ `since` and replay one anyway. The seen store forgets an id
+	// after DEFAULT_SEEN_RETENTION_SEC (3 days) while a wrap lives 30 days, so an old
+	// wrap replayed after that is not "known" and would be opened again.
+	const NOW_SEC = 1_800_000_000;
+	const DAY = 24 * 60 * 60;
+
+	function signerSpy() {
+		return {
+			getPublicKey: vi.fn(async () => ME),
+			nip44Decrypt: vi.fn(async () => {
+				throw new Error("not a real wrap");
+			}),
+		};
+	}
+
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(NOW_SEC * 1000);
+	});
+
+	it("does not open a wrap the relay replays from 10 days ago", async () => {
+		const signer = signerSpy();
+		const callback = vi.fn();
+		responder = () => ({
+			events: [ev({ id: "replayed-old", created_at: NOW_SEC - 10 * DAY })],
+			eose: true,
+		});
+		await listenEvents(signer as never, ["wss://a"], { pubkey: ME }, callback);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(signer.getPublicKey).not.toHaveBeenCalled();
+		expect(callback).not.toHaveBeenCalled();
+	});
+
+	it("measures age when the wrap arrives, not when the listener started", async () => {
+		const signer = signerSpy();
+		await listenEvents(signer as never, ["wss://a"], { pubkey: ME }, vi.fn());
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// Five days later the same listener is handed a wrap made when it started.
+		vi.setSystemTime((NOW_SEC + 5 * DAY) * 1000);
+		await subscriptionHandlers[0]?.onevent(
+			ev({ id: "five-days-old", created_at: NOW_SEC }),
+		);
+
+		expect(signer.getPublicKey).not.toHaveBeenCalled();
+	});
+
+	it("still opens a wrap inside the backdate window (control)", async () => {
+		const signer = signerSpy();
+		responder = () => ({
+			events: [ev({ id: "recent", created_at: NOW_SEC - 1 * DAY })],
+			eose: true,
+		});
+		await listenEvents(signer as never, ["wss://a"], { pubkey: ME }, vi.fn());
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(signer.getPublicKey).toHaveBeenCalledTimes(1);
+	});
+});
