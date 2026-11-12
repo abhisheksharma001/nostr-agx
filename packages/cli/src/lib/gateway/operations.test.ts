@@ -4,6 +4,7 @@ import {
 	type AgxTransport,
 	type PendingRequestRecord,
 	type PendingRequestStore,
+	parseTaskEnvelope,
 } from "@nostr-agx/core";
 import { MAX_WRAP_BACKDATE_SEC } from "@nostr-agx/nostr";
 import { describe, expect, it, vi } from "vitest";
@@ -77,11 +78,11 @@ describe("task result errors", () => {
 				records.delete(key);
 			},
 		};
-		let published = 0;
+		let requestsSent = 0;
 		const transport: AgxTransport = {
 			whoami: () => "me",
-			publishMessage: async () => {
-				published += 1;
+			publishMessage: async (_to, message) => {
+				if (parseTaskEnvelope(message.text)?.t === "req") requestsSent += 1;
 				return { ok: true, eventId: "e", contextId: "c" };
 			},
 			publishReceipt: async () => ({ ok: true }),
@@ -118,7 +119,7 @@ describe("task result errors", () => {
 				expect(text).not.toMatch(/npub1peer|reported|recovered|EACCES|agx\//i);
 				expect(text).toMatch(/nothing was sent/i);
 			}
-			expect(published).toBe(1);
+			expect(requestsSent).toBe(1);
 		} finally {
 			vi.restoreAllMocks();
 			await requester.stop();
