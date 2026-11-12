@@ -39,7 +39,9 @@ describe("configureWebSocket", () => {
 	it("rejects captured native constructors and native subclasses on Node", async () => {
 		vi.stubGlobal("process", { versions: { undici: "6.24.1" } });
 		const CapturedNative = NativeWebSocket;
-		class NativeSubclass extends CapturedNative {}
+		class NativeSubclass extends CapturedNative {
+			on(): void {}
+		}
 		vi.stubGlobal("WebSocket", class Replacement extends EventTarget {});
 		const { configureWebSocket } = await import("./ws");
 
