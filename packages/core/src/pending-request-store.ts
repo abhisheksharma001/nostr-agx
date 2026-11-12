@@ -13,8 +13,9 @@ export interface PendingRequestRecord {
  * Each call must also settle in bounded time: a `remove()` that never settles
  * holds that request's deadline, and a `save()` or `remove()` that never settles
  * during a send holds `stop({ preservePending: true })`, which waits for
- * in-flight sends. That wait is otherwise bounded only by the transport's own
- * publish limit. */
+ * in-flight sends. Apart from a store call that never settles, the wait for one
+ * send is bounded by the transport's own publish limit; sends that start while
+ * the stop is waiting extend it. */
 export interface PendingRequestStore {
 	list(): PendingRequestRecord[] | Promise<PendingRequestRecord[]>;
 	save(record: PendingRequestRecord): void | Promise<void>;
