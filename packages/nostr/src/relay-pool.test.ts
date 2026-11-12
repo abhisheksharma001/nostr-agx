@@ -152,11 +152,13 @@ describe("listenEvents", () => {
 	});
 
 	it("skips known and expired wraps before decryption and records expirations", async () => {
+		const nowSec = Math.floor(Date.now() / 1000);
 		const expired = ev({
 			id: "expired",
+			created_at: nowSec,
 			tags: [["p", ME], ["expiration", "1"]],
 		});
-		const known = ev({ id: "known" });
+		const known = ev({ id: "known", created_at: nowSec });
 		responder = () => ({ events: [expired, known], eose: true });
 		const isKnown = vi.fn(async () => new Set(["known"]));
 		const onDiscarded = vi.fn();
@@ -180,7 +182,12 @@ describe("listenEvents", () => {
 	it("records unopenable wraps and reports subscription close through the logger", async () => {
 		const onDiscarded = vi.fn();
 		const warn = vi.fn();
-		responder = () => ({ events: [ev({ id: "bad-wrap" })], eose: true });
+		responder = () => ({
+			events: [
+				ev({ id: "bad-wrap", created_at: Math.floor(Date.now() / 1000) }),
+			],
+			eose: true,
+		});
 		await listenEvents(
 			undefined as never,
 			["wss://a"],
