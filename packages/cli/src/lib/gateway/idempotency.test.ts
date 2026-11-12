@@ -957,6 +957,30 @@ describe("TaskOperationStore storage fairness", () => {
 		restored.close();
 	});
 
+	it("trims an over-limit restored credential without relying on pool enforcement", async () => {
+		let clock = 0;
+		const store = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 10,
+			maxOperations: 20,
+			now: () => (clock += 1),
+		});
+		for (let index = 0; index < 5; index++) {
+			await store.execute("credential-a", `key-${index}`, {}, async () => ({ index }));
+		}
+		store.close();
+
+		const restored = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 3,
+			maxOperations: 20,
+			now: () => (clock += 1),
+		});
+		const raw = JSON.parse(readFileSync(gatewayTaskOperationsPath("test"), "utf8")) as {
+			operations: Array<{ outcome: { body?: unknown } }>;
+		};
+		expect(raw.operations.map((operation) => operation.outcome.body)).toEqual([{ index: 2 }, { index: 3 }, { index: 4 }]);
+		restored.close();
+	});
+
 	it("enforces unkeyed background count limits when restoring an over-limit store", async () => {
 		let clock = 0;
 		const store = new TaskOperationStore("test", {
