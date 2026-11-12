@@ -796,6 +796,19 @@ export async function pollInbox(params: {
 	};
 }
 
+/** Clock difference tolerated between a sender and this host when the live
+ * listener judges a wrap's age. */
+export const LIVE_WRAP_CLOCK_MARGIN_SEC = 300;
+
+/** The oldest outer `created_at` the live listener will open, measured from the
+ * moment the wrap arrives. A wrap is stamped at most {@link MAX_WRAP_BACKDATE_SEC}
+ * before it was sent, so anything older was not sent recently and is a replay.
+ * It must stay strictly below the seen-store retention
+ * (`DEFAULT_SEEN_RETENTION_SEC`): past that, a replayed id is no longer "known".
+ * Wraps older than this are not lost: the inbox poll reads back from its cursor. */
+export const LIVE_WRAP_ACCEPT_WINDOW_SEC =
+	MAX_WRAP_BACKDATE_SEC + LIVE_WRAP_CLOCK_MARGIN_SEC;
+
 /**
  * Subscribe to relays for MESSAGE/RECEIPT events tagged to `pubkey`. Each
  * subscription replays only the bounded wrap window; polling remains the
@@ -855,6 +868,18 @@ export async function listenEvents(
 
 			sub = relay.subscribe([filter], {
 				async onevent(event: Event) {
+					// A relay can ignore the REQ `since`. Age is judged at arrival, not
+					// at subscribe time, so a long-lived listener does not drift.
+					if (
+						event.created_at <
+						Math.floor(Date.now() / 1000) - LIVE_WRAP_ACCEPT_WINDOW_SEC
+					) {
+						log.debug?.("AGX: live gift wrap older than the replay window", {
+							relay: url,
+							eventId: event.id,
+						});
+						return;
+					}
 					if (inFlight.has(event.id)) {
 						return;
 					}

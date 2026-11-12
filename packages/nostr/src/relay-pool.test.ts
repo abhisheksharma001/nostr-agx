@@ -1,4 +1,5 @@
 import type { Event, Filter } from "nostr-tools";
+import { DEFAULT_SEEN_RETENTION_SEC } from "@nostr-agx/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The relay pool talks to an untrusted relay: it must re-enforce the REQ filter
@@ -53,6 +54,7 @@ import {
 } from "./kinds";
 import {
 	DEFAULT_POLL_LIMIT,
+	LIVE_WRAP_ACCEPT_WINDOW_SEC,
 	fetchByAuthor,
 	fetchByAuthorWithStatus,
 	listenEvents,
@@ -1138,5 +1140,31 @@ describe("listenEvents refuses a replayed old gift wrap", () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 
 		expect(signer.getPublicKey).toHaveBeenCalledTimes(1);
+	});
+
+	it("accepts a wrap exactly at the window edge and refuses one second past it", async () => {
+		const signer = signerSpy();
+		responder = () => ({
+			events: [
+				ev({ id: "edge", created_at: NOW_SEC - LIVE_WRAP_ACCEPT_WINDOW_SEC }),
+				ev({
+					id: "past-edge",
+					created_at: NOW_SEC - LIVE_WRAP_ACCEPT_WINDOW_SEC - 1,
+				}),
+			],
+			eose: true,
+		});
+		await listenEvents(signer as never, ["wss://a"], { pubkey: ME }, vi.fn());
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(signer.getPublicKey).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps seen-store retention strictly longer than the live accept window", () => {
+		// Past retention a replayed id is no longer "known"; the age filter is the
+		// only thing left stopping it, so the filter must close first.
+		expect(DEFAULT_SEEN_RETENTION_SEC).toBeGreaterThan(
+			LIVE_WRAP_ACCEPT_WINDOW_SEC,
+		);
 	});
 });
