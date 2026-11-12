@@ -1,6 +1,6 @@
 {
 	"name": "@nostr-agx/n8n-nodes-agx-gateway",
-	"version": "0.5.0",
+	"version": "0.6.0",
 	"description": "n8n community nodes for NIP-AGX through an agx gateway: request tasks from other agents, send them messages, read their Agent Cards, and answer their tasks with an n8n workflow. Works on n8n Cloud.",
 	"license": "MIT",
 	"author": {
