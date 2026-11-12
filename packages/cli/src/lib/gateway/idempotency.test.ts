@@ -889,6 +889,74 @@ describe("TaskOperationStore storage fairness", () => {
 		restored.close();
 	});
 
+	it("restores pending records without throwing when they exceed a lowered count limit", async () => {
+		let clock = 0;
+		const store = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 10,
+			maxOperations: 20,
+			now: () => (clock += 1),
+		});
+		for (let index = 0; index < 5; index++) {
+			await store.execute("credential-a", `key-${index}`, {}, async () => ({ index }));
+		}
+		store.close();
+		const path = gatewayTaskOperationsPath("test");
+		const original = JSON.parse(readFileSync(path, "utf8")) as {
+			operations: Array<{ outcome: unknown }>;
+		};
+		for (const operation of original.operations.slice(1)) {
+			operation.outcome = null;
+		}
+		writePrivateJson(path, original);
+
+		const restored = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 3,
+			maxOperations: 20,
+			now: () => (clock += 1),
+		});
+		const raw = JSON.parse(readFileSync(path, "utf8")) as {
+			operations: Array<{ outcome: { code?: string } }>;
+		};
+		expect(raw.operations.length).toBeGreaterThan(0);
+		expect(raw.operations.every((operation) => operation.outcome.code === "result_unknown")).toBe(true);
+		restored.close();
+	});
+
+	it("persists a pool-only restore trim and evicts from the heaviest credential", async () => {
+		let clock = 0;
+		const store = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 10,
+			maxOperations: 20,
+			now: () => (clock += 1),
+		});
+		for (const [owner, key] of [
+			["credential-b", "old-bystander"],
+			["credential-a", "evicted"],
+			["credential-a", "kept-a1"],
+			["credential-a", "kept-a2"],
+			["credential-b", "kept-b1"],
+		] as const) {
+			await store.execute(owner, key, {}, async () => ({ owner, key }));
+		}
+		store.close();
+
+		const restored = new TaskOperationStore("test", {
+			maxOperationsPerCredential: 3,
+			maxOperations: 4,
+			now: () => (clock += 1),
+		});
+		const raw = JSON.parse(readFileSync(gatewayTaskOperationsPath("test"), "utf8")) as {
+			operations: Array<{ outcome: { body?: unknown } }>;
+		};
+		expect(raw.operations.map((operation) => operation.outcome.body)).toEqual([
+			{ owner: "credential-b", key: "old-bystander" },
+			{ owner: "credential-a", key: "kept-a1" },
+			{ owner: "credential-a", key: "kept-a2" },
+			{ owner: "credential-b", key: "kept-b1" },
+		]);
+		restored.close();
+	});
+
 	it("enforces unkeyed background count limits when restoring an over-limit store", async () => {
 		let clock = 0;
 		const store = new TaskOperationStore("test", {
