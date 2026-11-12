@@ -54,3 +54,4 @@ export {
 	type UrlSafetyResult,
 } from "./ssrf";
 export { configureWebSocket } from "./ws";
+export { withBoundedPong } from "./ws-pong";

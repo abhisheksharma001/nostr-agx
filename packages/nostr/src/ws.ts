@@ -1,4 +1,5 @@
 import { useWebSocketImplementation } from "nostr-tools/relay";
+import { withBoundedPong } from "./ws-pong";
 
 /**
  * WebSocket injection. nostr-tools uses the global `WebSocket` in browsers/edge,
@@ -18,7 +19,7 @@ let configured = false;
 export function configureWebSocket(impl?: WebSocketImpl): void {
 	if (impl) {
 		useWebSocketImplementation(
-			impl as Parameters<typeof useWebSocketImplementation>[0],
+			withBoundedPong(impl) as Parameters<typeof useWebSocketImplementation>[0],
 		);
 		configured = true;
 		return;

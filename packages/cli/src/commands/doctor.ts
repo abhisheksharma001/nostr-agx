@@ -1,5 +1,5 @@
 import { chmodSync, existsSync } from "node:fs";
-import { GIFT_WRAP_KIND } from "@nostr-agx/nostr";
+import { GIFT_WRAP_KIND, withBoundedPong } from "@nostr-agx/nostr";
 import kleur from "kleur";
 import WebSocket from "ws";
 import { createApiClient, toCliError } from "../lib/api.js";
@@ -158,7 +158,7 @@ function probeRelay(url: string, timeoutMs = 4000): Promise<RelayProbe> {
 		);
 		let socket: WebSocket;
 		try {
-			socket = new WebSocket(url);
+			socket = new (withBoundedPong(WebSocket))(url);
 		} catch {
 			clearTimeout(timer);
 			resolve({ verdict: "fail" });

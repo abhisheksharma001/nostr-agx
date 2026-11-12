@@ -1,11 +1,14 @@
+import { withBoundedPong } from "@nostr-agx/nostr";
 import WebSocket from "ws";
+
+const BoundedPongWebSocket = withBoundedPong(WebSocket);
 
 /** Whether a relay accepts a WebSocket connection within `timeoutMs`. */
 export function probeRelay(url: string, timeoutMs: number): Promise<boolean> {
 	return new Promise((resolve) => {
 		let socket: WebSocket;
 		try {
-			socket = new WebSocket(url);
+			socket = new BoundedPongWebSocket(url);
 		} catch {
 			resolve(false);
 			return;

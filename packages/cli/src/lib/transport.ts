@@ -1,6 +1,6 @@
 import type { AgxLogger } from "@nostr-agx/core";
 import { NostrTransport } from "@nostr-agx/nostr";
-import WebSocket from "ws";
+import WebSocket, { type ClientOptions } from "ws";
 import type { Profile } from "./config.js";
 import { configError } from "./errors.js";
 import type { Identity } from "./identity.js";
@@ -17,8 +17,12 @@ export const HANDSHAKE_TIMEOUT_MS = 7_000;
  */
 export function withHandshakeTimeout(timeoutMs: number) {
 	return class extends WebSocket {
-		constructor(address: string | URL, protocols?: string | string[]) {
-			super(address, protocols, { handshakeTimeout: timeoutMs });
+		constructor(
+			address: string | URL,
+			protocols?: string | string[],
+			options: ClientOptions = {},
+		) {
+			super(address, protocols, { ...options, handshakeTimeout: timeoutMs });
 		}
 	};
 }
