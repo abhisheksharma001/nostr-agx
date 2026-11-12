@@ -119,7 +119,7 @@ describe("agx card typed skills over a real local relay", () => {
 		expect(output.signatureValid).toBe(true);
 		expect(output.card.version).toBe("1.1.0");
 		expect(output.selectedSkill).toEqual(typedSkill);
-		expect(output.typedMetadata.warning).toBeUndefined();
+		expect(output.typedMetadata.warnings).toBeUndefined();
 
 		const human = await agx(
 			"card",
@@ -177,7 +177,9 @@ describe("agx card typed skills over a real local relay", () => {
 		expect(run.code, run.stderr).toBe(0);
 		const output = lastJson(run.stdout);
 		expect(output.card.capabilities).toEqual(["invoice.review"]);
-		expect(output.typedMetadata.warning.code).toBe("invalid_typed_metadata");
+		expect(
+			output.typedMetadata.warnings.map((w: { code: string }) => w.code),
+		).toEqual(["invalid_typed_skill"]);
 		expect(output.typedMetadata.skills).toBeUndefined();
 
 		const selected = await agx(
@@ -206,9 +208,9 @@ describe("agx card typed skills over a real local relay", () => {
 		expect(run.code, run.stderr).toBe(0);
 		const output = lastJson(run.stdout);
 		expect(output.card.capabilities).toEqual(["invoice.review"]);
-		expect(output.typedMetadata.warning.code).toBe(
-			"unsupported_required_extension",
-		);
+		expect(
+			output.typedMetadata.warnings.map((w: { code: string }) => w.code),
+		).toEqual(["unsupported_required_extension"]);
 		expect(output.typedMetadata.skills).toBeUndefined();
 		expect(output.typedMetadata.extensions).toEqual([
 			{ uri: "agx.unknown.v1", required: true },

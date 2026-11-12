@@ -122,7 +122,7 @@ describe("resolvePeerCard — attacker-controlled card validation", () => {
 			displayName: "Acme",
 			capabilities: ["invoice.review"],
 			nip05: "acme@example.com",
-			typedMetadataWarning: { code: "invalid_typed_metadata" },
+			typedMetadataWarnings: [{ code: "invalid_typed_skill" }],
 		});
 		expect(card).not.toHaveProperty("skills");
 	});
