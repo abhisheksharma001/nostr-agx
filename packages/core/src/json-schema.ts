@@ -452,6 +452,24 @@ function validatePayloadNode(
 	return null;
 }
 
+/** The value `JSON.stringify` puts on the wire, read back. `undefined` when
+ * the wire leaves the value out (a bare `return;`, a function, a symbol). */
+export function agxWireJson(
+	value: unknown,
+): { ok: true; value: unknown } | { ok: false; problem: string } {
+	try {
+		const text = JSON.stringify(value);
+		return {
+			ok: true,
+			value: text === undefined ? undefined : JSON.parse(text),
+		};
+	} catch {
+		return { ok: false, problem: "value cannot be encoded as JSON" };
+	}
+}
+
+/** Validate `payload` as the JSON it becomes on the wire. A value the wire
+ * leaves out is checked as `null`. */
 export function validateAgxJsonPayload(
 	schema: AgxJsonSchema,
 	payload: unknown,
@@ -461,11 +479,16 @@ export function validateAgxJsonPayload(
 		return `invalid schema: ${schemaProblem}`;
 	}
 	try {
-		const jsonProblem = boundedJsonValueProblem(payload);
+		const wire = agxWireJson(payload);
+		if (!wire.ok) {
+			return `$: ${wire.problem}`;
+		}
+		const value = wire.value === undefined ? null : wire.value;
+		const jsonProblem = boundedJsonValueProblem(value);
 		if (jsonProblem) {
 			return `$: ${jsonProblem}`;
 		}
-		return validatePayloadNode(schema, payload, "$");
+		return validatePayloadNode(schema, value, "$");
 	} catch {
 		return "$: payload could not be validated safely";
 	}

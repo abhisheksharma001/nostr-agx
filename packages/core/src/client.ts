@@ -1,6 +1,7 @@
 import { AgxPublicError, AgxTaskDeclined, AgxTaskFailedError } from "./errors";
 import { randomId } from "./id";
 import {
+	agxWireJson,
 	validateAgxJsonPayload,
 	validateAgxJsonSchema,
 } from "./json-schema";
@@ -438,14 +439,20 @@ export class AgxClient {
 		peer: string,
 		capability: string,
 		payload: unknown,
-	): Promise<void> {
+	): Promise<unknown> {
 		const card = (await this.transport.resolvePeer(peer)).card;
 		const skill = card?.skills?.find((candidate) => candidate.id === capability);
-		if (!skill?.inputSchema) return;
-		const problem = validateAgxJsonPayload(skill.inputSchema, payload);
-		if (problem) {
+		if (!skill?.inputSchema) return payload;
+		const wire = agxWireJson(payload);
+		const problem = wire.ok
+			? validateAgxJsonPayload(skill.inputSchema, wire.value)
+			: `$: ${wire.problem}`;
+		if (!wire.ok || problem) {
 			throw new Error(`AGX request: invalid_input: ${problem}`);
 		}
+		// Send the value that was checked, so a toJSON that answers differently
+		// on a second call cannot put something else on the wire.
+		return wire.value;
 	}
 
 	/** Send a task to a peer and await its correlated result. Rejects on a `failed`
@@ -456,11 +463,13 @@ export class AgxClient {
 		payload: unknown,
 		opts?: { timeoutMs?: number; validate?: boolean },
 	): Promise<Output> {
-		if (opts?.validate) await this.preflightInput(peer, capability, payload);
+		const sent = opts?.validate
+			? await this.preflightInput(peer, capability, payload)
+			: payload;
 		const { result } = await this.sendRequest<Output>(
 			peer,
 			capability,
-			payload,
+			sent,
 			{ ...opts, supportsInput: false },
 		);
 		return result;
@@ -474,7 +483,9 @@ export class AgxClient {
 		payload: unknown,
 		opts?: { timeoutMs?: number; validate?: boolean },
 	): Promise<StreamResponse<Output>> {
-		if (opts?.validate) await this.preflightInput(peer, capability, payload);
+		const sent = opts?.validate
+			? await this.preflightInput(peer, capability, payload)
+			: payload;
 		const taskId = randomId();
 		let resolveResult!: (output: Output) => void;
 		let rejectResult!: (error: Error) => void;
@@ -495,7 +506,7 @@ export class AgxClient {
 			this.log,
 		);
 		try {
-			const { result } = await this.sendRequest<Output>(peer, capability, payload, {
+			const { result } = await this.sendRequest<Output>(peer, capability, sent, {
 				...opts,
 				taskId,
 				supportsInput: true,
@@ -1481,12 +1492,16 @@ export class AgxClient {
 				},
 			});
 			if (active?.canceled) return;
+			let resultOutput: unknown = output;
 			if (registered.contract?.outputSchema) {
-				const problem = validateAgxJsonPayload(
-					registered.contract.outputSchema,
-					output,
-				);
-				if (problem) {
+				const wire = agxWireJson(output);
+				const problem = wire.ok
+					? validateAgxJsonPayload(
+							registered.contract.outputSchema,
+							wire.value,
+						)
+					: `$: ${wire.problem}`;
+				if (!wire.ok || problem) {
 					this.log.warn?.("AGX: task output failed schema validation", {
 						taskId: env.taskId,
 						capability: env.capability,
@@ -1498,10 +1513,12 @@ export class AgxClient {
 					});
 					return;
 				}
+				// Send the value that was checked, not a second encoding of it.
+				resultOutput = wire.value;
 			}
 			await this.sendResult(msg.from, env.taskId, {
 				status: "completed",
-				output,
+				output: resultOutput,
 			});
 		} catch (err) {
 			if (err instanceof AgxTaskCanceled || active?.canceled) {
