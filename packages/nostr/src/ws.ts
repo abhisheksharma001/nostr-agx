@@ -2,8 +2,10 @@ import { useWebSocketImplementation } from "nostr-tools/relay";
 
 /**
  * WebSocket injection. Browsers and edge runtimes can use their global. Node
- * hosts must inject the `ws` package: Node's own WebSocket comes from undici,
- * where relay-controlled frames and handshake headers have caused process exits.
+ * hosts must inject an EventEmitter-style implementation such as the `ws` package:
+ * Node's own WebSocket comes from undici, where relay-controlled frames and
+ * handshake headers have caused process exits. Other WHATWG/EventTarget-style
+ * constructors, including bound constructors, are refused on Node as well.
  */
 
 /** A WHATWG-compatible WebSocket constructor (e.g. the Node `ws` package's
@@ -21,16 +23,16 @@ function globalWebSocket(): unknown {
 		: (globalThis as { WebSocket?: unknown }).WebSocket;
 }
 
-function isNodeNativeWebSocket(impl: unknown): boolean {
-	const prototype = (impl as { prototype?: { [Symbol.toStringTag]?: unknown } }).prototype;
+function isUnsafeNodeWebSocket(impl: unknown): boolean {
+	const prototype = (impl as { prototype?: { on?: unknown; [Symbol.toStringTag]?: unknown } }).prototype;
 	return (
 		(globalThis as { process?: { versions?: { undici?: string } } }).process?.versions?.undici !== undefined &&
-		prototype?.[Symbol.toStringTag] === "WebSocket"
+		(prototype?.[Symbol.toStringTag] === "WebSocket" || typeof prototype?.on !== "function")
 	);
 }
 
-function guardNodeNativeWebSocket(impl: unknown): unknown {
-	if (!isNodeNativeWebSocket(impl)) {
+function guardUnsafeNodeWebSocket(impl: unknown): unknown {
+	if (!isUnsafeNodeWebSocket(impl)) {
 		return impl;
 	}
 	return new Proxy(impl as new (...args: unknown[]) => unknown, {
@@ -41,11 +43,12 @@ function guardNodeNativeWebSocket(impl: unknown): unknown {
 }
 
 /** Configure the WebSocket implementation for relay connections. On Node, pass
- * the `ws` package; its native `WebSocket` is refused when dialed. In a browser/edge
- * runtime, omit to use the global. Idempotent — a repeat call with the same intent is a no-op. */
+ * an EventEmitter-style implementation such as `ws`; native, bound and custom
+ * EventTarget-style constructors are refused when dialed. In a browser/edge runtime,
+ * omit to use the global. Idempotent — a repeat call with the same intent is a no-op. */
 export function configureWebSocket(impl?: WebSocketImpl): void {
 	if (impl) {
-		useWebSocketImplementation(guardNodeNativeWebSocket(impl) as ConfiguredWebSocket);
+		useWebSocketImplementation(guardUnsafeNodeWebSocket(impl) as ConfiguredWebSocket);
 		configured = true;
 		return;
 	}
@@ -54,8 +57,8 @@ export function configureWebSocket(impl?: WebSocketImpl): void {
 	}
 	const globalImpl = globalWebSocket();
 	if (globalImpl !== undefined) {
-		if (isNodeNativeWebSocket(globalImpl)) {
-			useWebSocketImplementation(guardNodeNativeWebSocket(globalImpl) as ConfiguredWebSocket);
+		if (isUnsafeNodeWebSocket(globalImpl)) {
+			useWebSocketImplementation(guardUnsafeNodeWebSocket(globalImpl) as ConfiguredWebSocket);
 		}
 		configured = true;
 	}

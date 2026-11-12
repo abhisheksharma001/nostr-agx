@@ -64,7 +64,8 @@ export interface NostrTransportConfig {
 	signer: AgxSigner;
 	/** Relays this agent publishes to / reads from. */
 	relays: string[];
-	/** WebSocket implementation. On Node, pass `ws`; its native `WebSocket` is refused.
+	/** WebSocket implementation. On Node, pass an EventEmitter-style implementation
+	 * such as `ws`; native and EventTarget-style constructors are refused.
 	 * Browser/edge hosts can omit this to use the global. */
 	ws?: WebSocketImpl;
 	/** Optional logger (default no-op). */
