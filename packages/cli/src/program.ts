@@ -58,6 +58,7 @@ import {
 } from "./commands/gateway.js";
 import { threadCommand, threadsCommand } from "./commands/threads.js";
 import { uiCommand } from "./commands/ui.js";
+import { waitCommand } from "./commands/wait.js";
 import { whoamiCommand } from "./commands/whoami.js";
 import { AgxCliError, EXIT, HumanActionRequiredError } from "./lib/errors.js";
 import {
@@ -577,6 +578,14 @@ export function buildProgram(): Command {
 		.option("--summary", "counts only, no peer text (safe for a hook)")
 		.option("-v, --verbose", "log transport activity")
 		.action((options) => inboxCommand(withGlobals(options)));
+
+	program
+		.command("wait")
+		.description("wait for one inbox activity batch and exit: never replies, never runs tasks")
+		.option("--timeout <seconds>", "maximum wait, 1–3600 (default 600)")
+		.option("--summary", "counts only, no peer text (safe for a background notification)")
+		.option("-v, --verbose", "log transport activity")
+		.action((options) => waitCommand(withGlobals(options)));
 
 	const held = program
 		.command("held")

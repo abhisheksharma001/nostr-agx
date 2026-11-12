@@ -38,6 +38,8 @@ export interface InboxReport {
 	held: InboxHeld[];
 	receipts: InboxReceipt[];
 	truncated: boolean;
+	/** Present for `agx wait`; ordinary one-shot inbox output is unchanged. */
+	timedOut?: boolean;
 }
 
 export interface InboxSummary {
@@ -48,6 +50,8 @@ export interface InboxSummary {
 	unread: number;
 	held: number;
 	relays: { ok: number; unreachable: number };
+	/** Present for `agx wait`; ordinary one-shot inbox output is unchanged. */
+	timedOut?: boolean;
 }
 
 /** ISO time for a unix-seconds value, or `fallback` when the value is not a time `Date` can hold. */
@@ -176,6 +180,7 @@ export function summarize(report: InboxReport, newCount: number, unreadCount: nu
 			ok: report.relays.filter((r) => r.status === "ok").length,
 			unreachable: report.relays.filter((r) => r.status === "unreachable").length,
 		},
+		...(report.timedOut === undefined ? {} : { timedOut: report.timedOut }),
 	};
 }
 
@@ -185,6 +190,9 @@ export function summaryLine(summary: InboxSummary): string {
 	const down = summary.relays.unreachable;
 	if (down > 0) {
 		parts.push(`${down} ${down === 1 ? "relay" : "relays"} unreachable`);
+	}
+	if (summary.timedOut === true) {
+		parts.push("timed out");
 	}
 	return parts.join(" · ");
 }

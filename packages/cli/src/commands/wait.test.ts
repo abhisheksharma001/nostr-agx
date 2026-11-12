@@ -78,6 +78,24 @@ async function publish(fromProfile: string, to: string, text: string): Promise<s
 	}
 }
 
+async function publishReceipt(fromProfile: string, to: string, refEventId: string, contextId: string): Promise<void> {
+	const profile = effectiveProfile(fromProfile);
+	const identity = loadIdentity(fromProfile);
+	const transport = await createTransport(profile, identity, makeLogger(false));
+	try {
+		const result = await transport.publishReceipt(toHexPubkey(to, "test recipient"), {
+			refEventId,
+			contextId,
+			status: "delivered",
+		});
+		if (!result.ok) {
+			throw new Error("test receipt publish failed");
+		}
+	} finally {
+		await transport.stop?.();
+	}
+}
+
 function startWait(options: { profile: string; timeout: string; summary?: boolean }) {
 	const controller = new AbortController();
 	controllers.push(controller);
@@ -127,6 +145,22 @@ describe("agx wait", () => {
 		expect(run.code).toBe(EXIT.ok);
 		expect(report(run)).toMatchObject({ timedOut: false, truncated: false });
 		expect(report(run).messages.map((message) => message.text)).toEqual(["live arrival"]);
+	});
+
+	it("wakes for a receipt matched to a sent message", async () => {
+		const pair = await allowedPair();
+		const sent = await agx("--json", "--profile", "sender", "send", "--", pair.receiver, "ack me");
+		expect(sent.code).toBe(EXIT.ok);
+		const outbound = jsonDocuments(sent.stdout).at(-1) as { eventId: string; contextId: string };
+		const waiting = startWait({ profile: "sender", timeout: "5" });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		await publishReceipt("receiver", pair.sender, outbound.eventId, outbound.contextId);
+
+		const run = await waiting.done;
+		expect(run.code).toBe(EXIT.ok);
+		expect(report(run)).toMatchObject({ timedOut: false });
+		expect(report(run).receipts).toHaveLength(1);
+		expect(report(run).receipts[0]).toMatchObject({ ref: outbound.eventId, status: "delivered" });
 	});
 
 	it("wakes for held activity without exposing held text or addresses in summary", async () => {
