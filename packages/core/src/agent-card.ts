@@ -30,6 +30,8 @@ const mediaTypeSchema = z
 	.regex(mediaTypePattern);
 const schemaDocumentSchema = z.record(z.string(), z.unknown());
 
+// Not strict: unknown fields are dropped, so a later card version stays
+// readable as typed.
 const skillSchema = z
 	.object({
 		id: z
@@ -61,15 +63,12 @@ const skillSchema = z
 			.array(z.string().min(1).max(AGX_AGENT_CARD_LIMITS.featureChars))
 			.max(AGX_AGENT_CARD_LIMITS.features)
 			.optional(),
-	})
-	.strict();
+	});
 
-const extensionSchema = z
-	.object({
-		uri: z.string().min(1).max(AGX_AGENT_CARD_LIMITS.extensionUriChars),
-		required: z.boolean().optional(),
-	})
-	.strict();
+const extensionSchema = z.object({
+	uri: z.string().min(1).max(AGX_AGENT_CARD_LIMITS.extensionUriChars),
+	required: z.boolean().optional(),
+});
 
 function issueProblem(error: z.ZodError): string {
 	const issue = error.issues[0];
