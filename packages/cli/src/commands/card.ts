@@ -1,5 +1,6 @@
 import {
 	CARD_KIND,
+	configureWebSocket,
 	fetchByAuthor,
 	fetchNip05Pubkey,
 	parseNip05,
@@ -7,6 +8,7 @@ import {
 	verifyEvent,
 } from "@nostr-agx/nostr";
 import kleur from "kleur";
+import WebSocket from "ws";
 import { effectiveProfile, resolveProfileName } from "../lib/config.js";
 import { AgxCliError, EXIT } from "../lib/errors.js";
 import { heading, info, json, kv, say, warn } from "../lib/output.js";
@@ -126,6 +128,7 @@ export async function cardCommand(
 		});
 	}
 	const pubkey = toHexPubkey(peer, "agent identity");
+	configureWebSocket(WebSocket);
 
 	const [cardEvents, relayEvents] = await Promise.all([
 		fetchByAuthor({ relays, author: pubkey, kinds: [CARD_KIND], limit: 1 }),

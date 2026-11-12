@@ -10,6 +10,7 @@ import { Relay, Subscription } from "nostr-tools/relay";
 import { GIFT_WRAP_KIND } from "./kinds";
 import { isSignerUnavailable, type AgxSigner } from "./signer";
 import { isIgnorableReceiptRumor, openMessageRumor, openReceiptRumor } from "./events";
+import { configureWebSocket } from "./ws";
 import {
 	eventExpiration,
 	MAX_WRAP_BACKDATE_SEC,
@@ -49,9 +50,10 @@ function verifiedOnce(event: Event): boolean {
 }
 
 /**
- * Relay pool: short-lived connections for poll/publish/discovery. WebSocket is
- * configured once by the transport via `configureWebSocket`. A logger is injected
- * (default no-op). NIP-42 AUTH is auto-answered when a signer is supplied.
+ * Relay pool: short-lived connections for poll/publish/discovery. Every dial goes
+ * through `configureWebSocket`, including standalone helpers with no transport.
+ * A logger is injected (default no-op). NIP-42 AUTH is auto-answered when a signer
+ * is supplied.
  */
 
 /** Per-op timeout budget — applied to the connect, to each REQ page (in
@@ -122,6 +124,13 @@ class RelayRefusedError extends Error {
 	}
 }
 
+function connectRelay(
+	...args: Parameters<typeof Relay.connect>
+): ReturnType<typeof Relay.connect> {
+	configureWebSocket();
+	return Relay.connect(...args);
+}
+
 async function withRelay<T>(
 	url: string,
 	fn: (relay: Relay) => Promise<T>,
@@ -130,7 +139,7 @@ async function withRelay<T>(
 	// Bound the connect too: a relay can accept the TCP socket then stall the WS
 	// upgrade, which would otherwise hang here past any per-op budget.
 	const relay = await withTimeout(
-		Relay.connect(url),
+		connectRelay(url),
 		RELAY_OP_TIMEOUT_MS,
 		// No URL in the label. A connect timeout surfaces as
 		// `rejected[].error` too, and every caller already renders the relay
@@ -824,7 +833,7 @@ export async function listenEvents(
 			// upgrade, which would otherwise hang here past any per-op budget.
 			const relay = await withTimeout(
 				// nostr-tools reconnects the socket and re-fires open subscriptions.
-				Relay.connect(url, { enableReconnect: true }),
+				connectRelay(url, { enableReconnect: true }),
 				RELAY_OP_TIMEOUT_MS,
 				// No URL in the label. A connect timeout surfaces as
 				// `rejected[].error` too, and every caller already renders the relay
