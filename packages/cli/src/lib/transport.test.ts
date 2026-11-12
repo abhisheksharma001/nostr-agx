@@ -1,4 +1,5 @@
 import { createServer, type Socket } from "node:net";
+import { withBoundedPong } from "@nostr-agx/nostr";
 import { describe, expect, it } from "vitest";
 import { withHandshakeTimeout } from "./transport.js";
 
@@ -24,6 +25,17 @@ describe("withHandshakeTimeout", () => {
 				socket.destroy();
 			}
 			relay.close();
+		}
+	});
+
+	it("forwards automatic-pong disablement through the handshake-timeout subclass", () => {
+		const Timed = withBoundedPong(withHandshakeTimeout(200));
+		const socket = new Timed("ws://127.0.0.1:1");
+		socket.on("error", () => {});
+		try {
+			expect((socket as unknown as { _autoPong: boolean })._autoPong).toBe(false);
+		} finally {
+			socket.terminate();
 		}
 	});
 });
