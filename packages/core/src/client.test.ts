@@ -1369,35 +1369,71 @@ describe("AgxClient streamRequest", () => {
 	});
 
 	it("cancels the responder on requester timeout and rejects late input", async () => {
-		const alice = new AgxClient({ transport: bus.transport(ALICE) });
-		const bob = new AgxClient({
-			transport: bus.transport(BOB),
-			authorize: "accept-all",
-		});
-		bob.handle("approval", async (_task, ctx) =>
-			ctx.requestInput({ prompt: "Approve?", timeoutMs: 5_000 }),
-		);
-		const stream = await alice.streamRequest(BOB, "approval", {}, {
-			timeoutMs: 30,
-		});
-		let inputRequestId = "";
-		stream.on("inputRequired", (update) => {
-			inputRequestId = update.inputRequestId;
-		});
+		// Fake timers make the cancel-vs-timeout race deterministic: the
+		// responder's input wait is capped by the requester's deadline, so
+		// with real timers both fire at ~30 ms and a slow runner can let the
+		// responder publish its own "failed" result before it sees the cancel.
+		vi.useFakeTimers();
+		try {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			let handlerError: unknown;
+			bob.handle("approval", async (_task, ctx) => {
+				try {
+					return await ctx.requestInput({ prompt: "Approve?", timeoutMs: 5_000 });
+				} catch (error) {
+					handlerError = error;
+					throw error;
+				}
+			});
+			const stream = await alice.streamRequest(BOB, "approval", {}, {
+				timeoutMs: 30,
+			});
+			let inputRequestId = "";
+			stream.on("inputRequired", (update) => {
+				inputRequestId = update.inputRequestId;
+			});
+			const rejected = expect(stream.result).rejects.toThrow(/timed out/);
 
-		await bob.pump();
-		await alice.pump();
-		expect(inputRequestId).not.toBe("");
-		await expect(stream.result).rejects.toThrow(/timed out/);
-		await expect(stream.provideInput(inputRequestId, true)).rejects.toThrow(
-			/not pending/,
-		);
-		await bob.pump();
-		await bob.tasksSettled();
-		const replies = (bus.inbox.get(ALICE) ?? [])
-			.map((message) => parseTaskEnvelope(message.text))
-			.filter((envelope) => envelope?.t === "res");
-		expect(replies).toHaveLength(1);
+			// The responder receives the request 10 ms later, so its input wait
+			// (capped to the requester's 30 ms budget) ends at t=40, after the
+			// requester's own timeout at t=30.
+			await vi.advanceTimersByTimeAsync(10);
+			await bob.pump();
+			await alice.pump();
+			expect(inputRequestId).not.toBe("");
+
+			// Requester times out at t=30 and sends a cancel.
+			await vi.advanceTimersByTimeAsync(20);
+			await rejected;
+			await expect(stream.provideInput(inputRequestId, true)).rejects.toThrow(
+				/not pending/,
+			);
+			const cancels = (bus.inbox.get(BOB) ?? [])
+				.map((message) => parseTaskEnvelope(message.text))
+				.filter((envelope) => envelope?.t === "cancel");
+			expect(cancels).toHaveLength(1);
+
+			// The responder handles the cancel before its own input deadline.
+			await bob.pump();
+			await bob.tasksSettled();
+			expect(handlerError).toBeDefined();
+			expect(String(handlerError)).not.toMatch(/timed out/);
+
+			// Running past the responder's deadline publishes nothing more.
+			await vi.advanceTimersByTimeAsync(10_000);
+			await bob.tasksSettled();
+			const replies = (bus.inbox.get(ALICE) ?? [])
+				.map((message) => parseTaskEnvelope(message.text))
+				.filter((envelope) => envelope?.t === "res");
+			expect(replies).toHaveLength(1);
+			expect(replies[0]).toMatchObject({ status: "input-required" });
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("registers stream update handling before publishing the initial request", async () => {

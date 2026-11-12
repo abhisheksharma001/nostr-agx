@@ -749,12 +749,12 @@ export class TaskOperationStore implements PendingRequestStore {
 			try {
 				if (retryable) {
 					if (operation.background) {
-						this.releaseBackgroundKey(operation);
+						evicted = this.releaseBackgroundKey(operation);
 					} else {
 						this.drop(operation);
 					}
 				}
-				evicted = this.enforceByteBudget(operation.id);
+				evicted = evicted.concat(this.enforceByteBudget(operation.id));
 				this.persist();
 			} catch {
 				for (const settled of evicted) {
@@ -777,14 +777,29 @@ export class TaskOperationStore implements PendingRequestStore {
 		return this.replay(operation, outcome);
 	}
 
-	private releaseBackgroundKey(operation: Operation): void {
+	/** The record leaves the keyed pool for the unkeyed one, so it needs room there first. */
+	private releaseBackgroundKey(operation: Operation): Operation[] {
 		if (!operation.keyed || !operation.publicId) {
-			return;
+			return [];
+		}
+		let evicted: Operation[] = [];
+		try {
+			evicted = this.makeStorageRoom(operation.credential ?? "", false);
+		} catch (error) {
+			// Every unkeyed record is still running, so none can go. Free the key all the same: failing
+			// here would hide this task's own error. The pool stays over its limit until a running task
+			// finishes and a later unkeyed submission trims it, and each release in that state adds a
+			// record. The default limits keep this from happening: at most 63 other background tasks
+			// run, against a per-credential limit of 100.
+			if (!(error instanceof ApiError && error.code === "idempotency_store_full")) {
+				throw error;
+			}
 		}
 		this.drop(operation);
 		operation.id = hash(`background task\0${operation.publicId}`);
 		operation.keyed = false;
 		this.put(operation);
+		return evicted;
 	}
 
 	private retainedOutcome(outcome: Outcome, background: boolean): Outcome {
