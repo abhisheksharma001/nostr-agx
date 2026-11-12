@@ -11,7 +11,7 @@ import { inboxCommand } from "./inbox.js";
 import { waitCommand } from "./wait.js";
 
 const control = vi.hoisted(() => ({
-	mode: "deadline" as "deadline" | "stop",
+	mode: "deadline" as "deadline" | "stop" | "wait-stop",
 	message: {
 		from: "11".repeat(32),
 		eventId: "22".repeat(32),
@@ -38,13 +38,15 @@ vi.mock("@nostr-agx/core", () => ({
 		async pump(): Promise<{ cursor: number; dispatched: number; complete: boolean }> {
 			if (control.mode === "deadline") {
 				this.onMessage(control.message);
+			}
+			if (control.mode !== "stop") {
 				return new Promise(() => {});
 			}
 			return { cursor: 0, dispatched: 0, complete: true };
 		}
 
 		async stop(): Promise<void> {
-			if (control.mode === "stop") {
+			if (control.mode !== "deadline") {
 				this.onMessage(control.message);
 			}
 		}
@@ -90,6 +92,15 @@ it("persists messages dispatched while one-shot inbox stops", async () => {
 	control.mode = "stop";
 	const run = await capture(() => inboxCommand({ wait: "1" }));
 	const report = jsonDocuments(run.stdout).at(-1) as { messages: Array<{ text: string }> };
+	expect(report.messages.map((message) => message.text)).toEqual([control.message.text]);
+	expect(storedTexts()).toEqual([control.message.text]);
+});
+
+it("persists messages dispatched while wait stops at its deadline", async () => {
+	control.mode = "wait-stop";
+	const run = await capture(() => waitCommand({ timeout: "1", signal: new AbortController().signal }));
+	const report = jsonDocuments(run.stdout).at(-1) as { messages: Array<{ text: string }>; timedOut: boolean; truncated: boolean };
+	expect(report).toMatchObject({ timedOut: true, truncated: true });
 	expect(report.messages.map((message) => message.text)).toEqual([control.message.text]);
 	expect(storedTexts()).toEqual([control.message.text]);
 });
