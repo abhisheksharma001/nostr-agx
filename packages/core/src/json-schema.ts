@@ -38,6 +38,15 @@ const schemaKeywords = new Set([
 	"minProperties",
 	"maxProperties",
 ]);
+/** Accepted whatever their value and otherwise ignored: never checked, never
+ * walked, never fetched (`$schema`), and `default` is never applied. */
+const annotationKeywords = new Set([
+	"description",
+	"title",
+	"$schema",
+	"default",
+	"examples",
+]);
 const nonNegativeIntegerKeywords = new Set([
 	"minLength",
 	"maxLength",
@@ -148,7 +157,7 @@ function validateSchemaNode(
 		return `schema has more than ${AGX_JSON_SCHEMA_LIMITS.schemaNodes} nodes`;
 	}
 	for (const keyword of Object.keys(schema)) {
-		if (!schemaKeywords.has(keyword)) {
+		if (!schemaKeywords.has(keyword) && !annotationKeywords.has(keyword)) {
 			return `unsupported schema keyword: ${keyword.slice(0, 120)}`;
 		}
 	}
