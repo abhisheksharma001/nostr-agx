@@ -1,6 +1,7 @@
 import {
-	AGX_JSON_SCHEMA_LIMITS,
-	validateAgxJsonSchema,
+	AGX_AGENT_CARD_LIMITS,
+	parseAgxAgentCardExtension,
+	parseAgxAgentSkill,
 } from "@nostr-agx/core";
 import type {
 	AgxAgentCardExtension,
@@ -15,96 +16,17 @@ export type AgentCardExtension = AgxAgentCardExtension;
 export type AgentCardMetadataWarning = AgxAgentCardMetadataWarning;
 export type AgentCardJsonSchema = AgxJsonSchema;
 
-export const AGENT_CARD_TYPED_METADATA_LIMITS = {
-	skills: 64,
-	extensions: 32,
-	skillIdChars: 200,
-	descriptionChars: 1_000,
-	tags: 16,
-	tagChars: 64,
-	modes: 8,
-	mediaTypeChars: 128,
-	features: 16,
-	featureChars: 200,
-	extensionUriChars: 512,
-	schemaBytes: 16 * 1024,
-	metadataBytes: 64 * 1024,
-	schemaDepth: AGX_JSON_SCHEMA_LIMITS.schemaDepth,
-	schemaProperties: AGX_JSON_SCHEMA_LIMITS.schemaProperties,
-	schemaNodes: AGX_JSON_SCHEMA_LIMITS.schemaNodes,
-} as const;
+export const AGENT_CARD_TYPED_METADATA_LIMITS = AGX_AGENT_CARD_LIMITS;
 
 export const SUPPORTED_AGENT_CARD_EXTENSIONS: ReadonlySet<string> = new Set();
 
-const mediaTypePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\/[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const mediaTypeSchema = z
-	.string()
-	.min(1)
-	.max(AGENT_CARD_TYPED_METADATA_LIMITS.mediaTypeChars)
-	.regex(mediaTypePattern);
-const schemaDocumentSchema = z.record(z.string(), z.unknown());
-
-const skillSchema = z
-	.object({
-		id: z
-			.string()
-			.min(1)
-			.max(AGENT_CARD_TYPED_METADATA_LIMITS.skillIdChars)
-			.refine((id) => id !== "*" && !id.endsWith(".*"), {
-				message: "typed skill IDs must be concrete capability keys",
-			}),
-		description: z
-			.string()
-			.min(1)
-			.max(AGENT_CARD_TYPED_METADATA_LIMITS.descriptionChars),
-		tags: z
-			.array(
-				z
-					.string()
-					.min(1)
-					.max(AGENT_CARD_TYPED_METADATA_LIMITS.tagChars),
-			)
-			.max(AGENT_CARD_TYPED_METADATA_LIMITS.tags)
-			.optional(),
-		inputModes: z
-			.array(mediaTypeSchema)
-			.max(AGENT_CARD_TYPED_METADATA_LIMITS.modes)
-			.optional(),
-		outputModes: z
-			.array(mediaTypeSchema)
-			.max(AGENT_CARD_TYPED_METADATA_LIMITS.modes)
-			.optional(),
-		inputSchema: schemaDocumentSchema.optional(),
-		outputSchema: schemaDocumentSchema.optional(),
-		features: z
-			.array(
-				z
-					.string()
-					.min(1)
-					.max(AGENT_CARD_TYPED_METADATA_LIMITS.featureChars),
-			)
-			.max(AGENT_CARD_TYPED_METADATA_LIMITS.features)
-			.optional(),
-	})
-	.strict();
-
-const extensionSchema = z
-	.object({
-		uri: z
-			.string()
-			.min(1)
-			.max(AGENT_CARD_TYPED_METADATA_LIMITS.extensionUriChars),
-		required: z.boolean().optional(),
-	})
-	.strict();
-
 const typedMetadataSchema = z.object({
 	skills: z
-		.array(skillSchema)
+		.array(z.unknown())
 		.max(AGENT_CARD_TYPED_METADATA_LIMITS.skills)
 		.optional(),
 	extensions: z
-		.array(extensionSchema)
+		.array(z.unknown())
 		.max(AGENT_CARD_TYPED_METADATA_LIMITS.extensions)
 		.optional(),
 });
@@ -182,47 +104,42 @@ function parseAgentCardMetadataUnsafe(
 		return invalid(`${path}${issue?.message ?? "invalid metadata"}`);
 	}
 
+	const skills: AgentSkill[] = [];
 	const skillIds = new Set<string>();
-	for (const skill of parsed.data.skills ?? []) {
+	for (const [index, entry] of (parsed.data.skills ?? []).entries()) {
+		const result = parseAgxAgentSkill(entry);
+		if ("problem" in result) {
+			return invalid(`skills.${index}: ${result.problem}`);
+		}
+		const skill = result.skill;
 		if (skillIds.has(skill.id)) {
 			return invalid(`duplicate skill ID: ${skill.id}`);
 		}
 		skillIds.add(skill.id);
-		for (const keyword of ["inputSchema", "outputSchema"] as const) {
-			const schema = skill[keyword];
-			if (!schema) {
-				continue;
-			}
-			const size = utf8Size(schema);
-			if (
-				size === null ||
-				size > AGENT_CARD_TYPED_METADATA_LIMITS.schemaBytes
-			) {
-				return invalid(
-					`${skill.id} ${keyword} exceeds ${AGENT_CARD_TYPED_METADATA_LIMITS.schemaBytes} UTF-8 bytes`,
-				);
-			}
-			const error = validateAgxJsonSchema(schema);
-			if (error) {
-				return invalid(`${skill.id} ${keyword}: ${error}`);
-			}
-		}
+		skills.push(skill);
 	}
 
+	const extensions: AgentCardExtension[] = [];
 	const extensionUris = new Set<string>();
-	for (const extension of parsed.data.extensions ?? []) {
+	for (const [index, entry] of (parsed.data.extensions ?? []).entries()) {
+		const result = parseAgxAgentCardExtension(entry);
+		if ("problem" in result) {
+			return invalid(`extensions.${index}: ${result.problem}`);
+		}
+		const extension = result.extension;
 		if (extensionUris.has(extension.uri)) {
 			return invalid(`duplicate extension URI: ${extension.uri}`);
 		}
 		extensionUris.add(extension.uri);
+		extensions.push(extension);
 	}
-	const unsupportedRequired = (parsed.data.extensions ?? []).filter(
+	const unsupportedRequired = extensions.filter(
 		(extension) =>
 			extension.required === true && !supportedExtensions.has(extension.uri),
 	);
 	const result: TypedAgentCardMetadata = {};
 	if (parsed.data.extensions !== undefined) {
-		result.extensions = parsed.data.extensions;
+		result.extensions = extensions;
 	}
 	if (unsupportedRequired.length > 0) {
 		result.warning = {
@@ -232,7 +149,7 @@ function parseAgentCardMetadataUnsafe(
 		return result;
 	}
 	if (parsed.data.skills !== undefined) {
-		result.skills = parsed.data.skills;
+		result.skills = skills;
 	}
 	return result;
 }
