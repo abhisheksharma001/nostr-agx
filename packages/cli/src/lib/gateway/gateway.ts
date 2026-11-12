@@ -671,19 +671,21 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			const deadline = new Promise<void>((resolve) => {
 				timer = setTimeout(resolve, SHUTDOWN_WAIT_MS);
 			});
-			const requesterStopped = requester.stop();
-			requesterStopped.catch(() => undefined);
-			await Promise.race([requesterStopped, deadline]);
-			await Promise.race([pumpLoop, deadline]);
-			// On disk before waiting for running tasks: a kill from here on loses
-			// nothing (a running task is already recorded as handled).
 			try {
-				persist();
-			} catch (error) {
-				log(`state could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+				// A requester stop that fails must not skip the saves and the lock release below.
+				await Promise.race([requester.stop().catch(() => undefined), deadline]);
+				await Promise.race([pumpLoop, deadline]);
+				// On disk before waiting for running tasks: a kill from here on loses
+				// nothing (a running task is already recorded as handled).
+				try {
+					persist();
+				} catch (error) {
+					log(`state could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				await Promise.race([Promise.all([publishing, client.tasksSettled(), queue.idle()]), deadline]);
+			} finally {
+				clearTimeout(timer);
 			}
-			await Promise.race([Promise.all([publishing, client.tasksSettled(), queue.idle()]), deadline]);
-			clearTimeout(timer);
 			if (queue.pending() > 0) {
 				log(`DROP  ${queue.pending()} message and receipt deliveries not made before stopping (they are in agx inbox)`);
 			}
