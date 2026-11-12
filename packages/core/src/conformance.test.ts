@@ -9,7 +9,7 @@ describe("task-envelope conformance vectors", () => {
 			suite.vectors.length,
 		);
 		for (const vector of suite.vectors) {
-			expect(vector.spec).toBe("packages/core/SPEC.md#task-lifecycle");
+			expect(vector.spec).toBe(suite.spec);
 			if (vector.valid) {
 				expect(vector).toHaveProperty("envelope");
 			}
@@ -36,6 +36,25 @@ describe("task-envelope conformance vectors", () => {
 	});
 
 	const ran = new Set<string>();
+	it("points at a SPEC section that exists", async () => {
+		const [file, anchor] = suite.spec.split("#");
+		// Variable specifier: this package has no Node or Vite type declarations.
+		const specPath = new URL(`../../../${file}`, import.meta.url).pathname;
+		const rawSpec = `${specPath}?raw`;
+		const spec: { default: string } = await import(rawSpec);
+		const slugs = spec.default
+			.split("\n")
+			.filter((line) => /^#{1,6} /.test(line))
+			.map((line) =>
+				line
+					.replace(/^#+ /, "")
+					.toLowerCase()
+					.replace(/[^a-z0-9 -]/g, "")
+					.replace(/ /g, "-"),
+			);
+		expect(slugs).toContain(anchor);
+	});
+
 	for (const vector of suite.vectors) {
 		it(vector.id, () => {
 			expect.hasAssertions();
