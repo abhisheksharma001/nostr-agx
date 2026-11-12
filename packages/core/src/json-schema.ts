@@ -382,7 +382,11 @@ function validatePayloadNode(
 			const quotient = value / (schema.multipleOf as number);
 			const tolerance =
 				Number.EPSILON * Math.max(1, Math.abs(quotient)) * 4;
-			if (Math.abs(quotient - Math.round(quotient)) > tolerance) {
+			// An overflowing quotient would compare NaN > tolerance (false) and pass.
+			if (
+				!Number.isFinite(quotient) ||
+				Math.abs(quotient - Math.round(quotient)) > tolerance
+			) {
 				return `${path}: not a multipleOf value`;
 			}
 		}
