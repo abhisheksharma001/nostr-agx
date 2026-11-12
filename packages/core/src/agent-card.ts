@@ -15,8 +15,11 @@ export const AGX_AGENT_CARD_LIMITS = {
 	features: 16,
 	featureChars: 200,
 	extensionUriChars: 512,
+	/** Each inline schema, measured the same way as `metadataBytes`. */
 	schemaBytes: 16 * 1024,
-	metadataBytes: 64 * 1024,
+	/** Typed metadata (`skills` + `extensions`), measured as UTF-8 inside the
+	 * Agent Card event's escaped `content`; see {@link agxEncodedJsonBytes}. */
+	metadataBytes: 32 * 1024,
 	schemaDepth: AGX_JSON_SCHEMA_LIMITS.schemaDepth,
 	schemaProperties: AGX_JSON_SCHEMA_LIMITS.schemaProperties,
 	schemaNodes: AGX_JSON_SCHEMA_LIMITS.schemaNodes,
@@ -76,12 +79,16 @@ function issueProblem(error: z.ZodError): string {
 	return `${path}${issue?.message ?? "invalid value"}`;
 }
 
-function utf8Size(value: unknown): number | null {
+/** The UTF-8 bytes `value` takes up inside a serialized Agent Card event:
+ * encoded once as part of the card text, then escaped again as the event's
+ * `content` string (without its two outer quotes). Null when `value` is not
+ * JSON. */
+export function agxEncodedJsonBytes(value: unknown): number | null {
 	try {
-		const serialized = JSON.stringify(value);
-		return serialized === undefined
+		const text = JSON.stringify(value);
+		return text === undefined
 			? null
-			: new TextEncoder().encode(serialized).byteLength;
+			: new TextEncoder().encode(JSON.stringify(text)).byteLength - 2;
 	} catch {
 		return null;
 	}
@@ -103,10 +110,10 @@ export function parseAgxAgentSkill(
 			if (!schema) {
 				continue;
 			}
-			const size = utf8Size(schema);
+			const size = agxEncodedJsonBytes(schema);
 			if (size === null || size > AGX_AGENT_CARD_LIMITS.schemaBytes) {
 				return {
-					problem: `${skill.id} ${keyword} exceeds ${AGX_AGENT_CARD_LIMITS.schemaBytes} UTF-8 bytes`,
+					problem: `${skill.id} ${keyword} exceeds ${AGX_AGENT_CARD_LIMITS.schemaBytes} bytes as encoded in the event`,
 				};
 			}
 			const error = validateAgxJsonSchema(schema);

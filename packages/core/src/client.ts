@@ -1,4 +1,8 @@
-import { parseAgxAgentSkill } from "./agent-card";
+import {
+	AGX_AGENT_CARD_LIMITS,
+	agxEncodedJsonBytes,
+	parseAgxAgentSkill,
+} from "./agent-card";
 import { AgxPublicError, AgxTaskDeclined, AgxTaskFailedError } from "./errors";
 import { randomId } from "./id";
 import { agxWireJson, validateAgxJsonPayload } from "./json-schema";
@@ -426,6 +430,23 @@ export class AgxClient {
 			if ("problem" in parsed) {
 				throw new Error(
 					`AGX handler ${capability} contract: ${parsed.problem}`,
+				);
+			}
+			// The card carries every typed skill, so check the set this one
+			// would join (replacing any earlier contract for the capability).
+			const skills = [
+				...this.typedSkills().filter((skill) => skill.id !== capability),
+				parsed.skill,
+			];
+			if (skills.length > AGX_AGENT_CARD_LIMITS.skills) {
+				throw new Error(
+					`AGX handler ${capability} contract: more than ${AGX_AGENT_CARD_LIMITS.skills} typed skills`,
+				);
+			}
+			const bytes = agxEncodedJsonBytes({ skills });
+			if (bytes === null || bytes > AGX_AGENT_CARD_LIMITS.metadataBytes) {
+				throw new Error(
+					`AGX handler ${capability} contract: typed skills would exceed ${AGX_AGENT_CARD_LIMITS.metadataBytes} bytes as encoded in the Agent Card event`,
 				);
 			}
 			const { id: _id, ...copy } = parsed.skill;

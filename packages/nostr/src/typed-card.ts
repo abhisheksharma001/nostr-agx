@@ -1,5 +1,6 @@
 import {
 	AGX_AGENT_CARD_LIMITS,
+	agxEncodedJsonBytes,
 	parseAgxAgentCardExtension,
 	parseAgxAgentSkill,
 } from "@nostr-agx/core";
@@ -40,17 +41,6 @@ export interface TypedAgentCardMetadata {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function utf8Size(value: unknown): number | null {
-	try {
-		const serialized = JSON.stringify(value);
-		return serialized === undefined
-			? null
-			: new TextEncoder().encode(serialized).byteLength;
-	} catch {
-		return null;
-	}
 }
 
 function invalid(detail: string): TypedAgentCardMetadata {
@@ -97,16 +87,16 @@ function parseAgentCardMetadataUnsafe(
 	if (raw.skills === undefined && raw.extensions === undefined) {
 		return {};
 	}
-	const serializedSize = utf8Size({
+	const encodedSize = agxEncodedJsonBytes({
 		...(raw.skills === undefined ? {} : { skills: raw.skills }),
 		...(raw.extensions === undefined ? {} : { extensions: raw.extensions }),
 	});
 	if (
-		serializedSize === null ||
-		serializedSize > AGENT_CARD_TYPED_METADATA_LIMITS.metadataBytes
+		encodedSize === null ||
+		encodedSize > AGENT_CARD_TYPED_METADATA_LIMITS.metadataBytes
 	) {
 		return invalid(
-			`serialized metadata exceeds ${AGENT_CARD_TYPED_METADATA_LIMITS.metadataBytes} UTF-8 bytes or is not JSON`,
+			`metadata exceeds ${AGENT_CARD_TYPED_METADATA_LIMITS.metadataBytes} bytes as encoded in the event, or is not JSON`,
 		);
 	}
 	const parsed = typedMetadataSchema.safeParse({
