@@ -545,9 +545,24 @@ describe("buildCard typed metadata", () => {
 		]);
 	});
 
-	it("refuses to build invalid typed metadata", () => {
-		expect(() => buildCard({ ...base, skills: [skill(), skill()] })).toThrow(
-			/duplicate skill ID/,
-		);
+	it("drops an invalid skill and builds the rest of the card", () => {
+		const card = buildCard({
+			...base,
+			skills: [skill(), skill({ id: "x.*" })],
+		});
+		expect(card.skills).toEqual([skill()]);
+		expect(card.capabilities).toEqual(["invoice.review"]);
+		expect(card.version).toBe(TYPED_CARD_VERSION);
+	});
+
+	it("falls back to version 1.0.0 when every typed field is dropped", () => {
+		const card = buildCard({
+			...base,
+			skills: [skill({ id: "x.*" }), skill({ description: "" })],
+		});
+		expect(card.version).toBe(CARD_VERSION);
+		expect(card).not.toHaveProperty("skills");
+		expect(card).not.toHaveProperty("extensions");
+		expect(card.capabilities).toEqual(["invoice.review"]);
 	});
 });
