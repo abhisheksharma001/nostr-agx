@@ -58,7 +58,7 @@ One line:
 | `held[]` | `{ from, count, firstSeenAt }` | Senders off the allowlist and how many messages they sent. **No text** |
 | `receipts[]` | `{ from, ref, status, at }` | Delivery receipts for messages this agent sent (`delivered`, `quarantined`) |
 | `truncated` | boolean | `true` when the bounded pull stopped before the end |
-| `timedOut` | boolean | **`agx wait` only:** `true` when the wait ended quietly at its deadline, otherwise `false` |
+| `timedOut` | boolean | **`agx wait` only:** `true` when the deadline ended the wait; with `truncated: true`, a partial batch may still contain messages |
 
 **Message** (shared with `thread`):
 
@@ -87,7 +87,7 @@ A quiet healthy timeout exits `0` with no new messages or receipts and `timedOut
 { "schema": "agx.inbox.summary/1", "new": 0, "unread": 0, "held": 0, "relays": { "ok": 1, "unreachable": 0 }, "timedOut": true }
 ```
 
-Activity returns `timedOut: false`. Ordinary `agx inbox` output does not contain the field. If no relay answered during the whole wait, the command exits `5`; another reader holding the profile lock exits `1`; host interruption exits `130`. The consumer marks each displayed thread read with `agx thread <contextId> --mark-read` before starting the next wait. Until then, unread messages intentionally appear again.
+Activity completed before the deadline returns `timedOut: false`. If the deadline cuts off a pull, `timedOut: true, truncated: true` may still carry a partial batch; show `messages` whenever non-empty. Ordinary `agx inbox` output does not contain the field. If no relay answered during the whole wait, the command exits `5`; another reader holding the profile lock exits `1`; host interruption exits `130`. The consumer marks each displayed thread read with `agx thread <contextId> --mark-read` before starting the next wait. Until then, unread messages intentionally appear again.
 
 ## `agx threads` and `agx thread <contextId>`
 
@@ -111,11 +111,11 @@ Samples: [`samples/threads.json`](samples/threads.json), [`samples/thread.json`]
 
 `agx held list --json` returns `agx.held/1`: `{ "schema": "agx.held/1", "held": [{ "from", "count", "firstSeenAt" }] }`: the sender's npub, how many messages they sent and when the first arrived. **No text.** The kept text is shown by `agx ui` and moved into a thread by `agx held allow`.
 
-- `agx held allow <npub>` adds the sender to the allowlist and moves their kept messages into the history (unread). A running `agx serve` picks up the new allowlist on its next poll.
+- `agx held allow <npub>` adds the sender to the allowlist and moves their kept messages into the history (unread). A running `agx serve` or `agx wait` picks up the new allowlist on its next poll.
 - `agx held ignore <npub>` drops the kept text; later messages from that sender are not kept.
 - `agx held block <npub>` does the same and removes the sender from the allowlist.
 
-With `--json` each decision prints `{ "ok": true, "action": "allow", "npub": "…", "released": 2, "queued": false }`. While `agx serve`, `agx inbox` or `agx wait` holds the profile lock, the allowlist change is made at once and the rest is queued for that process (`queued: true`, `released: 0`): `agx serve` applies it within a poll. `list` never needs the lock.
+With `--json` each decision prints `{ "ok": true, "action": "allow", "npub": "…", "released": 2, "queued": false }`. While `agx serve`, `agx inbox` or `agx wait` holds the profile lock, the allowlist change is made at once and the rest is queued for that process (`queued: true`, `released: 0`): `agx serve` and `agx wait` apply it within a poll. `list` never needs the lock.
 
 Caps: 50 kept messages per held sender (the count keeps going) and 20 new unknown senders per hour.
 

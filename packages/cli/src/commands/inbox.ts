@@ -170,10 +170,6 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 							break;
 						}
 						if (outcome.result === null) {
-							seen.holdFor(cursor);
-							store.flush();
-							seen.flush();
-							updateState(profileName, { cursor, lastPumpAt: new Date().toISOString() });
 							truncated = true;
 							timedOut = true;
 							break;
@@ -230,10 +226,15 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 			await client.stop().catch(() => undefined);
 		}
 
-		if (!control.activity) {
+		if (!interrupted) {
+			if (control.activity) {
+				seen.holdFor(cursor);
+			}
 			store.flush();
 			seen.flush();
 			updateState(profileName, { cursor, lastPumpAt: new Date().toISOString() });
+		}
+		if (!control.activity) {
 			relays = await probe();
 		}
 
