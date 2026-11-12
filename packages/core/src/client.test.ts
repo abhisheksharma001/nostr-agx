@@ -816,6 +816,53 @@ describe("AgxClient task request/response", () => {
 		);
 	});
 
+	it("refuses a contract that would push typed metadata over the card limit", async () => {
+		const advertise = vi.fn(async () => ({ ok: true }));
+		const bob = new AgxClient({
+			transport: { ...bus.transport(BOB), advertise },
+		});
+		// About 11.6 KiB each once escaped inside the event: two fit in 32 KiB,
+		// a third does not.
+		const big = {
+			description: "Review an invoice",
+			inputSchema: { const: '"'.repeat(2_900) },
+		};
+		bob.handle("invoice.a", () => null, big);
+		bob.handle("invoice.b", () => null, big);
+		expect(() => bob.handle("invoice.c", () => null, big)).toThrow(
+			/AGX handler invoice\.c.*32768/,
+		);
+		expect(bob.capabilities()).toEqual(["invoice.a", "invoice.b"]);
+
+		// Replacing a contract counts the new one instead of the old one.
+		bob.handle("invoice.b", () => null, big);
+		bob.handle("invoice.b", () => null, { description: "Smaller" });
+		bob.handle("invoice.c", () => null, big);
+
+		await bob.start({ pollIntervalMs: 0 });
+		const skills = (
+			advertise.mock.calls[0] as unknown as [string[], { skills: { id: string }[] }]
+		)[1].skills;
+		expect(skills.map((skill) => skill.id)).toEqual([
+			"invoice.a",
+			"invoice.b",
+			"invoice.c",
+		]);
+	});
+
+	it("refuses a 65th typed contract", () => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		for (let index = 0; index < 64; index += 1) {
+			bob.handle(`task.${index}`, () => null, { description: "A task" });
+		}
+		expect(() =>
+			bob.handle("task.64", () => null, { description: "A task" }),
+		).toThrow(/AGX handler task\.64.*64/);
+		bob.handle("task.untyped", () => null);
+		expect(bob.capabilities()).toHaveLength(65);
+		expect(bob.capabilities()).not.toContain("task.64");
+	});
+
 	it("registers a contract whose schemas carry annotations", () => {
 		const bob = new AgxClient({ transport: bus.transport(BOB) });
 		expect(() =>

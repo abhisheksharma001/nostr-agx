@@ -1,3 +1,4 @@
+import { agxEncodedJsonBytes } from "@nostr-agx/core";
 import { describe, expect, it, vi } from "vitest";
 import { buildCard, CARD_VERSION, TYPED_CARD_VERSION } from "./discovery";
 import {
@@ -62,11 +63,24 @@ function expectSkillDropped(bad: unknown): void {
 	expect(parsed.skills?.map((kept) => kept.id)).toEqual(["kept"]);
 }
 
+/** UTF-8 bytes of `JSON.stringify`, encoded once (not as in the event). */
+function singleEncodedBytes(value: unknown): number {
+	return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+/** `bytes` of padding as measured inside the event's escaped content. Quote
+ * heavy, so the single and double encodings clearly differ: a `"` takes 4
+ * bytes there, an `x` takes 1. */
+function quotePadding(bytes: number): string {
+	const quotes = Math.floor(bytes / 4);
+	return '"'.repeat(quotes) + "x".repeat(bytes - quotes * 4);
+}
+
 function schemaOfBytes(bytes: number): Record<string, unknown> {
 	const schema: Record<string, unknown> = { const: "" };
-	const overhead = new TextEncoder().encode(JSON.stringify(schema)).byteLength;
-	schema.const = "x".repeat(bytes - overhead);
-	expect(new TextEncoder().encode(JSON.stringify(schema)).byteLength).toBe(bytes);
+	const overhead = agxEncodedJsonBytes(schema) as number;
+	schema.const = quotePadding(bytes - overhead);
+	expect(agxEncodedJsonBytes(schema)).toBe(bytes);
 	return schema;
 }
 
@@ -75,7 +89,7 @@ function metadataOfBytes(bytes: number): { skills: AgentSkill[] } {
 	for (let index = 0; ; index += 1) {
 		const candidate = skill({
 			id: `skill.${index}`,
-			description: "x".repeat(LIMITS.descriptionChars),
+			description: '"'.repeat(LIMITS.descriptionChars),
 			tags: undefined,
 			inputModes: undefined,
 			outputModes: undefined,
@@ -83,9 +97,7 @@ function metadataOfBytes(bytes: number): { skills: AgentSkill[] } {
 			outputSchema: undefined,
 			features: undefined,
 		});
-		const size = new TextEncoder().encode(
-			JSON.stringify({ skills: [...skills, candidate] }),
-		).byteLength;
+		const size = agxEncodedJsonBytes({ skills: [...skills, candidate] }) as number;
 		if (size > bytes) {
 			break;
 		}
@@ -101,14 +113,13 @@ function metadataOfBytes(bytes: number): { skills: AgentSkill[] } {
 		outputSchema: undefined,
 		features: undefined,
 	});
-	const base = new TextEncoder().encode(
-		JSON.stringify({ skills: [...skills, last] }),
-	).byteLength;
-	const padding = bytes - base;
-	expect(padding).toBeGreaterThanOrEqual(0);
-	expect(padding).toBeLessThanOrEqual(LIMITS.descriptionChars);
-	last.description = "x".repeat(padding);
-	return { skills: [...skills, last] };
+	const base = agxEncodedJsonBytes({ skills: [...skills, last] }) as number;
+	last.description = quotePadding(bytes - base);
+	expect(last.description.length).toBeGreaterThan(0);
+	expect(last.description.length).toBeLessThanOrEqual(LIMITS.descriptionChars);
+	const metadata = { skills: [...skills, last] };
+	expect(agxEncodedJsonBytes(metadata)).toBe(bytes);
+	return metadata;
 }
 
 function schemaOfDepth(depth: number): Record<string, unknown> {
@@ -417,19 +428,23 @@ describe("parseAgentCardMetadata", () => {
 		expectSkillDropped(skill({ inputSchema: { properties: properties(257) } }));
 	});
 
-	it("enforces inline schema and combined metadata UTF-8 byte bounds", () => {
+	it("enforces the inline schema bound as encoded in the event", () => {
+		expect(LIMITS.schemaBytes).toBe(16 * 1024);
 		expectValid({
 			skills: [skill({ inputSchema: schemaOfBytes(LIMITS.schemaBytes) })],
 		});
-		expectSkillDropped(
-			skill({ inputSchema: schemaOfBytes(LIMITS.schemaBytes + 1) }),
-		);
-		const atLimit = metadataOfBytes(LIMITS.metadataBytes);
-		expect(new TextEncoder().encode(JSON.stringify(atLimit)).byteLength).toBe(
-			LIMITS.metadataBytes,
-		);
-		expectValid(atLimit);
-		expectInvalid(metadataOfBytes(LIMITS.metadataBytes + 1));
+		const over = schemaOfBytes(LIMITS.schemaBytes + 1);
+		expect(singleEncodedBytes(over)).toBeLessThan(LIMITS.schemaBytes);
+		expectSkillDropped(skill({ inputSchema: over }));
+	});
+
+	it("enforces the encoded typed metadata bound", () => {
+		expect(LIMITS.metadataBytes).toBe(32_768);
+		expectValid(metadataOfBytes(32_768));
+		expectInvalid(metadataOfBytes(32_769));
+		const overOnlyWhenEscaped = metadataOfBytes(32_769);
+		expect(singleEncodedBytes(overOnlyWhenEscaped)).toBeLessThan(32_768);
+		expectInvalid(overOnlyWhenEscaped);
 	});
 
 	const UNIT = "invalid_typed_metadata";
@@ -553,6 +568,17 @@ describe("buildCard typed metadata", () => {
 		expect(card.skills).toEqual([skill()]);
 		expect(card.capabilities).toEqual(["invoice.review"]);
 		expect(card.version).toBe(TYPED_CARD_VERSION);
+	});
+
+	it("builds a legacy-only card when typed metadata is over the limit", () => {
+		const card = buildCard({
+			...base,
+			...metadataOfBytes(LIMITS.metadataBytes + 1),
+		});
+		expect(card.version).toBe(CARD_VERSION);
+		expect(card).not.toHaveProperty("skills");
+		expect(card.capabilities).toEqual(["invoice.review"]);
+		expect(card.org).toBe("Acme");
 	});
 
 	it("falls back to version 1.0.0 when every typed field is dropped", () => {
