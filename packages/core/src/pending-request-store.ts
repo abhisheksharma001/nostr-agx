@@ -9,7 +9,12 @@ export interface PendingRequestRecord {
 	phase: "publishing" | "waiting";
 }
 
-/** Single-writer storage for outbound requests. A failed write must reject. */
+/** Single-writer storage for outbound requests. A failed write must reject.
+ * Each call must also settle in bounded time: a `remove()` that never settles
+ * holds that request's deadline, and a `save()` or `remove()` that never settles
+ * during a send holds `stop({ preservePending: true })`, which waits for
+ * in-flight sends. That wait is otherwise bounded only by the transport's own
+ * publish limit. */
 export interface PendingRequestStore {
 	list(): PendingRequestRecord[] | Promise<PendingRequestRecord[]>;
 	save(record: PendingRequestRecord): void | Promise<void>;
