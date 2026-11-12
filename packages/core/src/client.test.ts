@@ -1,11 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgxClient, type AgxTaskContract } from "./client";
-import { AgxPublicError, AgxTaskDeclined } from "./errors";
+import {
+	AgxInvalidInputError,
+	AgxPublicError,
+	AgxTaskDeclined,
+	AgxTaskFailedError,
+} from "./errors";
 import { randomId } from "./id";
 import { encodeTaskEnvelope, parseTaskEnvelope } from "./task";
 import type {
 	AgxIncomingMessage,
 	AgxIncomingReceipt,
+	AgxPeerCard,
 	AgxPollResult,
 	AgxResolvedPeer,
 	AgxTransport,
@@ -286,10 +292,168 @@ describe("AgxClient task request/response", () => {
 		const publishMessage = vi.spyOn(transport, "publishMessage");
 		const alice = new AgxClient({ transport });
 
-		await expect(
-			alice.request(BOB, "invoice.review", { amount: "hello" }, { validate: true }),
-		).rejects.toThrow(/invalid_input.*expected number/);
+		const pending = alice.request(
+			BOB,
+			"invoice.review",
+			{ amount: "hello" },
+			{ validate: true },
+		);
+		await expect(pending).rejects.toThrow(/invalid_input.*expected number/);
+		await expect(pending).rejects.toBeInstanceOf(AgxInvalidInputError);
 		expect(publishMessage).not.toHaveBeenCalled();
+	});
+
+	describe("validate preflight checks only against a valid peer schema", () => {
+		const invoiceSkill = {
+			id: "invoice.review",
+			description: "Review an invoice",
+			inputSchema: {
+				type: "object",
+				required: ["amount"],
+				properties: { amount: { type: "number" } },
+			},
+		};
+
+		function cardWith(extra: Partial<AgxPeerCard>): AgxPeerCard {
+			return {
+				displayName: "Billing",
+				capabilities: ["invoice.review"],
+				nip05: null,
+				...extra,
+			};
+		}
+
+		function peerTransport(card: AgxPeerCard | null | Error) {
+			return {
+				...bus.transport(ALICE),
+				resolvePeer: vi.fn(async () => {
+					if (card instanceof Error) throw card;
+					return { relays: [], card };
+				}),
+			} satisfies AgxTransport;
+		}
+
+		async function expectSentUnchecked(card: AgxPeerCard | null | Error) {
+			const transport = peerTransport(card);
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+			await expect(
+				alice.request(
+					BOB,
+					"invoice.review",
+					{ amount: "hello" },
+					{ validate: true, timeoutMs: 20 },
+				),
+			).rejects.toThrow(/timed out/);
+			expect(publishMessage).toHaveBeenCalled();
+		}
+
+		it("throws AgxInvalidInputError for a payload the peer schema refuses", async () => {
+			const transport = peerTransport(cardWith({ skills: [invoiceSkill] }));
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			const error = await alice
+				.request(BOB, "invoice.review", { amount: "hello" }, { validate: true })
+				.catch((caught: unknown) => caught);
+			expect(error).toBeInstanceOf(AgxInvalidInputError);
+			expect(error).not.toBeInstanceOf(AgxTaskFailedError);
+			expect((error as AgxInvalidInputError).problem).toContain(
+				"expected number",
+			);
+			expect(publishMessage).not.toHaveBeenCalled();
+		});
+
+		it("throws AgxInvalidInputError from streamRequest too", async () => {
+			const transport = peerTransport(cardWith({ skills: [invoiceSkill] }));
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			await expect(
+				alice.streamRequest(
+					BOB,
+					"invoice.review",
+					{ amount: "hello" },
+					{ validate: true },
+				),
+			).rejects.toBeInstanceOf(AgxInvalidInputError);
+			expect(publishMessage).not.toHaveBeenCalled();
+		});
+
+		it("sends without checking when the peer has no card", async () => {
+			await expectSentUnchecked(null);
+		});
+
+		it("sends without checking when the card has no typed skills or carries only a metadata warning", async () => {
+			await expectSentUnchecked(cardWith({}));
+			await expectSentUnchecked(
+				cardWith({
+					typedMetadataWarnings: [
+						{ code: "invalid_typed_metadata", message: "ignored" },
+					],
+				}),
+			);
+		});
+
+		it("sends without checking when the peer skill has no input schema", async () => {
+			await expectSentUnchecked(
+				cardWith({
+					skills: [{ id: "invoice.review", description: "Review an invoice" }],
+				}),
+			);
+		});
+
+		it("sends without checking when the peer skill schema is invalid", async () => {
+			await expectSentUnchecked(
+				cardWith({
+					skills: [{ ...invoiceSkill, inputSchema: { pattern: "x" } }],
+				}),
+			);
+		});
+
+		it("sends without checking when the card lookup fails", async () => {
+			await expectSentUnchecked(new Error("no relay answered"));
+		});
+
+		it("still checks a valid skill when another skill on the card was dropped", async () => {
+			const transport = peerTransport(
+				cardWith({
+					skills: [invoiceSkill],
+					typedMetadataWarnings: [
+						{ code: "invalid_typed_skill", message: "skills.1 dropped" },
+					],
+				}),
+			);
+			const alice = new AgxClient({ transport });
+			await expect(
+				alice.request(
+					BOB,
+					"invoice.review",
+					{ amount: "hello" },
+					{ validate: true },
+				),
+			).rejects.toBeInstanceOf(AgxInvalidInputError);
+		});
+
+		it("a peer's invalid_input result rejects with AgxTaskFailedError", async () => {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			bob.handle("invoice.review", () => ({ approved: true }), {
+				description: "Review an invoice",
+				inputSchema: invoiceSkill.inputSchema,
+			});
+
+			const pending = alice.request(BOB, "invoice.review", { amount: "hello" });
+			pending.catch(() => undefined);
+			await bob.pump();
+			await alice.pump();
+			const error = await pending.catch((caught: unknown) => caught);
+			expect(error).toBeInstanceOf(AgxTaskFailedError);
+			expect(error).not.toBeInstanceOf(AgxInvalidInputError);
+		});
 	});
 
 	describe("streamRequest preflight", () => {
