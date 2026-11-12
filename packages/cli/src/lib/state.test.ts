@@ -146,8 +146,10 @@ describe("a state file the CLI cannot read", () => {
 		it("tells a damaged file apart from one it cannot read, and says what moving it costs", () => {
 			plant(statePath("default"), "{");
 			const damaged = refusal(() => loadState("default"), statePath("default"));
-			expect(damaged.remediation).toContain("agx inbox");
+			expect(damaged.remediation).toContain("inbox");
 			expect(damaged.remediation).toContain("cursor 0");
+			expect(damaged.remediation).toContain("--wait 600");
+			expect(damaged.remediation).toContain('"truncated": false');
 
 			// A directory where the file should be: access problem, not damage.
 			rmSync(statePath("default"));
@@ -219,8 +221,25 @@ describe("a state file the CLI cannot read", () => {
 				() => new FileSeenStore("default"),
 				seenPath("default"),
 			);
-			expect(error.remediation).toContain("agx inbox");
+			expect(error.remediation).toContain("inbox");
 			expect(error.remediation).toContain("answered again");
+			expect(error.remediation).toContain("will not run those");
+		});
+
+		it("names the profile in the pull-the-inbox advice, not the default one", () => {
+			plant(seenPath("receiver"), "{");
+			const error = refusal(
+				() => new FileSeenStore("receiver"),
+				seenPath("receiver"),
+			);
+			expect(error.remediation).toContain("--profile 'receiver' --json inbox");
+
+			plant(statePath("odd name"), "{");
+			const stateError = refusal(
+				() => loadState("odd name"),
+				statePath("odd name"),
+			);
+			expect(stateError.remediation).toContain("--profile 'odd name' --json inbox");
 		});
 	});
 });

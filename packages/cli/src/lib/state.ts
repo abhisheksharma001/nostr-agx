@@ -53,6 +53,7 @@ function shellQuote(path: string): string {
  * replay memory instead of an empty one.
  */
 function unreadableStateFile(
+	profile: string,
 	path: string,
 	kind: StateFileKind,
 	reason: string,
@@ -67,22 +68,27 @@ function unreadableStateFile(
 	}
 	const cost =
 		kind === "state"
-			? "Without it agx starts from cursor 0 and reads back everything the relays still hold (up to 30 days), and it forgets the stored listing."
+			? "Without it agx starts from cursor 0 and reads back everything the relays still hold (up to 30 days), and requests older than the replay memory (about 3 days) are answered again. It also forgets the stored listing."
 			: "Without it agx forgets which requests it already answered, so requests from the last two days or so are answered again.";
 	return new AgxCliError(message, {
 		exitCode: EXIT.config,
-		remediation: `If a newer agx wrote it, use that agx. If it is damaged, move it aside, then pull the inbox once before serving, so the replay memory is filled in without running any handler:\n    mv ${shellQuote(path)} ${shellQuote(`${path}.bad`)}\n    agx inbox\n  ${cost}`,
+		remediation: `If a newer agx wrote it, use that agx. If it is damaged, move it aside, then pull the inbox before serving, so the replay memory is filled in without running any handler. \`agx inbox\` waits only 10 seconds by default and does not say when it stopped early, so give it time and repeat it until the JSON report says "truncated": false:\n    mv ${shellQuote(path)} ${shellQuote(`${path}.bad`)}\n    agx --profile ${shellQuote(profile)} --json inbox --wait 600\n  ${cost} The pull marks every request it sees as seen, including ones never answered, so \`agx serve\` will not run those.`,
 	});
 }
 
 /** Read and parse a state file that exists. The error never carries the file's text. */
-function readJsonFile(path: string, kind: StateFileKind): unknown {
+function readJsonFile(
+	profile: string,
+	path: string,
+	kind: StateFileKind,
+): unknown {
 	let text: string;
 	try {
 		text = readFileSync(path, "utf8");
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		throw unreadableStateFile(
+			profile,
 			path,
 			kind,
 			`read failed${code ? `: ${code}` : ""}`,
@@ -92,7 +98,13 @@ function readJsonFile(path: string, kind: StateFileKind): unknown {
 	try {
 		return JSON.parse(text);
 	} catch {
-		throw unreadableStateFile(path, kind, "not valid JSON", "contents");
+		throw unreadableStateFile(
+			profile,
+			path,
+			kind,
+			"not valid JSON",
+			"contents",
+		);
 	}
 }
 
@@ -104,9 +116,10 @@ export function loadState(profile: string): AgxState {
 	// On disk the version must be present: a file without one is not ours.
 	const parsed = stateSchema
 		.extend({ version: z.literal(1) })
-		.safeParse(readJsonFile(path, "state"));
+		.safeParse(readJsonFile(profile, path, "state"));
 	if (!parsed.success) {
 		throw unreadableStateFile(
+			profile,
 			path,
 			"state",
 			"unexpected contents or a newer version",
@@ -185,7 +198,7 @@ export class FileSeenStore implements SeenStore {
 			this.failures = {};
 			return;
 		}
-		const raw = readJsonFile(this.path, "seen");
+		const raw = readJsonFile(profile, this.path, "seen");
 		const v2 = seenSchemaV2.safeParse(raw);
 		if (v2.success) {
 			this.seenAt = new Map(v2.data.entries.map((e) => [e.id, e.seenAt]));
@@ -195,6 +208,7 @@ export class FileSeenStore implements SeenStore {
 		const v1 = seenSchemaV1.safeParse(raw);
 		if (!v1.success) {
 			throw unreadableStateFile(
+				profile,
 				this.path,
 				"seen",
 				"unexpected contents or a newer version",
