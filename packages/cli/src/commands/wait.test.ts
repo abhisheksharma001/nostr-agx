@@ -1,6 +1,6 @@
 import { DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { effectiveProfile } from "../lib/config.js";
+import { effectiveProfile, updateProfile } from "../lib/config.js";
 import { EXIT } from "../lib/errors.js";
 import { loadIdentity } from "../lib/identity.js";
 import { INBOX_SCHEMA, INBOX_SUMMARY_SCHEMA, type InboxReport, type InboxSummary } from "../lib/inbox.js";
@@ -176,6 +176,20 @@ describe("agx wait", () => {
 		expect(summary(run)).toMatchObject({ schema: INBOX_SUMMARY_SCHEMA, new: 0, held: 1, timedOut: false });
 		expect(run.stdout).not.toContain(HELD_SECRET);
 		expect(run.stdout).not.toContain(sender);
+	});
+
+	it("honors a sender revoked while waiting", async () => {
+		const pair = await allowedPair();
+		const waiting = startWait({ profile: "receiver", timeout: "5", summary: true });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		updateProfile("receiver", { allow: [] });
+		await publish("sender", pair.receiver, HELD_SECRET);
+
+		const run = await waiting.done;
+		expect(run.code).toBe(EXIT.ok);
+		expect(summary(run)).toMatchObject({ new: 0, held: 1, timedOut: false });
+		expect(run.stdout).not.toContain(HELD_SECRET);
+		expect(run.stdout).not.toContain(pair.sender);
 	});
 
 	it("returns an empty successful result after a quiet healthy timeout", async () => {
