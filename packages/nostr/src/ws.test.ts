@@ -7,6 +7,7 @@ const { useWebSocketImplementation } = vi.hoisted(() => ({
 vi.mock("nostr-tools/relay", () => ({ useWebSocketImplementation }));
 
 class NativeWebSocket extends EventTarget {}
+Object.defineProperty(NativeWebSocket.prototype, Symbol.toStringTag, { value: "WebSocket" });
 class EventEmitterWebSocket {
 	on(): void {}
 }
@@ -31,6 +32,20 @@ describe("configureWebSocket", () => {
 		expect(useWebSocketImplementation).toHaveBeenCalledTimes(2);
 		for (const call of useWebSocketImplementation.mock.calls) {
 			const Guarded = call[0] as new (url: string) => unknown;
+			expect(() => new Guarded("ws://relay.invalid")).toThrow("Node's own WebSocket is refused");
+		}
+	});
+
+	it("rejects captured native constructors and native subclasses on Node", async () => {
+		vi.stubGlobal("process", { versions: { undici: "6.24.1" } });
+		const CapturedNative = NativeWebSocket;
+		class NativeSubclass extends CapturedNative {}
+		vi.stubGlobal("WebSocket", class Replacement extends EventTarget {});
+		const { configureWebSocket } = await import("./ws");
+
+		for (const impl of [CapturedNative, NativeSubclass]) {
+			configureWebSocket(impl);
+			const Guarded = useWebSocketImplementation.mock.lastCall?.[0] as new (url: string) => unknown;
 			expect(() => new Guarded("ws://relay.invalid")).toThrow("Node's own WebSocket is refused");
 		}
 	});
