@@ -34,31 +34,65 @@ const stateSchema = z.object({
 
 export type AgxState = z.infer<typeof stateSchema>;
 
+type StateFileKind = "state" | "seen";
+
+/** Quote a path for a shell line the user may paste. */
+function shellQuote(path: string): string {
+	return `'${path.replaceAll("'", `'\\''`)}'`;
+}
+
 /**
  * The file could not be used, and agx will not replace it. The poll cursor and
  * the replay memory live in these files: an empty one in their place re-drains
  * the inbox and runs handlers again for messages already answered, and the next
  * save would overwrite a file a newer agx wrote.
+ *
+ * Moving a file aside is NOT harmless, so the advice says what it costs and
+ * names the safer order: `agx inbox` pulls once, runs no handler and publishes
+ * nothing, and records what it sees, so `agx serve` starts from a filled-in
+ * replay memory instead of an empty one.
  */
-function unreadableStateFile(path: string, why: string): AgxCliError {
-	return new AgxCliError(
-		`${path} could not be read (${why}), so agx stopped rather than start from an empty one.`,
-		{
+function unreadableStateFile(
+	path: string,
+	kind: StateFileKind,
+	reason: string,
+	cause: "contents" | "access",
+): AgxCliError {
+	const message = `${path} could not be used (${reason}), so agx will not use or replace it.`;
+	if (cause === "access") {
+		return new AgxCliError(message, {
 			exitCode: EXIT.config,
-			remediation: `If it is damaged, move it aside (mv "${path}" "${path}.bad") and run agx again; it starts empty, which re-reads the inbox. If a newer agx wrote it, use that agx.`,
-		},
-	);
+			remediation: `Check that the file exists, is a regular file, and that you may read it:\n    ls -l ${shellQuote(path)}`,
+		});
+	}
+	const cost =
+		kind === "state"
+			? "Without it agx starts from cursor 0 and reads back everything the relays still hold (up to 30 days), and it forgets the stored listing."
+			: "Without it agx forgets which requests it already answered, so requests from the last two days or so are answered again.";
+	return new AgxCliError(message, {
+		exitCode: EXIT.config,
+		remediation: `If a newer agx wrote it, use that agx. If it is damaged, move it aside, then pull the inbox once before serving, so the replay memory is filled in without running any handler:\n    mv ${shellQuote(path)} ${shellQuote(`${path}.bad`)}\n    agx inbox\n  ${cost}`,
+	});
 }
 
-/** Read and parse a state file that exists; a file that is not JSON names itself. */
-function readStateJson(path: string): unknown {
+/** Read and parse a state file that exists. The error never carries the file's text. */
+function readJsonFile(path: string, kind: StateFileKind): unknown {
+	let text: string;
 	try {
-		return JSON.parse(readFileSync(path, "utf8"));
+		text = readFileSync(path, "utf8");
 	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
 		throw unreadableStateFile(
 			path,
-			error instanceof Error ? error.message : "unreadable",
+			kind,
+			`read failed${code ? `: ${code}` : ""}`,
+			"access",
 		);
+	}
+	try {
+		return JSON.parse(text);
+	} catch {
+		throw unreadableStateFile(path, kind, "not valid JSON", "contents");
 	}
 }
 
@@ -67,9 +101,17 @@ export function loadState(profile: string): AgxState {
 	if (!existsSync(path)) {
 		return stateSchema.parse({});
 	}
-	const parsed = stateSchema.safeParse(readStateJson(path));
+	// On disk the version must be present: a file without one is not ours.
+	const parsed = stateSchema
+		.extend({ version: z.literal(1) })
+		.safeParse(readJsonFile(path, "state"));
 	if (!parsed.success) {
-		throw unreadableStateFile(path, "unexpected contents or a newer version");
+		throw unreadableStateFile(
+			path,
+			"state",
+			"unexpected contents or a newer version",
+			"contents",
+		);
 	}
 	return parsed.data;
 }
@@ -92,16 +134,20 @@ const seenEntrySchema = z.object({ id: z.string(), seenAt: z.number() });
 /** v2: each id with the time it was recorded, so retention is by age. */
 const seenSchemaV2 = z.object({
 	version: z.literal(2),
-	entries: z.array(seenEntrySchema).default([]),
+	entries: z.array(seenEntrySchema),
 	failures: z.record(z.string(), z.number()).default({}),
 });
 
 /** v1 (count-bounded, no timestamps). Read once and upgraded on the next flush. */
-const seenSchemaV1 = z.object({
-	version: z.literal(1).default(1),
-	ids: z.array(z.string()).default([]),
-	failures: z.record(z.string(), z.number()).default({}),
-});
+const seenSchemaV1 = z
+	.object({
+		version: z.literal(1).default(1),
+		ids: z.array(z.string()).default([]),
+		failures: z.record(z.string(), z.number()).default({}),
+	})
+	// Strict: a file with version 2's keys but no usable version must not match
+	// here and load as an empty v1 store.
+	.strict();
 
 /** Memory/disk guard only — retention is `DEFAULT_SEEN_RETENTION_SEC`, the same
  * time window as `InMemorySeenStore`'s. Evicting an id still inside the poll
@@ -139,7 +185,7 @@ export class FileSeenStore implements SeenStore {
 			this.failures = {};
 			return;
 		}
-		const raw = readStateJson(this.path);
+		const raw = readJsonFile(this.path, "seen");
 		const v2 = seenSchemaV2.safeParse(raw);
 		if (v2.success) {
 			this.seenAt = new Map(v2.data.entries.map((e) => [e.id, e.seenAt]));
@@ -150,7 +196,9 @@ export class FileSeenStore implements SeenStore {
 		if (!v1.success) {
 			throw unreadableStateFile(
 				this.path,
+				"seen",
 				"unexpected contents or a newer version",
+				"contents",
 			);
 		}
 		const data = v1.data;

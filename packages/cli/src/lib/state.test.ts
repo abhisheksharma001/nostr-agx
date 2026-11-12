@@ -1,7 +1,8 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sandbox } from "../test/helpers.js";
+import { AgxCliError, EXIT } from "./errors.js";
 import { seenPath, statePath } from "./paths.js";
 import { FileSeenStore, loadState, updateState } from "./state.js";
 
@@ -72,6 +73,21 @@ describe("a state file the CLI cannot read", () => {
 		writeFileSync(path, text);
 	}
 
+	/** The CLI error, with the config exit code, that names the file. */
+	function refusal(fn: () => unknown, path: string): AgxCliError {
+		let caught: unknown;
+		try {
+			fn();
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(AgxCliError);
+		const error = caught as AgxCliError;
+		expect(error.exitCode).toBe(EXIT.config);
+		expect(error.message).toContain(path);
+		return error;
+	}
+
 	describe("state.json", () => {
 		it("loads a valid file (control)", () => {
 			plant(statePath("default"), JSON.stringify({ version: 1, cursor: 42 }));
@@ -102,6 +118,42 @@ describe("a state file the CLI cannot read", () => {
 			plant(statePath("default"), text);
 			expect(() => updateState("default", { cursor: 1 })).toThrow();
 			expect(readFileSync(statePath("default"), "utf8")).toBe(text);
+		});
+
+		it("refuses a file with no version, which is not one of ours", () => {
+			plant(statePath("default"), JSON.stringify({ cursor: 7 }));
+			refusal(() => loadState("default"), statePath("default"));
+			plant(statePath("default"), "{}");
+			refusal(() => loadState("default"), statePath("default"));
+		});
+
+		it("still loads a version 1 file that carries extra keys (control)", () => {
+			plant(
+				statePath("default"),
+				JSON.stringify({ version: 1, cursor: 9, addedLater: true }),
+			);
+			expect(loadState("default").cursor).toBe(9);
+		});
+
+		it("does not put the file's text in the error", () => {
+			plant(statePath("default"), "SECRETCANARY not json");
+			const error = refusal(() => loadState("default"), statePath("default"));
+			expect(`${error.message}\n${error.remediation}`).not.toContain(
+				"SECRETCANARY",
+			);
+		});
+
+		it("tells a damaged file apart from one it cannot read, and says what moving it costs", () => {
+			plant(statePath("default"), "{");
+			const damaged = refusal(() => loadState("default"), statePath("default"));
+			expect(damaged.remediation).toContain("agx inbox");
+			expect(damaged.remediation).toContain("cursor 0");
+
+			// A directory where the file should be: access problem, not damage.
+			rmSync(statePath("default"));
+			mkdirSync(statePath("default"));
+			const access = refusal(() => loadState("default"), statePath("default"));
+			expect(access.remediation).not.toContain("mv ");
 		});
 	});
 
@@ -141,6 +193,34 @@ describe("a state file the CLI cannot read", () => {
 			plant(seenPath("default"), text);
 			expect(() => new FileSeenStore("default")).toThrow(seenPath("default"));
 			expect(readFileSync(seenPath("default"), "utf8")).toBe(text);
+		});
+
+		it("refuses a file that holds null", () => {
+			plant(seenPath("default"), "null");
+			refusal(() => new FileSeenStore("default"), seenPath("default"));
+		});
+
+		it("refuses entries with no version instead of reading them as an empty v1 store", () => {
+			plant(
+				seenPath("default"),
+				JSON.stringify({ entries: [{ id: "event-1", seenAt: 1 }], failures: {} }),
+			);
+			refusal(() => new FileSeenStore("default"), seenPath("default"));
+		});
+
+		it("refuses a version 2 file with no entries list", () => {
+			plant(seenPath("default"), JSON.stringify({ version: 2 }));
+			refusal(() => new FileSeenStore("default"), seenPath("default"));
+		});
+
+		it("says moving it aside means answered requests are answered again, and names the safer order", () => {
+			plant(seenPath("default"), "{");
+			const error = refusal(
+				() => new FileSeenStore("default"),
+				seenPath("default"),
+			);
+			expect(error.remediation).toContain("agx inbox");
+			expect(error.remediation).toContain("answered again");
 		});
 	});
 });

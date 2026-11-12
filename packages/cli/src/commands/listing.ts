@@ -148,6 +148,9 @@ export async function listingCreateCommand(
 	options: ListingOptions,
 ): Promise<void> {
 	const { profileName, profile, creds, client } = ctx(options);
+	// Saves the listing id to the state file after the index creates it: read
+	// the file first, so a damaged one stops the command before the remote call.
+	loadState(profileName);
 	if (!options.slug) {
 		throw usageError(
 			"--slug is required.",

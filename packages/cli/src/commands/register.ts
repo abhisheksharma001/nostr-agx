@@ -11,7 +11,7 @@ import { loadIdentity } from "../lib/identity.js";
 import { heading, info, json, kv, ok, say, step, warn } from "../lib/output.js";
 import { signNonceEvent } from "../lib/proof.js";
 import { relaysForListing } from "../lib/relays.js";
-import { updateState } from "../lib/state.js";
+import { loadState, updateState } from "../lib/state.js";
 
 export interface RegisterOptions {
 	profile?: string;
@@ -56,6 +56,10 @@ function titleCase(slug: string): string {
  */
 export async function registerCommand(options: RegisterOptions): Promise<void> {
 	const profileName = resolveProfileName(options.profile);
+	// This command saves the listing id to the state file once the index has
+	// made it. Read the file first, so a damaged one stops the command before
+	// anything is created on the index, not after.
+	loadState(profileName);
 	const creds = resolveApiCredentials(profileName, { org: options.org });
 	const profile = effectiveProfile(profileName);
 	const identity = loadIdentity(profileName);
