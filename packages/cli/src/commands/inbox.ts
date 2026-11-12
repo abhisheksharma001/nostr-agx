@@ -93,6 +93,24 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 
 	try {
 		const allowed = new Set(profile.allow.map((entry) => toHexPubkey(entry, "allowlist entry")));
+		let warnedAllowlist = false;
+		function refreshAllowed(): void {
+			let current: string[];
+			try {
+				current = effectiveProfile(profileName).allow.map((entry) => toHexPubkey(entry, "allowlist entry"));
+			} catch (error) {
+				if (!warnedAllowlist) {
+					warnedAllowlist = true;
+					warn(`The allowlist could not be re-read, so the last good one stays in use: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				return;
+			}
+			warnedAllowlist = false;
+			allowed.clear();
+			for (const entry of current) {
+				allowed.add(entry);
+			}
+		}
 		const state = loadState(profileName);
 		const store = new MessageStore(profileDir(profileName), undefined, { claimSpool: true });
 		const seen = new FileSeenStore(profileName);
@@ -144,6 +162,7 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 						break;
 					}
 					store.absorbSpool();
+					refreshAllowed();
 					try {
 						const outcome = await pumpWithin(client, remaining, control.signal);
 						if (outcome.interrupted) {
