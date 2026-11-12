@@ -796,6 +796,28 @@ export async function pollInbox(params: {
 	};
 }
 
+/** Slack added to the backdate window when the live listener judges a wrap's age:
+ * the clock difference between a sender and this host, plus delivery delay. */
+export const LIVE_WRAP_CLOCK_MARGIN_SEC = 300;
+
+/** The oldest outer `created_at` the live listener will open, measured from the
+ * moment the wrap arrives. A wrap is stamped at most {@link MAX_WRAP_BACKDATE_SEC}
+ * before it was sent, so a wrap older than this window was not sent recently.
+ *
+ * Why it exists: the subscription's `since` is fixed when the listener
+ * subscribes, but the listener lives as long as the process. Once the seen store
+ * forgets a wrap's id (`DEFAULT_SEEN_RETENTION_SEC`), a relay can replay that wrap
+ * and it still passes the frozen `since`. The window must stay strictly below that
+ * retention, so the age check closes before the id is forgotten.
+ *
+ * Cost: a refused wrap is usually NOT recovered by the inbox poll, whose own
+ * window (cursor - overlap - backdate) is about as tight. The poll only reaches
+ * it while its cursor is held back (a relay down, or a dispatch failure). It hits
+ * a sender whose clock lag plus delivery delay exceeds the margin AND whose random
+ * backdate is near the maximum. A poll-only host already behaved this way. */
+export const LIVE_WRAP_ACCEPT_WINDOW_SEC =
+	MAX_WRAP_BACKDATE_SEC + LIVE_WRAP_CLOCK_MARGIN_SEC;
+
 /**
  * Subscribe to relays for MESSAGE/RECEIPT events tagged to `pubkey`. Each
  * subscription replays only the bounded wrap window; polling remains the
@@ -855,6 +877,19 @@ export async function listenEvents(
 
 			sub = relay.subscribe([filter], {
 				async onevent(event: Event) {
+					// The REQ `since` is fixed when this listener subscribes, but the
+					// listener lives as long as the process, so it goes stale. Judge a
+					// wrap's age when it arrives.
+					if (
+						event.created_at <
+						Math.floor(Date.now() / 1000) - LIVE_WRAP_ACCEPT_WINDOW_SEC
+					) {
+						log.debug?.("AGX: live gift wrap older than the accept window", {
+							relay: url,
+							eventId: event.id,
+						});
+						return;
+					}
 					if (inFlight.has(event.id)) {
 						return;
 					}
