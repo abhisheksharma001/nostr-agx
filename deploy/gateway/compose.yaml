@@ -5,7 +5,7 @@
 services:
   gateway:
     build: .
-    image: agx-gateway:0.5.0
+    image: agx-gateway:0.6.0
     restart: unless-stopped
     init: true
     # The gateway waits up to 8 s for running tasks when it stops.
