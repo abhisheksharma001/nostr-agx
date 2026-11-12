@@ -1,0 +1,176 @@
+{
+  "formatVersion": 1,
+  "name": "agx-task-envelopes",
+  "spec": "packages/core/SPEC.md#task-lifecycle",
+  "vectors": [
+    {
+      "id": "request-minimal",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"req\",\"taskId\":\"task-1\",\"capability\":\"invoice.review\",\"payload\":{\"invoice\":\"INV-001\"}}",
+      "valid": true,
+      "envelope": {
+        "t": "req",
+        "taskId": "task-1",
+        "capability": "invoice.review",
+        "payload": {
+          "invoice": "INV-001"
+        }
+      }
+    },
+    {
+      "id": "request-interactive-with-deadline",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"req\",\"taskId\":\"task-2\",\"capability\":\"invoice.review\",\"payload\":null,\"supportsInput\":true,\"timeoutMs\":30000}",
+      "valid": true,
+      "envelope": {
+        "t": "req",
+        "taskId": "task-2",
+        "capability": "invoice.review",
+        "payload": null,
+        "supportsInput": true,
+        "timeoutMs": 30000
+      }
+    },
+    {
+      "id": "request-zero-timeout",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"req\",\"taskId\":\"task-3\",\"capability\":\"echo\",\"payload\":\"hello\",\"supportsInput\":false,\"timeoutMs\":0}",
+      "valid": true,
+      "envelope": {
+        "t": "req",
+        "taskId": "task-3",
+        "capability": "echo",
+        "payload": "hello",
+        "supportsInput": false,
+        "timeoutMs": 0
+      }
+    },
+    {
+      "id": "result-completed",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"res\",\"taskId\":\"task-1\",\"status\":\"completed\",\"output\":{\"approved\":true}}",
+      "valid": true,
+      "envelope": {
+        "t": "res",
+        "taskId": "task-1",
+        "status": "completed",
+        "output": {
+          "approved": true
+        }
+      }
+    },
+    {
+      "id": "result-completed-without-output",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"res\",\"taskId\":\"task-1\",\"status\":\"completed\"}",
+      "valid": true,
+      "envelope": {
+        "t": "res",
+        "taskId": "task-1",
+        "status": "completed"
+      }
+    },
+    {
+      "id": "result-failed",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"res\",\"taskId\":\"task-1\",\"status\":\"failed\",\"error\":\"invoice not found\"}",
+      "valid": true,
+      "envelope": {
+        "t": "res",
+        "taskId": "task-1",
+        "status": "failed",
+        "error": "invoice not found"
+      }
+    },
+    {
+      "id": "update-input-required",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"res\",\"taskId\":\"task-2\",\"status\":\"input-required\",\"inputRequestId\":\"question-1\",\"requirement\":{\"id\":\"invoice-number\",\"prompt\":\"Which invoice?\",\"inputSchema\":{\"type\":\"string\"},\"timeoutMs\":10000}}",
+      "valid": true,
+      "envelope": {
+        "t": "res",
+        "taskId": "task-2",
+        "status": "input-required",
+        "inputRequestId": "question-1",
+        "requirement": {
+          "id": "invoice-number",
+          "prompt": "Which invoice?",
+          "inputSchema": {
+            "type": "string"
+          },
+          "timeoutMs": 10000
+        }
+      }
+    },
+    {
+      "id": "input-continuation",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"input\",\"taskId\":\"task-2\",\"inputRequestId\":\"question-1\",\"input\":\"INV-001\"}",
+      "valid": true,
+      "envelope": {
+        "t": "input",
+        "taskId": "task-2",
+        "inputRequestId": "question-1",
+        "input": "INV-001"
+      }
+    },
+    {
+      "id": "cancellation",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"cancel\",\"taskId\":\"task-2\"}",
+      "valid": true,
+      "envelope": {
+        "t": "cancel",
+        "taskId": "task-2"
+      }
+    },
+    {
+      "id": "invalid-json",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"req\"",
+      "valid": false
+    },
+    {
+      "id": "unknown-envelope-type",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"unknown\",\"taskId\":\"task-1\"}",
+      "valid": false
+    },
+    {
+      "id": "request-missing-task-id",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"req\",\"capability\":\"invoice.review\",\"payload\":{}}",
+      "valid": false
+    },
+    {
+      "id": "request-empty-capability",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"req\",\"taskId\":\"task-1\",\"capability\":\"\",\"payload\":{}}",
+      "valid": false
+    },
+    {
+      "id": "request-negative-timeout",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"req\",\"taskId\":\"task-1\",\"capability\":\"invoice.review\",\"payload\":{},\"timeoutMs\":-1}",
+      "valid": false
+    },
+    {
+      "id": "result-unknown-status",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"res\",\"taskId\":\"task-1\",\"status\":\"exploded\"}",
+      "valid": false
+    },
+    {
+      "id": "input-required-empty-prompt",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"res\",\"taskId\":\"task-2\",\"status\":\"input-required\",\"inputRequestId\":\"question-1\",\"requirement\":{\"prompt\":\"\"}}",
+      "valid": false
+    },
+    {
+      "id": "input-missing-correlation-id",
+      "spec": "packages/core/SPEC.md#task-lifecycle",
+      "text": "{\"t\":\"input\",\"taskId\":\"task-2\",\"input\":\"INV-001\"}",
+      "valid": false
+    }
+  ]
+}
