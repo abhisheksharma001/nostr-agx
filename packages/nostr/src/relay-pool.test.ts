@@ -46,6 +46,7 @@ vi.mock("nostr-tools/relay", () => ({
 	},
 }));
 
+import { MAX_WRAP_BACKDATE_SEC } from "./giftwrap";
 import {
 	GIFT_WRAP_KIND,
 	MESSAGE_KIND,
@@ -1080,11 +1081,13 @@ describe("pollInbox checks each signature once", () => {
 });
 
 describe("listenEvents refuses a replayed old gift wrap", () => {
-	// A wrap's outer created_at is backdated by at most MAX_WRAP_BACKDATE_SEC, so a
-	// wrap that arrives live with an older created_at was not made recently. A relay
-	// can ignore the REQ `since` and replay one anyway. The seen store forgets an id
-	// after DEFAULT_SEEN_RETENTION_SEC (3 days) while a wrap lives 30 days, so an old
-	// wrap replayed after that is not "known" and would be opened again.
+	// The subscription's `since` is fixed when the listener subscribes, but the
+	// listener lives as long as the process. The seen store forgets an id after
+	// DEFAULT_SEEN_RETENTION_SEC (3 days) while a wrap lives 30 days, so a relay
+	// can replay a wrap that is older than the accept window but still passes the
+	// frozen `since`, and it would be opened again. The listener therefore judges
+	// age when each wrap arrives. (nostr-tools also filters on `since`, but this
+	// file mocks Relay, so the first test is a backstop, not the whole story.)
 	const NOW_SEC = 1_800_000_000;
 	const DAY = 24 * 60 * 60;
 
@@ -1109,11 +1112,21 @@ describe("listenEvents refuses a replayed old gift wrap", () => {
 			events: [ev({ id: "replayed-old", created_at: NOW_SEC - 10 * DAY })],
 			eose: true,
 		});
-		await listenEvents(signer as never, ["wss://a"], { pubkey: ME }, callback);
+		const isKnown = vi.fn(async () => new Set<string>());
+		const onDiscarded = vi.fn();
+		await listenEvents(
+			signer as never,
+			["wss://a"],
+			{ pubkey: ME, isKnown, onDiscarded },
+			callback,
+		);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 
 		expect(signer.getPublicKey).not.toHaveBeenCalled();
 		expect(callback).not.toHaveBeenCalled();
+		// Not recorded as seen: a held poll cursor may still need to read it.
+		expect(onDiscarded).not.toHaveBeenCalled();
+		expect(isKnown).not.toHaveBeenCalled();
 	});
 
 	it("measures age when the wrap arrives, not when the listener started", async () => {
@@ -1123,11 +1136,30 @@ describe("listenEvents refuses a replayed old gift wrap", () => {
 
 		// Five days later the same listener is handed a wrap made when it started.
 		vi.setSystemTime((NOW_SEC + 5 * DAY) * 1000);
-		await subscriptionHandlers[0]?.onevent(
-			ev({ id: "five-days-old", created_at: NOW_SEC }),
-		);
-
+		const handler = subscriptionHandlers[0];
+		if (!handler) throw new Error("no live handler was registered");
+		await handler.onevent(ev({ id: "five-days-old", created_at: NOW_SEC }));
 		expect(signer.getPublicKey).not.toHaveBeenCalled();
+
+		// Control: a wrap made just now is still opened on the same listener.
+		await handler.onevent(
+			ev({ id: "fresh", created_at: NOW_SEC + 5 * DAY }),
+		);
+		expect(signer.getPublicKey).toHaveBeenCalledTimes(1);
+	});
+
+	it("opens a wrap backdated by the full MAX_WRAP_BACKDATE_SEC", async () => {
+		const signer = signerSpy();
+		responder = () => ({
+			events: [
+				ev({ id: "max-backdate", created_at: NOW_SEC - MAX_WRAP_BACKDATE_SEC }),
+			],
+			eose: true,
+		});
+		await listenEvents(signer as never, ["wss://a"], { pubkey: ME }, vi.fn());
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(signer.getPublicKey).toHaveBeenCalledTimes(1);
 	});
 
 	it("still opens a wrap inside the backdate window (control)", async () => {
@@ -1165,6 +1197,10 @@ describe("listenEvents refuses a replayed old gift wrap", () => {
 		// only thing left stopping it, so the filter must close first.
 		expect(DEFAULT_SEEN_RETENTION_SEC).toBeGreaterThan(
 			LIVE_WRAP_ACCEPT_WINDOW_SEC,
+		);
+		// ...and the window must cover the whole backdate, or real wraps are refused.
+		expect(LIVE_WRAP_ACCEPT_WINDOW_SEC).toBeGreaterThanOrEqual(
+			MAX_WRAP_BACKDATE_SEC,
 		);
 	});
 });
