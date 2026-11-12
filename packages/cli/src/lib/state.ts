@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { DEFAULT_SEEN_RETENTION_SEC, type SeenStore } from "@nostr-agx/core";
 import { z } from "zod";
+import { AgxCliError, EXIT } from "./errors.js";
 import { seenPath, statePath, writePrivateJson, writePrivateText } from "./paths.js";
 
 /**
@@ -33,15 +34,44 @@ const stateSchema = z.object({
 
 export type AgxState = z.infer<typeof stateSchema>;
 
+/**
+ * The file could not be used, and agx will not replace it. The poll cursor and
+ * the replay memory live in these files: an empty one in their place re-drains
+ * the inbox and runs handlers again for messages already answered, and the next
+ * save would overwrite a file a newer agx wrote.
+ */
+function unreadableStateFile(path: string, why: string): AgxCliError {
+	return new AgxCliError(
+		`${path} could not be read (${why}), so agx stopped rather than start from an empty one.`,
+		{
+			exitCode: EXIT.config,
+			remediation: `If it is damaged, move it aside (mv "${path}" "${path}.bad") and run agx again; it starts empty, which re-reads the inbox. If a newer agx wrote it, use that agx.`,
+		},
+	);
+}
+
+/** Read and parse a state file that exists; a file that is not JSON names itself. */
+function readStateJson(path: string): unknown {
+	try {
+		return JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		throw unreadableStateFile(
+			path,
+			error instanceof Error ? error.message : "unreadable",
+		);
+	}
+}
+
 export function loadState(profile: string): AgxState {
 	const path = statePath(profile);
 	if (!existsSync(path)) {
 		return stateSchema.parse({});
 	}
-	const parsed = stateSchema.safeParse(
-		JSON.parse(readFileSync(path, "utf8")),
-	);
-	return parsed.success ? parsed.data : stateSchema.parse({});
+	const parsed = stateSchema.safeParse(readStateJson(path));
+	if (!parsed.success) {
+		throw unreadableStateFile(path, "unexpected contents or a newer version");
+	}
+	return parsed.data;
 }
 
 export function saveState(profile: string, state: AgxState): void {
@@ -104,17 +134,26 @@ export class FileSeenStore implements SeenStore {
 	constructor(profile: string) {
 		this.path = seenPath(profile);
 		this.cursor = loadState(profile).cursor;
-		const raw: unknown = existsSync(this.path)
-			? JSON.parse(readFileSync(this.path, "utf8"))
-			: null;
+		if (!existsSync(this.path)) {
+			this.seenAt = new Map();
+			this.failures = {};
+			return;
+		}
+		const raw = readStateJson(this.path);
 		const v2 = seenSchemaV2.safeParse(raw);
 		if (v2.success) {
 			this.seenAt = new Map(v2.data.entries.map((e) => [e.id, e.seenAt]));
 			this.failures = v2.data.failures;
 			return;
 		}
-		const v1 = seenSchemaV1.safeParse(raw ?? {});
-		const data = v1.success ? v1.data : seenSchemaV1.parse({});
+		const v1 = seenSchemaV1.safeParse(raw);
+		if (!v1.success) {
+			throw unreadableStateFile(
+				this.path,
+				"unexpected contents or a newer version",
+			);
+		}
+		const data = v1.data;
 		// v1 kept no timestamps: treat every id as recorded now, which keeps it
 		// for a full retention window rather than risk re-delivering it.
 		const loadedAt = nowSec();
