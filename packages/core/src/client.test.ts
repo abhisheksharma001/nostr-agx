@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { AgxClient } from "./client";
+import { AgxClient, type AgxTaskContract } from "./client";
 import { AgxPublicError, AgxTaskDeclined } from "./errors";
 import { randomId } from "./id";
 import { encodeTaskEnvelope, parseTaskEnvelope } from "./task";
@@ -747,6 +747,73 @@ describe("AgxClient task request/response", () => {
 				inputSchema: { $ref: "https://example.com/schema" },
 			}),
 		).toThrow(/unsupported schema keyword/);
+	});
+
+	it.each([
+		["a wildcard ID", "invoice.*", { description: "Review an invoice" }],
+		[
+			"17 tags",
+			"invoice.review",
+			{
+				description: "Review an invoice",
+				tags: Array.from({ length: 17 }, (_, i) => `t${i}`),
+			},
+		],
+		["an empty description", "invoice.review", { description: "" }],
+	])("refuses a contract the card would refuse: %s", (_name, capability, contract) => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		bob.handle("other.task", () => null);
+		expect(() => bob.handle(capability, () => null, contract)).toThrow(
+			/AGX handler/,
+		);
+		expect(bob.capabilities()).toEqual(["other.task"]);
+	});
+
+	it("refuses an unknown contract field at registration", () => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		const contract = {
+			description: "Review an invoice",
+			inputschema: { type: "object" },
+		} as unknown as AgxTaskContract;
+		expect(() => bob.handle("invoice.review", () => null, contract)).toThrow(
+			/AGX handler.*inputschema/,
+		);
+		expect(bob.capabilities()).toEqual([]);
+	});
+
+	it("keeps the registered contract when the caller mutates it later", async () => {
+		const advertise = vi.fn(async () => ({ ok: true }));
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: { ...bus.transport(BOB), advertise },
+			authorize: "accept-all",
+		});
+		const inputSchema: Record<string, unknown> = {
+			type: "object",
+			required: ["a"],
+		};
+		bob.handle("invoice.review", () => "ok", {
+			description: "Review an invoice",
+			inputSchema,
+		});
+		inputSchema.required = [42];
+
+		const pending = alice.request(BOB, "invoice.review", { a: 1 });
+		await bob.pump();
+		await alice.pump();
+		await expect(pending).resolves.toBe("ok");
+
+		await bob.start({ pollIntervalMs: 0 });
+		expect(advertise).toHaveBeenCalledWith(
+			["invoice.review"],
+			expect.objectContaining({
+				skills: [{
+					id: "invoice.review",
+					description: "Review an invoice",
+					inputSchema: { type: "object", required: ["a"] },
+				}],
+			}),
+		);
 	});
 
 	it("registers a contract whose schemas carry annotations", () => {
