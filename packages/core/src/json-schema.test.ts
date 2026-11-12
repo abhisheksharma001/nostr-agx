@@ -109,13 +109,37 @@ describe("AGX JSON Schema validation", () => {
 		expectInvalid({ pattern: ".*" }, "anything", /invalid schema/);
 	});
 
-	it("rejects non-JSON, cyclic, over-deep, and oversized payloads without throwing", () => {
-		expectInvalid({}, undefined, /not JSON/);
-		expectInvalid({}, Number.POSITIVE_INFINITY, /finite/);
-		expectInvalid({ type: "object" }, new Date(), /not JSON/);
+	it("validates values as their JSON encoding", () => {
+		expectValid(
+			{
+				type: "object",
+				properties: { a: { type: "number" } },
+				additionalProperties: false,
+			},
+			{ a: 1, b: undefined },
+		);
+		expectValid({ type: "string" }, new Date(0));
+		expectInvalid({ type: "object" }, new Date(0), /expected object/);
+		expectValid(
+			{ type: "object", required: ["id"] },
+			new (class Row {
+				id = 1;
+			})(),
+		);
+		expectValid({}, undefined);
+		expectValid({ type: "null" }, undefined);
+		expectInvalid({ type: "object" }, undefined, /expected object/);
+		expectInvalid({ type: "number" }, Number.POSITIVE_INFINITY, /expected number/);
 		const cyclic: unknown[] = [];
 		cyclic.push(cyclic);
-		expectInvalid({}, cyclic, /cycle/);
+		expectInvalid({}, cyclic, /cannot be encoded as JSON/);
+		expectInvalid({}, { n: BigInt(1) }, /cannot be encoded as JSON/);
+	});
+
+	it("rejects unencodable, over-deep, and oversized payloads without throwing", () => {
+		const cyclic: unknown[] = [];
+		cyclic.push(cyclic);
+		expectInvalid({}, cyclic, /cannot be encoded as JSON/);
 		let deep: unknown = null;
 		for (let index = 0; index <= AGX_JSON_SCHEMA_LIMITS.payloadDepth; index += 1) {
 			deep = [deep];

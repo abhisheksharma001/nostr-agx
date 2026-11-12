@@ -342,6 +342,21 @@ describe("AgxClient task request/response", () => {
 			await expect(stream.result).rejects.toThrow(/timed out/);
 		});
 
+		it("accepts a payload whose undefined member the wire drops", async () => {
+			const transport = typedPeerTransport();
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			const stream = await alice.streamRequest(
+				BOB,
+				"invoice.review",
+				{ amount: 5, note: undefined },
+				{ validate: true, timeoutMs: 20 },
+			);
+			expect(publishMessage).toHaveBeenCalledTimes(1);
+			await expect(stream.result).rejects.toThrow(/timed out/);
+		});
+
 		it("does not look the peer up unless validate is set", async () => {
 			const transport = typedPeerTransport();
 			const alice = new AgxClient({ transport });
@@ -427,6 +442,105 @@ describe("AgxClient task request/response", () => {
 		await alice.pump();
 		await expect(pending).rejects.toThrow("invalid_output");
 		expect(handler).toHaveBeenCalledTimes(1);
+	});
+
+	describe("validates the JSON a task value becomes on the wire", () => {
+		async function runTyped(
+			handler: () => unknown,
+			outputSchema: Record<string, unknown>,
+		): Promise<unknown> {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			bob.handle("invoice.review", handler, {
+				description: "Review an invoice",
+				outputSchema,
+			});
+			const pending = alice.request(BOB, "invoice.review", {});
+			pending.catch(() => undefined);
+			await bob.pump();
+			await alice.pump();
+			return pending;
+		}
+
+		it("completes when the handler result has an undefined member", async () => {
+			await expect(
+				runTyped(() => ({ approved: true, note: undefined }), {
+					type: "object",
+					required: ["approved"],
+					properties: {
+						approved: { type: "boolean" },
+						note: { type: "string" },
+					},
+					additionalProperties: false,
+				}),
+			).resolves.toEqual({ approved: true });
+		});
+
+		it("completes when the handler returns a Date that encodes to a string", async () => {
+			await expect(
+				runTyped(() => new Date(0), { type: "string" }),
+			).resolves.toBe("1970-01-01T00:00:00.000Z");
+		});
+
+		it("completes when the handler returns a class instance", async () => {
+			class Row {
+				id = 1;
+			}
+			await expect(
+				runTyped(() => new Row(), { type: "object", required: ["id"] }),
+			).resolves.toEqual({ id: 1 });
+		});
+
+		it("completes a void handler against an empty output schema", async () => {
+			await expect(
+				runTyped(() => {
+					return;
+				}, {}),
+			).resolves.toBeUndefined();
+		});
+
+		it("returns invalid_output for a void handler when the schema needs an object", async () => {
+			await expect(
+				runTyped(() => undefined, { type: "object" }),
+			).rejects.toThrow("invalid_output");
+		});
+
+		it("preflight accepts a payload whose undefined member the wire drops", async () => {
+			const transport: AgxTransport = {
+				...bus.transport(ALICE),
+				resolvePeer: vi.fn(async () => ({
+					relays: [],
+					card: {
+						displayName: "Billing",
+						capabilities: ["invoice.review"],
+						nip05: null,
+						skills: [{
+							id: "invoice.review",
+							description: "Review an invoice",
+							inputSchema: {
+								type: "object",
+								properties: { a: { type: "number" } },
+								additionalProperties: false,
+							},
+						}],
+					},
+				})),
+			};
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			const pending = alice.request(
+				BOB,
+				"invoice.review",
+				{ a: 1, b: undefined },
+				{ validate: true, timeoutMs: 20 },
+			);
+			await expect(pending).rejects.toThrow(/timed out/);
+			expect(publishMessage).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	it("does not expose schema validation to a denied requester", async () => {
