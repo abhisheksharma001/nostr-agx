@@ -866,6 +866,105 @@ describe("AgxClient task request/response", () => {
 			await bob.tasksSettled();
 		});
 
+		it("drops a working report made while waiting for input, then reports again after the answer", async () => {
+			const bob = new AgxClient({ transport: bus.transport(BOB), authorize: "accept-all" });
+			bob.handle("ask", async (_task, ctx) => {
+				const answer = ctx.requestInput({ prompt: "Continue?" });
+				void ctx.report("waiting");
+				const input = await answer;
+				await ctx.report("resumed");
+				return input;
+			});
+			pushTaskEnvelope(BOB, ALICE, {
+				t: "req",
+				taskId: "input-hold",
+				capability: "ask",
+				payload: {},
+				supportsInput: true,
+				supportsWorking: true,
+				timeoutMs: 0,
+			});
+			await bob.pump();
+			let prompt: TaskEnvelope | null = null;
+			for (let attempt = 0; attempt < 200 && !prompt; attempt += 1) {
+				const found = (bus.inbox.get(ALICE) ?? [])
+					.map((message) => parseTaskEnvelope(message.text))
+					.find((envelope) => envelope?.t === "res" && envelope.status === "input-required");
+				if (found) prompt = found;
+				else await new Promise((resolve) => setTimeout(resolve, 1));
+			}
+			if (prompt?.t !== "res" || prompt.status !== "input-required") {
+				throw new Error("expected input-required");
+			}
+			// Let the dropped report settle before the answer arrives.
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			await bus.transport(ALICE).publishMessage(BOB, {
+				text: encodeTaskEnvelope({
+					t: "input",
+					taskId: "input-hold",
+					inputRequestId: prompt.inputRequestId,
+					input: "yes",
+				}),
+				contextId: "input-hold",
+				contentType: TASK_CONTENT_TYPE,
+			});
+			await bob.pump();
+			await bob.tasksSettled();
+
+			const wire = (bus.inbox.get(ALICE) ?? []).flatMap((message) => {
+				const envelope = parseTaskEnvelope(message.text);
+				if (envelope?.t !== "res") return [];
+				if (envelope.status === "working") {
+					return [{ status: envelope.status, seq: envelope.seq, message: envelope.message }];
+				}
+				if (envelope.status === "completed") {
+					return [{ status: envelope.status, output: envelope.output }];
+				}
+				return [{ status: envelope.status }];
+			});
+			expect(wire).toEqual([
+				{ status: "input-required" },
+				{ status: "working", seq: 1, message: "resumed" },
+				{ status: "completed", output: "yes" },
+			]);
+			await bob.stop();
+		});
+
+		it("drops a working report made while the input request is being sent", async () => {
+			const base = bus.transport(BOB);
+			// A slow relay for input-required, so a report lands mid-publish.
+			const slowPrompt: AgxTransport = {
+				...base,
+				async publishMessage(to, message) {
+					const envelope = parseTaskEnvelope(message.text);
+					const isPrompt = envelope?.t === "res" && envelope.status === "input-required";
+					await new Promise((resolve) => setTimeout(resolve, isPrompt ? 30 : 1));
+					return base.publishMessage(to, message);
+				},
+			};
+			const bob = new AgxClient({ transport: slowPrompt, authorize: "accept-all" });
+			bob.handle("ask", async (_task, ctx) => {
+				const answer = ctx.requestInput({ prompt: "Continue?" });
+				setTimeout(() => void ctx.report("during send"), 5);
+				return answer;
+			});
+			pushTaskEnvelope(BOB, ALICE, {
+				t: "req",
+				taskId: "input-send",
+				capability: "ask",
+				payload: {},
+				supportsInput: true,
+				supportsWorking: true,
+				timeoutMs: 0,
+			});
+			await bob.pump();
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			expect(statusesSentTo(ALICE, "input-send")).toEqual(["input-required"]);
+			await bob.stop();
+			await bob.tasksSettled();
+		});
+
 		it("sends no working update after the requester cancels the task", async () => {
 			const bob = new AgxClient({
 				transport: bus.transport(BOB),
