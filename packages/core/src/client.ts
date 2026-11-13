@@ -89,9 +89,9 @@ export type HandlerContext = {
 	requestInput(requirement: InputRequirement): Promise<unknown>;
 	/** Publish a best-effort public `working` update (at most 2000 characters; never
 	 * raw reasoning or internal error detail). Sends nothing unless the request
-	 * opted in with `supportsWorking`, and nothing once the task has finished or
-	 * been canceled. A failed or oversized publish is logged and dropped; it never
-	 * fails the task. */
+	 * opted in with `supportsWorking`, nothing while an input request is
+	 * outstanding, and nothing once the task has finished or been canceled. A
+	 * failed or oversized publish is logged and dropped; it never fails the task. */
 	report(message?: string): Promise<void>;
 };
 
@@ -1537,6 +1537,10 @@ export class AgxClient {
 					if (reportsClosed || active?.canceled) {
 						return;
 					}
+					// Nothing while an input request is outstanding, from the moment it
+					// starts sending until the answer arrives. Dropped, not queued, and
+					// it uses no seq number.
+					if (waitingForInput) return;
 					statusSeq += 1;
 					const sending = this.sendTaskStatus(msg.from, env.taskId, statusSeq, message);
 					reportsInFlight = Promise.all([
