@@ -69,9 +69,10 @@ function setup(
 		view?: Record<string, unknown> | null;
 		slots?: TaskStreamSlots;
 		authorized?: () => boolean;
+		firstEventId?: number;
 	} = {},
 ) {
-	const streams = new TaskEventStreams();
+	const streams = new TaskEventStreams({ firstEventId: options.firstEventId ?? 1 });
 	const stream = streams.ensure(ID);
 	let view: Record<string, unknown> | null =
 		options.view === undefined ? { id: ID, status: "running" } : options.view;
@@ -244,4 +245,30 @@ describe("serveTaskEvents", () => {
 		stream.push(working(1));
 		expect(response.body()).not.toContain("event: working");
 	});
+
+	it("does not answer 204 to a client that saw IDs from a lost stream, whoever connects first", () => {
+		// A restart: the new process numbers events above any earlier one.
+		const { open } = setup({
+			view: { id: ID, status: "completed", result: { ok: true } },
+			firstEventId: 1_000,
+		});
+		const curl = open();
+		expect(curl.body()).toMatch(/id: \d+\nevent: completed/);
+		// A browser tab that saw IDs up to 100 before the restart.
+		const browser = open("100");
+		expect(browser.status()).toBe(200);
+		expect(browser.body()).toContain("event: completed");
+	});
+
+	it("places the terminal event of a stream rebuilt mid-task after earlier IDs", () => {
+		const { stream, open, setView } = setup({ firstEventId: 1_000 });
+		// The client saw IDs up to 40 from the stream that was lost, then dropped.
+		open("40").close();
+		setView({ id: ID, status: "completed", result: { ok: true } });
+		stream.markTerminal(); // as the settle callback does
+		const reconnect = open("40");
+		expect(reconnect.status()).toBe(200);
+		expect(reconnect.body()).toContain("event: completed");
+	});
 });
+
