@@ -110,7 +110,8 @@ describe("task result errors", () => {
 
 			// First request after the idle spell: a fresh client restores the stale record.
 			const stale = await task("operation-2");
-			// Next one: the store cannot even be read.
+			// Another idle spell, then a request when the store cannot even be read.
+			vi.spyOn(Date, "now").mockReturnValue(Date.now() + (MAX_WRAP_BACKDATE_SEC + 60) * 1000);
 			failList = true;
 			const unreadable = await task("operation-3");
 			for (const failure of [stale, unreadable]) {
