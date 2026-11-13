@@ -245,4 +245,3 @@ describe("serveTaskEvents", () => {
 		expect(response.body()).not.toContain("event: working");
 	});
 });
-
