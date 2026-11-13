@@ -502,14 +502,25 @@ curl -N -H "Authorization: Bearer $AGX_GATEWAY_KEY" \
   http://127.0.0.1:8787/v1/tasks/task_…/events
 ```
 
-On reconnect, send `Last-Event-ID: <last-id>` to skip already received events. The gateway retains at
-most 128 intermediate events per task and 1,000 in-memory streams for up to 24 hours. The 1,000 is
-shared by every API credential of the gateway: many background tasks under one credential can evict
-another credential's buffered `working` events, never its stored terminal view. Intermediate
-replay is bounded and does not survive restart; the stored terminal view is authoritative and is
-always available without rerunning the task. Closing an SSE connection does not cancel remote work.
-Responses include `Cache-Control: no-store, no-transform` and `X-Accel-Buffering: no`; proxies must
-also be configured not to buffer SSE.
+On reconnect, send `Last-Event-ID: <last-id>` to skip already received events. A reconnect that
+already has the terminal event gets `204 No Content`, which stops a browser `EventSource` from
+reconnecting; some proxies alter or retry a 204, so let it through unchanged.
+
+Intermediate replay is bounded, in memory, and does not survive restart; the stored terminal view is
+authoritative and is always available without rerunning the task. The gateway keeps at most 128
+`working` events and 64 KiB per task, and 4 MiB across all tasks for up to 24 hours. Past that it drops
+the oldest events of finished tasks first, so a running task keeps its live updates. The terminal
+event is read from the task store when it is sent, not kept in the event buffer.
+
+Each API key may hold 64 open event streams (past that: `429 too_many_streams` with
+`Retry-After: 5`), and the gateway 256 (past that: `503 busy`). An open stream rechecks its key and
+task every 5 seconds and ends if the key was revoked or the task record is gone. Closing an SSE
+connection does not cancel remote work. The gateway reads `working` updates through `request()` with
+`onTaskStatus`, so a task that needs input still fails with `input_required`.
+
+The stream body starts with `retry: 1000`; a heartbeat is a comment and has no event ID. Responses
+include `Cache-Control: no-store, no-transform` and `X-Accel-Buffering: no`; proxies must also be
+configured not to buffer SSE.
 
 ### Subscriptions
 
