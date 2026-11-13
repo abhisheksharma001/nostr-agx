@@ -766,9 +766,10 @@ export class AgxClient {
 				return { taskId, result };
 			}
 			if (this.pending.get(taskId) !== pending) {
-				if (!pending.preservePending) {
-					await Promise.resolve(this.pendingRequests.remove(durableKey)).catch(() => undefined);
-				}
+				// Stopped while this first record was being written: nothing was sent, so
+				// the record is removed even for a restart stop. Left behind, the next
+				// client would report an outcome that is not unknown at all.
+				await Promise.resolve(this.pendingRequests.remove(durableKey)).catch(() => undefined);
 				return { taskId, result };
 			}
 		}
