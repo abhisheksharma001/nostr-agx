@@ -768,8 +768,13 @@ export class AgxClient {
 			if (this.pending.get(taskId) !== pending) {
 				// Stopped while this first record was being written: nothing was sent, so
 				// the record is removed even for a restart stop. Left behind, the next
-				// client would report an outcome that is not unknown at all.
-				await Promise.resolve(this.pendingRequests.remove(durableKey)).catch(() => undefined);
+				// client would report an outcome that is not unknown at all. Only a key
+				// made from this request's own ID is certain to hold no earlier record:
+				// a caller-chosen storage key may have replaced the record of a request
+				// that was sent, so for that a restart stop leaves the record in place.
+				if (!pending.preservePending || durableKey === taskId) {
+					await Promise.resolve(this.pendingRequests.remove(durableKey)).catch(() => undefined);
+				}
 				return { taskId, result };
 			}
 		}
