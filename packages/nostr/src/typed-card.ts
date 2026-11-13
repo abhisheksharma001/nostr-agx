@@ -168,8 +168,16 @@ function parseAgentCardMetadataUnsafe(
 
 	// Skills: an invalid entry hides only itself. A duplicated ID drops every
 	// copy, since there is no telling which one the publisher meant.
-	const parsedSkills: AgentSkill[] = [];
+	// Count IDs over every entry, valid or not, so an invalid copy still
+	// makes the ID ambiguous.
 	const idCounts = new Map<string, number>();
+	for (const entry of parsed.data.skills ?? []) {
+		const id = isRecord(entry) ? entry.id : undefined;
+		if (typeof id === "string") {
+			idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+		}
+	}
+	const parsedSkills: AgentSkill[] = [];
 	for (const [index, entry] of (parsed.data.skills ?? []).entries()) {
 		const parsedSkill = parseAgxAgentSkill(entry);
 		if ("problem" in parsedSkill) {
@@ -180,10 +188,6 @@ function parseAgentCardMetadataUnsafe(
 			continue;
 		}
 		parsedSkills.push(parsedSkill.skill);
-		idCounts.set(
-			parsedSkill.skill.id,
-			(idCounts.get(parsedSkill.skill.id) ?? 0) + 1,
-		);
 	}
 	for (const [id, count] of idCounts) {
 		if (count > 1) {
