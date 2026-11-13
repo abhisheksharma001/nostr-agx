@@ -80,6 +80,7 @@ export class Requester {
 	): Promise<unknown> {
 		if (this.waiting === 0 && nowSec() - this.lastPolledSec > MAX_WRAP_BACKDATE_SEC) {
 			this.client = this.newClient();
+			this.lastPolledSec = nowSec();
 		}
 		try {
 			if ((await this.client.restorePendingRequests()).length > 0) {
