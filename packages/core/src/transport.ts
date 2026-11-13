@@ -232,7 +232,11 @@ export interface AgxAgentCardExtension {
 }
 
 export interface AgxAgentCardMetadataWarning {
-	code: "invalid_typed_metadata" | "unsupported_required_extension";
+	code:
+		| "invalid_typed_metadata"
+		| "invalid_typed_skill"
+		| "invalid_typed_extension"
+		| "unsupported_required_extension";
 	message: string;
 }
 
@@ -243,7 +247,7 @@ export interface AgxPeerCard {
 	nip05: string | null;
 	skills?: AgxAgentSkill[];
 	extensions?: AgxAgentCardExtension[];
-	typedMetadataWarning?: AgxAgentCardMetadataWarning;
+	typedMetadataWarnings?: AgxAgentCardMetadataWarning[];
 }
 
 export interface AgxResolvedPeer {

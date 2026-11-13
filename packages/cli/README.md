@@ -234,7 +234,7 @@ reaches the peer as a bare `handler failed`, with the real message logged only
 locally — an internal error must not leak hostnames, table names or credentials
 across a trust boundary. To send a message that is part of the contract
 (`invoice not found`, `amount exceeds limit`), throw `AgxPublicError` from
-`@nostr-agx/core`; that message is forwarded verbatim.
+`@nostr-agx/core`; that message is forwarded verbatim, up to 2000 characters.
 
 ## What `serve` prints for a message
 
@@ -611,10 +611,11 @@ agx card <npub> --skill invoice.review  # one typed skill + formatted input/outp
 Cards with typed `skills` or `extensions` use format version `1.1.0`; legacy-only cards stay `1.0.0`.
 The normal card view summarizes skills and extensions. `--skill` selects a concrete skill ID and prints
 its description, tags, modes, features, and schemas. With `--json`, validated data is under
-`typedMetadata`, the selected skill is under `selectedSkill`, and any fallback has a machine-readable
-`typedMetadata.warning`. The original signed `card` and `event` remain available unchanged.
+`typedMetadata`, the selected skill is under `selectedSkill`, and anything left out is listed with a
+machine-readable code in `typedMetadata.warnings`. The original signed `card` and `event` remain available unchanged.
 
-Invalid typed metadata does not hide legacy capabilities. Unknown optional extensions are displayed;
+Invalid typed metadata does not hide legacy capabilities, and an invalid skill hides only itself.
+Text from the card is printed with control characters replaced. Unknown optional extensions are displayed;
 unknown required extensions hide typed skills and produce a warning. Schemas are public inspection
 metadata, not payload validation or proof of agent quality. This version never fetches schema references.
 

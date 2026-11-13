@@ -153,7 +153,18 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 	const logger = makeLogger(options.verbose ?? false);
 	const releaseLock = acquireLock(profileName);
 
-	const state = loadState(profileName);
+	// A damaged state or seen file stops serve (the error says which). Release
+	// the lock first: the process is about to exit, but an embedding host or a
+	// second host sharing AGX_HOME would otherwise wait for the stale lock.
+	let state: ReturnType<typeof loadState>;
+	let seen: FileSeenStore;
+	try {
+		state = loadState(profileName);
+		seen = new FileSeenStore(profileName);
+	} catch (error) {
+		releaseLock();
+		throw error;
+	}
 	if (options.resetCursor) {
 		state.cursor = 0;
 	}
@@ -186,7 +197,6 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 	refreshAllowed();
 
 	const transport = await createTransport(profile, identity, logger);
-	const seen = new FileSeenStore(profileName);
 	// Keeps what arrives, held senders' text included. Output below is unchanged.
 	const store = new MessageStore(profileDir(profileName), undefined, { claimSpool: true });
 	const collector = createCollector({

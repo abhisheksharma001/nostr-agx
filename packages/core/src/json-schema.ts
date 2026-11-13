@@ -38,6 +38,15 @@ const schemaKeywords = new Set([
 	"minProperties",
 	"maxProperties",
 ]);
+/** Accepted whatever their value and otherwise ignored: never checked, never
+ * walked, never fetched (`$schema`), and `default` is never applied. */
+const annotationKeywords = new Set([
+	"description",
+	"title",
+	"$schema",
+	"default",
+	"examples",
+]);
 const nonNegativeIntegerKeywords = new Set([
 	"minLength",
 	"maxLength",
@@ -148,7 +157,7 @@ function validateSchemaNode(
 		return `schema has more than ${AGX_JSON_SCHEMA_LIMITS.schemaNodes} nodes`;
 	}
 	for (const keyword of Object.keys(schema)) {
-		if (!schemaKeywords.has(keyword)) {
+		if (!schemaKeywords.has(keyword) && !annotationKeywords.has(keyword)) {
 			return `unsupported schema keyword: ${keyword.slice(0, 120)}`;
 		}
 	}
@@ -281,6 +290,30 @@ function validateSchemaNode(
 	return null;
 }
 
+/** Remove, in place, every annotation whose value is larger or deeper than a
+ * task payload may be. Annotations never make a schema invalid, but one of
+ * any depth would make printing the schema blow up. Call it on a copy. */
+export function dropUnboundedAgxAnnotations(schema: unknown, depth = 1): void {
+	if (!isRecord(schema) || depth > AGX_JSON_SCHEMA_LIMITS.schemaDepth) {
+		return;
+	}
+	for (const keyword of annotationKeywords) {
+		if (
+			Object.hasOwn(schema, keyword) &&
+			boundedJsonValueProblem(schema[keyword])
+		) {
+			delete schema[keyword];
+		}
+	}
+	if (isRecord(schema.properties)) {
+		for (const child of Object.values(schema.properties)) {
+			dropUnboundedAgxAnnotations(child, depth + 1);
+		}
+	}
+	dropUnboundedAgxAnnotations(schema.items, depth + 1);
+	dropUnboundedAgxAnnotations(schema.additionalProperties, depth + 1);
+}
+
 export function validateAgxJsonSchema(schema: unknown): string | null {
 	try {
 		return isRecord(schema)
@@ -373,7 +406,11 @@ function validatePayloadNode(
 			const quotient = value / (schema.multipleOf as number);
 			const tolerance =
 				Number.EPSILON * Math.max(1, Math.abs(quotient)) * 4;
-			if (Math.abs(quotient - Math.round(quotient)) > tolerance) {
+			// An overflowing quotient would compare NaN > tolerance (false) and pass.
+			if (
+				!Number.isFinite(quotient) ||
+				Math.abs(quotient - Math.round(quotient)) > tolerance
+			) {
 				return `${path}: not a multipleOf value`;
 			}
 		}
@@ -452,6 +489,24 @@ function validatePayloadNode(
 	return null;
 }
 
+/** The value `JSON.stringify` puts on the wire, read back. `undefined` when
+ * the wire leaves the value out (a bare `return;`, a function, a symbol). */
+export function agxWireJson(
+	value: unknown,
+): { ok: true; value: unknown } | { ok: false; problem: string } {
+	try {
+		const text = JSON.stringify(value);
+		return {
+			ok: true,
+			value: text === undefined ? undefined : JSON.parse(text),
+		};
+	} catch {
+		return { ok: false, problem: "value cannot be encoded as JSON" };
+	}
+}
+
+/** Validate `payload` as the JSON it becomes on the wire. A value the wire
+ * leaves out is checked as `null`. */
 export function validateAgxJsonPayload(
 	schema: AgxJsonSchema,
 	payload: unknown,
@@ -461,11 +516,16 @@ export function validateAgxJsonPayload(
 		return `invalid schema: ${schemaProblem}`;
 	}
 	try {
-		const jsonProblem = boundedJsonValueProblem(payload);
+		const wire = agxWireJson(payload);
+		if (!wire.ok) {
+			return `$: ${wire.problem}`;
+		}
+		const value = wire.value === undefined ? null : wire.value;
+		const jsonProblem = boundedJsonValueProblem(value);
 		if (jsonProblem) {
 			return `$: ${jsonProblem}`;
 		}
-		return validatePayloadNode(schema, payload, "$");
+		return validatePayloadNode(schema, value, "$");
 	} catch {
 		return "$: payload could not be validated safely";
 	}

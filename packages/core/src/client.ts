@@ -1,6 +1,17 @@
-import { AgxPublicError, AgxTaskDeclined } from "./errors";
+import {
+	AGX_AGENT_CARD_LIMITS,
+	agxEncodedJsonBytes,
+	parseAgxAgentSkill,
+} from "./agent-card";
+import {
+	AgxInvalidInputError,
+	AgxPublicError,
+	AgxTaskDeclined,
+	AgxTaskFailedError,
+} from "./errors";
 import { randomId } from "./id";
 import {
+	agxWireJson,
 	validateAgxJsonPayload,
 	validateAgxJsonSchema,
 } from "./json-schema";
@@ -23,6 +34,7 @@ import type {
 	AgxAgentSkill,
 	AgxIncomingMessage,
 	AgxIncomingReceipt,
+	AgxPeerCard,
 	AgxTransportListenerOptions,
 	AgxTransport,
 	Unsubscribe,
@@ -50,6 +62,16 @@ export type TaskHandler<Payload = unknown, Output = unknown> = (
 ) => Output | Promise<Output>;
 
 export type AgxTaskContract = Omit<AgxAgentSkill, "id">;
+
+const taskContractFields = new Set([
+	"description",
+	"tags",
+	"inputModes",
+	"outputModes",
+	"inputSchema",
+	"outputSchema",
+	"features",
+]);
 
 interface RegisteredTaskHandler {
 	handler: TaskHandler;
@@ -209,6 +231,23 @@ const DEFAULT_MAX_DISPATCH_ATTEMPTS = 10;
  * {@link DEFAULT_POLL_OVERLAP_SEC}, for hosts that keep their own replay records:
  * an event dispatched at time `t` is dated no later than `t` plus this. */
 export const MAX_FUTURE_SKEW_SEC = 300;
+
+/** The longest `error` a result may carry: the limit in `taskResultSchema`
+ * (task.ts). A requester drops a result whose `error` is longer, so the task
+ * would only end at its timeout. */
+const MAX_RESULT_ERROR = 2000;
+
+/** Cut a public error message to {@link MAX_RESULT_ERROR} UTF-16 units. If the
+ * cut would split a surrogate pair (an emoji, say), keep one unit fewer so the
+ * cut never separates the two halves of a pair. */
+function fitPublicMessage(message: string): string {
+	if (message.length <= MAX_RESULT_ERROR) {
+		return message;
+	}
+	const last = message.charCodeAt(MAX_RESULT_ERROR - 1);
+	const splitsPair = last >= 0xd800 && last <= 0xdbff;
+	return message.slice(0, splitsPair ? MAX_RESULT_ERROR - 1 : MAX_RESULT_ERROR);
+}
 
 interface TransportLifecycle {
 	clients: Set<object>;
@@ -389,27 +428,56 @@ export class AgxClient {
 		return new TextEncoder().encode(text).length <= MAX_BODY_BYTES;
 	}
 
-	/** Register a capability handler and, optionally, its public typed contract. */
+	/** Register a capability handler and, optionally, its public typed contract.
+	 * The contract must pass the same rules the Agent Card applies to a typed
+	 * skill, so a contract accepted here can always be published. The client
+	 * keeps its own copy: changing `contract` afterwards has no effect. */
 	handle<Payload = unknown, Output = unknown>(
 		capability: string,
 		handler: TaskHandler<Payload, Output>,
 		contract?: AgxTaskContract,
 	): this {
-		for (const keyword of ["inputSchema", "outputSchema"] as const) {
-			const schema = contract?.[keyword];
-			if (!schema) {
-				continue;
-			}
-			const problem = validateAgxJsonSchema(schema);
-			if (problem) {
+		let registered: AgxTaskContract | undefined;
+		if (contract) {
+			// Stricter than a card reader, which ignores unknown fields: here an
+			// unknown field is most likely a typo such as `inputschema`.
+			const unknownField = Object.keys(contract).find(
+				(field) => !taskContractFields.has(field),
+			);
+			if (unknownField !== undefined) {
 				throw new Error(
-					`AGX handler ${capability} ${keyword}: ${problem}`,
+					`AGX handler ${capability} contract: unknown field ${unknownField.slice(0, 120)}`,
 				);
 			}
+			const parsed = parseAgxAgentSkill({ ...contract, id: capability });
+			if ("problem" in parsed) {
+				throw new Error(
+					`AGX handler ${capability} contract: ${parsed.problem}`,
+				);
+			}
+			// The card carries every typed skill, so check the set this one
+			// would join (replacing any earlier contract for the capability).
+			const skills = [
+				...this.typedSkills().filter((skill) => skill.id !== capability),
+				parsed.skill,
+			];
+			if (skills.length > AGX_AGENT_CARD_LIMITS.skills) {
+				throw new Error(
+					`AGX handler ${capability} contract: more than ${AGX_AGENT_CARD_LIMITS.skills} typed skills`,
+				);
+			}
+			const bytes = agxEncodedJsonBytes({ skills });
+			if (bytes === null || bytes > AGX_AGENT_CARD_LIMITS.metadataBytes) {
+				throw new Error(
+					`AGX handler ${capability} contract: typed skills would exceed ${AGX_AGENT_CARD_LIMITS.metadataBytes} bytes as encoded in the Agent Card event`,
+				);
+			}
+			const { id: _id, ...copy } = parsed.skill;
+			registered = copy;
 		}
 		this.handlers.set(capability, {
 			handler: handler as TaskHandler,
-			contract,
+			contract: registered,
 		});
 		return this;
 	}
@@ -432,7 +500,10 @@ export class AgxClient {
 	}
 
 	/** Check the payload against the peer's typed skill before anything is
-	 * published or registered. A peer with no matching skill schema passes.
+	 * published or registered, throwing {@link AgxInvalidInputError} on a
+	 * failure. It checks only when the peer's card has a valid input schema
+	 * for exactly this capability; with no card, no such skill or schema, an
+	 * invalid schema, or a failed lookup, the payload is sent unchecked.
 	 * Callers await this only when `validate` is set, so a plain request still
 	 * publishes in the same tick. The peer lookup runs before the request's
 	 * `timeoutMs` deadline starts, so that deadline does not cover it. */
@@ -440,14 +511,35 @@ export class AgxClient {
 		peer: string,
 		capability: string,
 		payload: unknown,
-	): Promise<void> {
-		const card = (await this.transport.resolvePeer(peer)).card;
-		const skill = card?.skills?.find((candidate) => candidate.id === capability);
-		if (!skill?.inputSchema) return;
-		const problem = validateAgxJsonPayload(skill.inputSchema, payload);
-		if (problem) {
-			throw new Error(`AGX request: invalid_input: ${problem}`);
+	): Promise<unknown> {
+		let card: AgxPeerCard | null;
+		try {
+			card = (await this.transport.resolvePeer(peer)).card;
+		} catch (error) {
+			this.log.debug?.("AGX: peer card lookup failed; sending unchecked", {
+				peer,
+				capability,
+				error: String(error),
+			});
+			return payload;
 		}
+		const schema = card?.skills?.find(
+			(candidate) => candidate.id === capability,
+		)?.inputSchema;
+		// A transport need not run the card reader's checks, so make sure the
+		// schema is one this client can apply before trusting its verdict.
+		if (!schema || validateAgxJsonSchema(schema)) return payload;
+		const wire = agxWireJson(payload);
+		if (!wire.ok) {
+			throw new AgxInvalidInputError(`$: ${wire.problem}`);
+		}
+		const problem = validateAgxJsonPayload(schema, wire.value);
+		if (problem) {
+			throw new AgxInvalidInputError(problem);
+		}
+		// Send the value that was checked, so a toJSON that answers differently
+		// on a second call cannot put something else on the wire.
+		return wire.value;
 	}
 
 	/** Send a task to a peer and await its correlated result. Rejects on a `failed`
@@ -462,11 +554,13 @@ export class AgxClient {
 			onTaskStatus?: (update: TaskStatusUpdate) => void | Promise<void>;
 		},
 	): Promise<Output> {
-		if (opts?.validate) await this.preflightInput(peer, capability, payload);
+		const sent = opts?.validate
+			? await this.preflightInput(peer, capability, payload)
+			: payload;
 		const { result } = await this.sendRequest<Output>(
 			peer,
 			capability,
-			payload,
+			sent,
 			{
 				...opts,
 				supportsInput: false,
@@ -485,7 +579,9 @@ export class AgxClient {
 		payload: unknown,
 		opts?: { timeoutMs?: number; validate?: boolean },
 	): Promise<StreamResponse<Output>> {
-		if (opts?.validate) await this.preflightInput(peer, capability, payload);
+		const sent = opts?.validate
+			? await this.preflightInput(peer, capability, payload)
+			: payload;
 		const taskId = randomId();
 		let resolveResult!: (output: Output) => void;
 		let rejectResult!: (error: Error) => void;
@@ -506,7 +602,7 @@ export class AgxClient {
 			this.log,
 		);
 		try {
-			const { result } = await this.sendRequest<Output>(peer, capability, payload, {
+			const { result } = await this.sendRequest<Output>(peer, capability, sent, {
 				...opts,
 				taskId,
 				supportsInput: true,
@@ -1529,12 +1625,16 @@ export class AgxClient {
 			});
 			await closeReports();
 			if (active?.canceled) return;
+			let resultOutput: unknown = output;
 			if (registered.contract?.outputSchema) {
-				const problem = validateAgxJsonPayload(
-					registered.contract.outputSchema,
-					output,
-				);
-				if (problem) {
+				const wire = agxWireJson(output);
+				const problem = wire.ok
+					? validateAgxJsonPayload(
+							registered.contract.outputSchema,
+							wire.value,
+						)
+					: `$: ${wire.problem}`;
+				if (!wire.ok || problem) {
 					this.log.warn?.("AGX: task output failed schema validation", {
 						taskId: env.taskId,
 						capability: env.capability,
@@ -1546,10 +1646,12 @@ export class AgxClient {
 					});
 					return;
 				}
+				// Send the value that was checked, not a second encoding of it.
+				resultOutput = wire.value;
 			}
 			await this.sendResult(msg.from, env.taskId, {
 				status: "completed",
-				output,
+				output: resultOutput,
 			});
 		} catch (err) {
 			await closeReports();
@@ -1582,7 +1684,7 @@ export class AgxClient {
 			await this.sendResult(msg.from, env.taskId, {
 				status: "failed",
 				error: isPublic
-					? (err as AgxPublicError).message
+					? fitPublicMessage((err as AgxPublicError).message)
 					: "handler failed",
 			});
 		} finally {
@@ -1738,7 +1840,7 @@ export class AgxClient {
 		if (env.status === "completed") {
 			p.resolve(env.output);
 		} else {
-			p.reject(new Error(env.error ?? "task failed"));
+			p.reject(new AgxTaskFailedError(env.error ?? "task failed"));
 		}
 	}
 

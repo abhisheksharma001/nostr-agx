@@ -11,7 +11,7 @@ ARG BASE_IMAGE=node:22-alpine
 FROM ${BASE_IMAGE}
 
 # The CLI release to install; kept equal to packages/cli's version by its tests.
-ARG AGX_PACKAGE=@nostr-agx/cli@0.5.0
+ARG AGX_PACKAGE=@nostr-agx/cli@0.6.0
 
 RUN npm install --global --omit=dev --no-audit --no-fund "${AGX_PACKAGE}" \
 	&& npm cache clean --force \

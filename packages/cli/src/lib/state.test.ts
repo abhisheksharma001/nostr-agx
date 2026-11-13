@@ -1,6 +1,10 @@
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sandbox } from "../test/helpers.js";
-import { FileSeenStore, updateState } from "./state.js";
+import { AgxCliError, EXIT } from "./errors.js";
+import { seenPath, statePath } from "./paths.js";
+import { FileSeenStore, loadState, updateState } from "./state.js";
 
 const DAY = 24 * 60 * 60;
 
@@ -56,5 +60,186 @@ describe("FileSeenStore", () => {
 		expect(seen.recordFailure("event-1")).toBe(1);
 		seen.add("event-1");
 		expect(seen.recordFailure("event-1")).toBe(1);
+	});
+});
+
+describe("a state file the CLI cannot read", () => {
+	// The state file holds the poll cursor and the seen file holds the replay
+	// memory. Replacing either with an empty one on a read failure re-drains the
+	// inbox and runs handlers again for messages already answered. The CLI must
+	// stop and say which file is wrong, and leave the file as it found it.
+	function plant(path: string, text: string): void {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, text);
+	}
+
+	/** The CLI error, with the config exit code, that names the file. */
+	function refusal(fn: () => unknown, path: string): AgxCliError {
+		let caught: unknown;
+		try {
+			fn();
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(AgxCliError);
+		const error = caught as AgxCliError;
+		expect(error.exitCode).toBe(EXIT.config);
+		expect(error.message).toContain(path);
+		return error;
+	}
+
+	describe("state.json", () => {
+		it("loads a valid file (control)", () => {
+			plant(statePath("default"), JSON.stringify({ version: 1, cursor: 42 }));
+			expect(loadState("default").cursor).toBe(42);
+		});
+
+		it("starts empty when there is no file yet (control)", () => {
+			expect(loadState("default").cursor).toBe(0);
+		});
+
+		it("refuses a file that is not JSON, and names it", () => {
+			plant(statePath("default"), "{ \"cursor\": 4");
+			expect(() => loadState("default")).toThrow(statePath("default"));
+		});
+
+		it("refuses a file with the wrong shape instead of resetting the cursor", () => {
+			plant(statePath("default"), JSON.stringify({ version: 1, cursor: "soon" }));
+			expect(() => loadState("default")).toThrow(statePath("default"));
+		});
+
+		it("refuses a file written by a newer version", () => {
+			plant(statePath("default"), JSON.stringify({ version: 2, cursor: 500 }));
+			expect(() => loadState("default")).toThrow(statePath("default"));
+		});
+
+		it("leaves a newer file untouched when something tries to update it", () => {
+			const text = JSON.stringify({ version: 2, cursor: 500 });
+			plant(statePath("default"), text);
+			expect(() => updateState("default", { cursor: 1 })).toThrow();
+			expect(readFileSync(statePath("default"), "utf8")).toBe(text);
+		});
+
+		it("refuses a file with no version, which is not one of ours", () => {
+			plant(statePath("default"), JSON.stringify({ cursor: 7 }));
+			refusal(() => loadState("default"), statePath("default"));
+			plant(statePath("default"), "{}");
+			refusal(() => loadState("default"), statePath("default"));
+		});
+
+		it("still loads a version 1 file that carries extra keys (control)", () => {
+			plant(
+				statePath("default"),
+				JSON.stringify({ version: 1, cursor: 9, addedLater: true }),
+			);
+			expect(loadState("default").cursor).toBe(9);
+		});
+
+		it("does not put the file's text in the error", () => {
+			plant(statePath("default"), "CANARY not json");
+			const error = refusal(() => loadState("default"), statePath("default"));
+			expect(`${error.message}\n${error.remediation}`).not.toContain(
+				"CANARY",
+			);
+		});
+
+		it("tells a damaged file apart from one it cannot read, and says what moving it costs", () => {
+			plant(statePath("default"), "{");
+			const damaged = refusal(() => loadState("default"), statePath("default"));
+			expect(damaged.remediation).toContain("inbox");
+			expect(damaged.remediation).toContain("cursor 0");
+			expect(damaged.remediation).toContain("--wait 600");
+			expect(damaged.remediation).toContain('"truncated": false');
+
+			// A directory where the file should be: access problem, not damage.
+			rmSync(statePath("default"));
+			mkdirSync(statePath("default"));
+			const access = refusal(() => loadState("default"), statePath("default"));
+			expect(access.remediation).not.toContain("mv ");
+		});
+	});
+
+	describe("seen.json", () => {
+		it("loads a version 2 file (control)", () => {
+			plant(
+				seenPath("default"),
+				JSON.stringify({
+					version: 2,
+					entries: [{ id: "event-1", seenAt: Math.floor(Date.now() / 1000) }],
+					failures: {},
+				}),
+			);
+			expect(new FileSeenStore("default").has("event-1")).toBe(true);
+		});
+
+		it("still reads the older version 1 file (control)", () => {
+			plant(seenPath("default"), JSON.stringify({ version: 1, ids: ["event-1"] }));
+			expect(new FileSeenStore("default").has("event-1")).toBe(true);
+		});
+
+		it("refuses a file that is not JSON, and names it", () => {
+			plant(seenPath("default"), "{ \"version\": 2, \"entries\": [");
+			expect(() => new FileSeenStore("default")).toThrow(seenPath("default"));
+		});
+
+		it("refuses a file with the wrong shape instead of forgetting every id", () => {
+			plant(
+				seenPath("default"),
+				JSON.stringify({ version: 2, entries: "event-1" }),
+			);
+			expect(() => new FileSeenStore("default")).toThrow(seenPath("default"));
+		});
+
+		it("refuses a file written by a newer version, and leaves it alone", () => {
+			const text = JSON.stringify({ version: 3, entries: [{ id: "event-1" }] });
+			plant(seenPath("default"), text);
+			expect(() => new FileSeenStore("default")).toThrow(seenPath("default"));
+			expect(readFileSync(seenPath("default"), "utf8")).toBe(text);
+		});
+
+		it("refuses a file that holds null", () => {
+			plant(seenPath("default"), "null");
+			refusal(() => new FileSeenStore("default"), seenPath("default"));
+		});
+
+		it("refuses entries with no version instead of reading them as an empty v1 store", () => {
+			plant(
+				seenPath("default"),
+				JSON.stringify({ entries: [{ id: "event-1", seenAt: 1 }], failures: {} }),
+			);
+			refusal(() => new FileSeenStore("default"), seenPath("default"));
+		});
+
+		it("refuses a version 2 file with no entries list", () => {
+			plant(seenPath("default"), JSON.stringify({ version: 2 }));
+			refusal(() => new FileSeenStore("default"), seenPath("default"));
+		});
+
+		it("says moving it aside means answered requests are answered again, and names the safer order", () => {
+			plant(seenPath("default"), "{");
+			const error = refusal(
+				() => new FileSeenStore("default"),
+				seenPath("default"),
+			);
+			expect(error.remediation).toContain("inbox");
+			expect(error.remediation).toContain("answered again");
+			expect(error.remediation).toContain("will not run those");
+		});
+
+		it("names the profile in the pull-the-inbox advice, not the default one", () => {
+			plant(seenPath("receiver"), "{");
+			const error = refusal(
+				() => new FileSeenStore("receiver"),
+				seenPath("receiver"),
+			);
+			expect(error.remediation).toContain("--profile 'receiver' --json inbox");
+
+			plant(statePath("odd name"), "{");
+			const stateError = refusal(
+				() => loadState("odd name"),
+				statePath("odd name"),
+			);
+			expect(stateError.remediation).toContain("--profile 'odd name' --json inbox");
+		});
 	});
 });

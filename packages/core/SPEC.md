@@ -208,9 +208,13 @@ client configuration.
 the peer **generically** (`handler failed`) and the real message is logged locally — an internal
 driver/ORM/HTTP error must not leak hostnames, table names, or credentials to another org. To send a
 message that is part of the protocol contract (`invoice not found`, `amount exceeds limit`), throw an
-`AgxPublicError`, whose message is forwarded verbatim. Both the request and result envelopes are
-size-checked before sending; an oversize payload fails fast (request) or is replaced with a
-`result too large` failure (result) rather than truncated into unparseable JSON.
+`AgxPublicError`, whose message is forwarded verbatim, up to the 2000 UTF-16 code units a result's
+`error` may carry; a longer message is cut to its first 2000 units (one fewer if the cut would split a
+surrogate pair), because a requester drops a result whose `error` is longer and the task would end only
+at its timeout.
+Both the request and result envelopes are size-checked before sending; an oversize payload fails fast
+(request) or is replaced with a `result too large` failure (result) rather than truncated into
+unparseable JSON.
 
 ## Capability matching
 
@@ -230,9 +234,9 @@ budget, block rules) triages it rather than being bypassed by a content-type lab
 
 ### Typed skills and extensions (Agent Card format 1.1.0)
 
-A publisher MAY add `skills` and `extensions` to the same signed, unencrypted kind `11337` card. A card
-with either field uses human-readable format `version: "1.1.0"`; `v` remains `1`, and cards without
-either field remain `1.0.0`. Legacy `capabilities` remains explicit: skill IDs are not copied into it
+Agent Card format 1.1.0 is part of the protocol. A publisher MAY add `skills` and `extensions` to the
+same signed, unencrypted kind `11337` card. A card with either field uses human-readable format
+`version: "1.1.0"`; `v` remains `1`, and cards without either field remain `1.0.0`. Legacy `capabilities` remains explicit: skill IDs are not copied into it
 automatically, and typed metadata does not change wildcard matching or peer selection.
 
 Each skill has a concrete `id` (not `*` or a `.*` wildcard), a public `description`, and optional
@@ -242,25 +246,38 @@ transport. Feature labels advertise behavior rather than enabling it; client-cre
 include `working` because their handlers can report status. Schemas are inline metadata and MAY also
 drive local task input/output validation as specified below.
 
-Each extension has a stable `uri` and optional `required` (default `false`). AGX-namespaced identifiers
-such as `agx.task-status.v1` are recommended. An unknown optional extension is retained and does not
-affect typed skills. An unknown required extension hides all typed skills and returns an
-`unsupported_required_extension` warning; its extension declaration remains visible and legacy fields
-remain usable. The reference implementation currently recognizes no required extension URIs. A
+Each extension has a stable `uri` and optional `required` (default `false`). Extensions are declared
+once per card, so `required: true` means a reader that does not support the URI MUST NOT use any of
+the card's typed skills. AGX-namespaced identifiers such as `agx.task-status.v1` are recommended. An
+unknown optional extension is retained and does not affect typed skills. An unknown required extension
+hides all typed skills and returns an `unsupported_required_extension` warning; its extension
+declaration remains visible and legacy fields remain usable. A URI declared more than once is merged
+into one declaration, required if any copy is, with an `invalid_typed_extension` warning. An invalid
+extension entry is dropped with an `invalid_typed_extension` warning; one that says `required: true`
+also counts as an unsupported required extension. The reference implementation currently recognizes
+no required extension URIs. A
 publisher MUST omit a skill from legacy `capabilities` when legacy interaction with it would be unsafe.
 
 Legacy fields are parsed independently. Malformed, duplicate, oversized, or unsupported typed metadata
-MUST NOT hide valid legacy `org`, `nip05`, or `capabilities`. The typed `skills` and `extensions` unit
-is rejected as a whole with an `invalid_typed_metadata` warning rather than exposing a partial contract.
-No parser may fetch a schema or follow a reference. A signature proves only which key published these
+MUST NOT hide valid legacy `org`, `nip05`, or `capabilities`. A structural failure (card content that
+is not an object, `skills` or `extensions` that is not an array or has too many entries, or typed
+metadata over the size limit) ignores the whole typed unit with an `invalid_typed_metadata` warning.
+Otherwise each skill is checked on its own: an invalid skill is dropped with an `invalid_typed_skill`
+warning and hides only itself, and every copy of a duplicated skill ID is dropped, since a reader
+cannot tell which one the publisher meant. Unknown fields in skill and extension objects are ignored
+and left out, so a card written for a later format version still reads as typed. A publisher drops an
+invalid skill instead of not publishing the card. No parser may fetch a schema or follow a reference. A signature proves only which key published these
 public claims, not their correctness, safety, quality, or current availability. Cards MUST NOT contain
 credentials, private endpoints, confidential examples, or other secrets.
 
 The inline JSON Schema 2020-12 subset permits `type`, `properties`, `required`,
 `additionalProperties`, `items`, `enum`, `const`, `minLength`, `maxLength`, `minimum`, `maximum`,
 `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minItems`, `maxItems`, `uniqueItems`,
-`minProperties`, and `maxProperties`. Other keywords, including `$ref`, `$schema`, `$id`, `pattern`,
-`format`, and `patternProperties`, invalidate the typed unit. Schemas are objects, not boolean schemas;
+`minProperties`, and `maxProperties`. The annotation keywords `description`, `title`, `$schema`,
+`default`, and `examples` are accepted with any value and ignored: they are never checked or fetched,
+and `default` is never applied. A reader MAY drop an annotation whose value exceeds the validated payload
+bounds below; the schema and its skill stay valid. Other keywords, including `$ref`, `$id`, `pattern`, `format`, and
+`patternProperties`, make the schema invalid, which drops its skill. Schemas are objects, not boolean schemas;
 remote references and format assertions are not supported.
 
 | Bound | Limit |
@@ -273,25 +290,38 @@ remote references and format assertions are not supported.
 | Input or output modes per skill / characters per mode | 8 each / 128 |
 | Features per skill / characters per feature | 16 / 200 |
 | Extension URI | 512 characters |
-| Inline schema | 16 KiB UTF-8 each |
-| Combined serialized typed metadata | 64 KiB UTF-8 |
+| Inline schema | 16 KiB each, measured like typed metadata |
+| Typed metadata (`skills` + `extensions`), measured as UTF-8 inside the event's escaped `content` | 32 KiB (32,768 bytes) |
 | Schema nesting depth | 16 |
 | Total object properties per schema | 256 |
 | Total schema nodes | 512 |
 | Validated payload nesting depth | 64 |
 | Validated payload nodes | 16,384 |
 
+Sizes are the UTF-8 bytes a value takes up inside the signed event's `content` string: the card text is
+JSON, and the event escapes it again, so a quote or backslash counts more than once. Publishers MUST
+check the typed metadata limit before publishing; readers ignore typed metadata over it.
+
 ### Typed payload validation
 
-A handler MAY register an `AgxTaskContract` containing the typed skill fields other than `id`. The
-reference client rejects unsupported local schemas at registration and includes registered contracts
-in discovery metadata while retaining the same legacy capability keys. Existing handlers without a
+A handler MAY register an `AgxTaskContract` containing the typed skill fields other than `id`. At
+registration the reference client applies every skill rule above, refuses unknown contract fields, and
+refuses a contract that would take the card past 64 typed skills or the typed metadata limit, so a
+registered contract can always be published. It keeps its own copy of the contract and includes
+registered contracts in discovery metadata while retaining the same legacy capability keys. Existing handlers without a
 contract retain their previous behavior.
 
+Values are validated as the JSON they become on the wire (`JSON.stringify`, read back): an `undefined`
+member is absent, a `Date` is its string, and a value the encoding leaves out, such as a handler that
+returns nothing, is checked as `null`. A value that cannot be encoded fails validation.
+
 `request(..., { validate: true })` and `streamRequest(..., { validate: true })` opt into requester
-preflight. The client resolves the peer card, selects the exact typed skill ID, and rejects a payload
-that violates its `inputSchema` before publishing. A missing card, typed skill, or input schema skips preflight; this option performs no
-schema-driven fetch beyond normal peer-card resolution. That peer-card lookup runs before the request is
+preflight. The client resolves the peer card and checks the payload only against a valid `inputSchema`
+on the skill whose ID is exactly the requested capability. A missing card, skill, or input schema, a
+schema the client cannot apply, or a failed card lookup sends the payload without checking; a warning
+about a different skill does not stop the check. A payload the schema refuses throws
+`AgxInvalidInputError` locally and nothing is published; a peer's own `invalid_input` result arrives as
+`AgxTaskFailedError`. This option performs no schema-driven fetch beyond normal peer-card resolution. That peer-card lookup runs before the request is
 published, so `timeoutMs` does not cover it.
 
 After authorization succeeds, a receiver with an input schema validates before invoking its handler.
@@ -303,7 +333,7 @@ before it is registered as an active task or takes a concurrency slot, so a retr
 ID is accepted. A task the requester has canceled sends no result, so
 it never sends `invalid_output` either.
 A handler result that violates its registered `outputSchema` produces `invalid_output` instead of a
-completed result. Structured error codes and requester-side validation of remote results remain
+completed result; a result that passes is sent as the value that was checked. Structured error codes and requester-side validation of remote results remain
 outside this change. Validation uses only the bounded inline subset above and never evaluates schema
 text as code.
 

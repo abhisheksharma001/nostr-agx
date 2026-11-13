@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.0
+
+Released with `@nostr-agx/core` and `@nostr-agx/nostr` 0.6.0, which add interactive input to tasks: a handler can call `ctx.requestInput(...)` to ask its requester a question, and a requester that opts in through `streamRequest()` answers it (see "Task lifecycle" in the core `SPEC.md`). `NostrTransport` can also receive over live relay subscriptions instead of only polling.
+
+### Added
+
+- `agx gateway`: `POST /v1/tasks` accepts an optional `Idempotency-Key` header. For one API credential, the same key and the same JSON body share one run and get the same stored outcome for up to 24 hours; a key reused with a different body gets `409 idempotency_key_reused`, and work the gateway could not finish recording before a restart gets `409 result_unknown` instead of running again.
+- `agx gateway`: `"background": true` on `POST /v1/tasks` answers `202` with a `task_<id>` handle, and `GET /v1/tasks/<id>` reads its status and stored result, scoped to the API credential that submitted it.
+- `agx relay` speaks standard relay subscriptions, so agents using live subscriptions can be tested against it.
+
+### Changed
+
+- `agx request`, the gateway (`422 input_required`) and the n8n Task → Request operation say so plainly when a peer asks for interactive input, which they cannot answer. `serve` and the gateway keep polling and do not use live dispatch.
+- `serve`, `inbox`, `doctor`, `register` and `listing` stop with exit 3 and advice when `state.json` or `seen.json` cannot be read or does not match its format, instead of crashing or silently starting from empty. A missing file still starts empty, and `doctor` still prints its full report with the failed check.
+- `agx gateway`: a peer's task failure is always `502 task_failed`, whatever its text. Before, a failure whose text looked like a local error got that error's status, for example `504 timeout` for text starting "AGX request timed out".
+
+### Fixed
+
+- A peer's failure text could pose as the gateway's own `413 payload_too_large`, which frees the idempotency key, so a retry with the same key sent the task again.
+- When a background task's key was freed after a retryable failure, its record moved to the unkeyed pool without making room there, so that pool could stay over its per-credential and profile limits.
+- An `AgxPublicError` message over 2000 characters made the requester drop the result and wait for its timeout; through the gateway that showed as a `504 timeout`. The message is now cut to 2000 characters.
+- The live listener refuses a gift wrap older than the replay window, so an old wrap a relay replays after the seen store has forgotten it is not handled twice.
+- On stop, `serve` fails tasks still waiting for a slot or for input with a `failed` result, and waits (up to 10 seconds) for running handlers to publish theirs before exiting.
+
 ## 0.5.0
 
 Released with `@nostr-agx/core` and `@nostr-agx/nostr` 0.5.0, which add the optional `evidence` member to the message payload (see "Evidence" in the core `SPEC.md`) and a `read` receipt status with an optional `readAt` (see "Receipt statuses"). `agx` does not send or show evidence yet, and does not send `read` receipts.

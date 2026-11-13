@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { AgxClient } from "./client";
-import { AgxPublicError, AgxTaskDeclined } from "./errors";
+import { AgxClient, type AgxTaskContract } from "./client";
+import {
+	AgxInvalidInputError,
+	AgxPublicError,
+	AgxTaskDeclined,
+	AgxTaskFailedError,
+} from "./errors";
 import { randomId } from "./id";
 import {
 	encodeTaskEnvelope,
@@ -11,6 +16,7 @@ import {
 import type {
 	AgxIncomingMessage,
 	AgxIncomingReceipt,
+	AgxPeerCard,
 	AgxPollResult,
 	AgxResolvedPeer,
 	AgxTransport,
@@ -847,10 +853,168 @@ describe("AgxClient task request/response", () => {
 		const publishMessage = vi.spyOn(transport, "publishMessage");
 		const alice = new AgxClient({ transport });
 
-		await expect(
-			alice.request(BOB, "invoice.review", { amount: "hello" }, { validate: true }),
-		).rejects.toThrow(/invalid_input.*expected number/);
+		const pending = alice.request(
+			BOB,
+			"invoice.review",
+			{ amount: "hello" },
+			{ validate: true },
+		);
+		await expect(pending).rejects.toThrow(/invalid_input.*expected number/);
+		await expect(pending).rejects.toBeInstanceOf(AgxInvalidInputError);
 		expect(publishMessage).not.toHaveBeenCalled();
+	});
+
+	describe("validate preflight checks only against a valid peer schema", () => {
+		const invoiceSkill = {
+			id: "invoice.review",
+			description: "Review an invoice",
+			inputSchema: {
+				type: "object",
+				required: ["amount"],
+				properties: { amount: { type: "number" } },
+			},
+		};
+
+		function cardWith(extra: Partial<AgxPeerCard>): AgxPeerCard {
+			return {
+				displayName: "Billing",
+				capabilities: ["invoice.review"],
+				nip05: null,
+				...extra,
+			};
+		}
+
+		function peerTransport(card: AgxPeerCard | null | Error) {
+			return {
+				...bus.transport(ALICE),
+				resolvePeer: vi.fn(async () => {
+					if (card instanceof Error) throw card;
+					return { relays: [], card };
+				}),
+			} satisfies AgxTransport;
+		}
+
+		async function expectSentUnchecked(card: AgxPeerCard | null | Error) {
+			const transport = peerTransport(card);
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+			await expect(
+				alice.request(
+					BOB,
+					"invoice.review",
+					{ amount: "hello" },
+					{ validate: true, timeoutMs: 20 },
+				),
+			).rejects.toThrow(/timed out/);
+			expect(publishMessage).toHaveBeenCalled();
+		}
+
+		it("throws AgxInvalidInputError for a payload the peer schema refuses", async () => {
+			const transport = peerTransport(cardWith({ skills: [invoiceSkill] }));
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			const error = await alice
+				.request(BOB, "invoice.review", { amount: "hello" }, { validate: true })
+				.catch((caught: unknown) => caught);
+			expect(error).toBeInstanceOf(AgxInvalidInputError);
+			expect(error).not.toBeInstanceOf(AgxTaskFailedError);
+			expect((error as AgxInvalidInputError).problem).toContain(
+				"expected number",
+			);
+			expect(publishMessage).not.toHaveBeenCalled();
+		});
+
+		it("throws AgxInvalidInputError from streamRequest too", async () => {
+			const transport = peerTransport(cardWith({ skills: [invoiceSkill] }));
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			await expect(
+				alice.streamRequest(
+					BOB,
+					"invoice.review",
+					{ amount: "hello" },
+					{ validate: true },
+				),
+			).rejects.toBeInstanceOf(AgxInvalidInputError);
+			expect(publishMessage).not.toHaveBeenCalled();
+		});
+
+		it("sends without checking when the peer has no card", async () => {
+			await expectSentUnchecked(null);
+		});
+
+		it("sends without checking when the card has no typed skills or carries only a metadata warning", async () => {
+			await expectSentUnchecked(cardWith({}));
+			await expectSentUnchecked(
+				cardWith({
+					typedMetadataWarnings: [
+						{ code: "invalid_typed_metadata", message: "ignored" },
+					],
+				}),
+			);
+		});
+
+		it("sends without checking when the peer skill has no input schema", async () => {
+			await expectSentUnchecked(
+				cardWith({
+					skills: [{ id: "invoice.review", description: "Review an invoice" }],
+				}),
+			);
+		});
+
+		it("sends without checking when the peer skill schema is invalid", async () => {
+			await expectSentUnchecked(
+				cardWith({
+					skills: [{ ...invoiceSkill, inputSchema: { pattern: "x" } }],
+				}),
+			);
+		});
+
+		it("sends without checking when the card lookup fails", async () => {
+			await expectSentUnchecked(new Error("no relay answered"));
+		});
+
+		it("still checks a valid skill when another skill on the card was dropped", async () => {
+			const transport = peerTransport(
+				cardWith({
+					skills: [invoiceSkill],
+					typedMetadataWarnings: [
+						{ code: "invalid_typed_skill", message: "skills.1 dropped" },
+					],
+				}),
+			);
+			const alice = new AgxClient({ transport });
+			await expect(
+				alice.request(
+					BOB,
+					"invoice.review",
+					{ amount: "hello" },
+					{ validate: true },
+				),
+			).rejects.toBeInstanceOf(AgxInvalidInputError);
+		});
+
+		it("a peer's invalid_input result rejects with AgxTaskFailedError", async () => {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			bob.handle("invoice.review", () => ({ approved: true }), {
+				description: "Review an invoice",
+				inputSchema: invoiceSkill.inputSchema,
+			});
+
+			const pending = alice.request(BOB, "invoice.review", { amount: "hello" });
+			pending.catch(() => undefined);
+			await bob.pump();
+			await alice.pump();
+			const error = await pending.catch((caught: unknown) => caught);
+			expect(error).toBeInstanceOf(AgxTaskFailedError);
+			expect(error).not.toBeInstanceOf(AgxInvalidInputError);
+		});
 	});
 
 	describe("streamRequest preflight", () => {
@@ -897,6 +1061,21 @@ describe("AgxClient task request/response", () => {
 				BOB,
 				"invoice.review",
 				{ amount: 5 },
+				{ validate: true, timeoutMs: 20 },
+			);
+			expect(publishMessage).toHaveBeenCalledTimes(1);
+			await expect(stream.result).rejects.toThrow(/timed out/);
+		});
+
+		it("accepts a payload whose undefined member the wire drops", async () => {
+			const transport = typedPeerTransport();
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			const stream = await alice.streamRequest(
+				BOB,
+				"invoice.review",
+				{ amount: 5, note: undefined },
 				{ validate: true, timeoutMs: 20 },
 			);
 			expect(publishMessage).toHaveBeenCalledTimes(1);
@@ -988,6 +1167,165 @@ describe("AgxClient task request/response", () => {
 		await alice.pump();
 		await expect(pending).rejects.toThrow("invalid_output");
 		expect(handler).toHaveBeenCalledTimes(1);
+	});
+
+	describe("validates the JSON a task value becomes on the wire", () => {
+		async function runTyped(
+			handler: () => unknown,
+			outputSchema: Record<string, unknown>,
+		): Promise<unknown> {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			bob.handle("invoice.review", handler, {
+				description: "Review an invoice",
+				outputSchema,
+			});
+			const pending = alice.request(BOB, "invoice.review", {});
+			pending.catch(() => undefined);
+			await bob.pump();
+			await alice.pump();
+			return pending;
+		}
+
+		it("completes when the handler result has an undefined member", async () => {
+			await expect(
+				runTyped(() => ({ approved: true, note: undefined }), {
+					type: "object",
+					required: ["approved"],
+					properties: {
+						approved: { type: "boolean" },
+						note: { type: "string" },
+					},
+					additionalProperties: false,
+				}),
+			).resolves.toEqual({ approved: true });
+		});
+
+		it("completes when the handler returns a Date that encodes to a string", async () => {
+			await expect(
+				runTyped(() => new Date(0), { type: "string" }),
+			).resolves.toBe("1970-01-01T00:00:00.000Z");
+		});
+
+		it("completes when the handler returns a class instance", async () => {
+			class Row {
+				id = 1;
+			}
+			await expect(
+				runTyped(() => new Row(), { type: "object", required: ["id"] }),
+			).resolves.toEqual({ id: 1 });
+		});
+
+		it("completes a void handler against an empty output schema", async () => {
+			await expect(
+				runTyped(() => {
+					return;
+				}, {}),
+			).resolves.toBeUndefined();
+		});
+
+		it("returns invalid_output for a void handler when the schema needs an object", async () => {
+			await expect(
+				runTyped(() => undefined, { type: "object" }),
+			).rejects.toThrow("invalid_output");
+		});
+
+		it("sends the output that was checked, not a second encoding of it", async () => {
+			// A toJSON that answers differently on each call: the first answer
+			// passes the schema, a later one would not.
+			let calls = 0;
+			const output = {
+				toJSON: () => (calls++ === 0 ? { approved: true } : { approved: "no" }),
+			};
+			await expect(
+				runTyped(() => output, {
+					type: "object",
+					required: ["approved"],
+					properties: { approved: { type: "boolean" } },
+				}),
+			).resolves.toEqual({ approved: true });
+		});
+
+		it("preflight sends the input that was checked, not a second encoding of it", async () => {
+			const transport: AgxTransport = {
+				...bus.transport(ALICE),
+				resolvePeer: vi.fn(async () => ({
+					relays: [],
+					card: {
+						displayName: "Billing",
+						capabilities: ["invoice.review"],
+						nip05: null,
+						skills: [{
+							id: "invoice.review",
+							description: "Review an invoice",
+							inputSchema: {
+								type: "object",
+								required: ["a"],
+								properties: { a: { type: "number" } },
+							},
+						}],
+					},
+				})),
+			};
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+			const received = vi.fn((task: { payload: unknown }) => task.payload);
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			bob.handle("invoice.review", received);
+			let calls = 0;
+			const input = {
+				toJSON: () => (calls++ === 0 ? { a: 1 } : { a: "one" }),
+			};
+
+			const pending = alice.request(BOB, "invoice.review", input, {
+				validate: true,
+			});
+			await vi.waitFor(() => expect(publishMessage).toHaveBeenCalled());
+			await bob.pump();
+			await alice.pump();
+			await expect(pending).resolves.toEqual({ a: 1 });
+		});
+
+		it("preflight accepts a payload whose undefined member the wire drops", async () => {
+			const transport: AgxTransport = {
+				...bus.transport(ALICE),
+				resolvePeer: vi.fn(async () => ({
+					relays: [],
+					card: {
+						displayName: "Billing",
+						capabilities: ["invoice.review"],
+						nip05: null,
+						skills: [{
+							id: "invoice.review",
+							description: "Review an invoice",
+							inputSchema: {
+								type: "object",
+								properties: { a: { type: "number" } },
+								additionalProperties: false,
+							},
+						}],
+					},
+				})),
+			};
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+
+			const pending = alice.request(
+				BOB,
+				"invoice.review",
+				{ a: 1, b: undefined },
+				{ validate: true, timeoutMs: 20 },
+			);
+			await expect(pending).rejects.toThrow(/timed out/);
+			// The request, then the cancel sent when it timed out.
+			expect(publishMessage).toHaveBeenCalled();
+		});
 	});
 
 	it("does not expose schema validation to a denied requester", async () => {
@@ -1193,6 +1531,146 @@ describe("AgxClient task request/response", () => {
 				inputSchema: { $ref: "https://example.com/schema" },
 			}),
 		).toThrow(/unsupported schema keyword/);
+	});
+
+	it.each([
+		["a wildcard ID", "invoice.*", { description: "Review an invoice" }],
+		[
+			"17 tags",
+			"invoice.review",
+			{
+				description: "Review an invoice",
+				tags: Array.from({ length: 17 }, (_, i) => `t${i}`),
+			},
+		],
+		["an empty description", "invoice.review", { description: "" }],
+	])("refuses a contract the card would refuse: %s", (_name, capability, contract) => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		bob.handle("other.task", () => null);
+		expect(() => bob.handle(capability, () => null, contract)).toThrow(
+			/AGX handler/,
+		);
+		expect(bob.capabilities()).toEqual(["other.task"]);
+	});
+
+	it("refuses an unknown contract field at registration", () => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		const contract = {
+			description: "Review an invoice",
+			inputschema: { type: "object" },
+		} as unknown as AgxTaskContract;
+		expect(() => bob.handle("invoice.review", () => null, contract)).toThrow(
+			/AGX handler.*inputschema/,
+		);
+		expect(bob.capabilities()).toEqual([]);
+	});
+
+	it("keeps the registered contract when the caller mutates it later", async () => {
+		const advertise = vi.fn(async () => ({ ok: true }));
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const bob = new AgxClient({
+			transport: { ...bus.transport(BOB), advertise },
+			authorize: "accept-all",
+		});
+		const amount: Record<string, unknown> = { type: "number" };
+		const inputSchema: Record<string, unknown> = {
+			type: "object",
+			required: ["a"],
+			properties: { a: amount },
+		};
+		bob.handle("invoice.review", () => "ok", {
+			description: "Review an invoice",
+			inputSchema,
+		});
+		inputSchema.required = [42];
+		// Two levels down, below the copy the schema parser makes anyway.
+		amount.type = "string";
+
+		const pending = alice.request(BOB, "invoice.review", { a: 1 });
+		await bob.pump();
+		await alice.pump();
+		await expect(pending).resolves.toBe("ok");
+
+		await bob.start({ pollIntervalMs: 0 });
+		expect(advertise).toHaveBeenCalledWith(
+			["invoice.review"],
+			expect.objectContaining({
+				skills: [{
+					id: "invoice.review",
+					description: "Review an invoice",
+					inputSchema: {
+						type: "object",
+						required: ["a"],
+						properties: { a: { type: "number" } },
+					},
+				}],
+			}),
+		);
+	});
+
+	it("refuses a contract that would push typed metadata over the card limit", async () => {
+		const advertise = vi.fn(async () => ({ ok: true }));
+		const bob = new AgxClient({
+			transport: { ...bus.transport(BOB), advertise },
+		});
+		// About 11.6 KiB each once escaped inside the event: two fit in 32 KiB,
+		// a third does not.
+		const big = {
+			description: "Review an invoice",
+			inputSchema: { const: '"'.repeat(2_900) },
+		};
+		bob.handle("invoice.a", () => null, big);
+		bob.handle("invoice.b", () => null, big);
+		expect(() => bob.handle("invoice.c", () => null, big)).toThrow(
+			/AGX handler invoice\.c.*32768/,
+		);
+		expect(bob.capabilities()).toEqual(["invoice.a", "invoice.b"]);
+
+		// Replacing a contract counts the new one instead of the old one.
+		bob.handle("invoice.b", () => null, big);
+		bob.handle("invoice.b", () => null, { description: "Smaller" });
+		bob.handle("invoice.c", () => null, big);
+
+		await bob.start({ pollIntervalMs: 0 });
+		const skills = (
+			advertise.mock.calls[0] as unknown as [string[], { skills: { id: string }[] }]
+		)[1].skills;
+		expect(skills.map((skill) => skill.id)).toEqual([
+			"invoice.a",
+			"invoice.b",
+			"invoice.c",
+		]);
+	});
+
+	it("refuses a 65th typed contract", () => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		for (let index = 0; index < 64; index += 1) {
+			bob.handle(`task.${index}`, () => null, { description: "A task" });
+		}
+		expect(() =>
+			bob.handle("task.64", () => null, { description: "A task" }),
+		).toThrow(/AGX handler task\.64.*64/);
+		bob.handle("task.untyped", () => null);
+		expect(bob.capabilities()).toHaveLength(65);
+		expect(bob.capabilities()).not.toContain("task.64");
+	});
+
+	it("registers a contract whose schemas carry annotations", () => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		expect(() =>
+			bob.handle("invoice.review", () => null, {
+				description: "Review an invoice",
+				inputSchema: {
+					$schema: "https://json-schema.org/draft/2020-12/schema",
+					title: "Invoice",
+					description: "An invoice to review",
+					type: "object",
+					properties: {
+						amount: { type: "number", default: 0, examples: [10] },
+					},
+				},
+			}),
+		).not.toThrow();
 	});
 
 	it("advertises typed contracts without changing legacy capability keys", async () => {
@@ -1904,6 +2382,52 @@ describe("AgxClient task request/response", () => {
 		// The generic message is used; the internal detail (db-host, user) is absent.
 		await expect(p2).rejects.toThrow("handler failed");
 		await expect(p2).rejects.not.toThrow(/db-host/);
+	});
+
+	describe("a public error message longer than the 2000-character result limit", () => {
+		/** Run one request whose handler throws `AgxPublicError(message)` and return
+		 * what the requester's promise settled with. The short timeout turns a
+		 * dropped result into a fast, clearly-labelled failure instead of a hang. */
+		async function failureMessage(message: string): Promise<string> {
+			const alice = new AgxClient({ transport: bus.transport(ALICE) });
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			bob.handle("long", () => {
+				throw new AgxPublicError(message);
+			});
+			const pending = alice.request(BOB, "long", {}, { timeoutMs: 200 });
+			await bob.pump();
+			await alice.pump();
+			const error = await pending.then(
+				() => new Error("request unexpectedly completed"),
+				(e: unknown) => e as Error,
+			);
+			return error.message;
+		}
+
+		it("delivers the first 2000 characters instead of letting the requester time out", async () => {
+			const got = await failureMessage("x".repeat(2001));
+			expect(got).toBe("x".repeat(2000));
+		});
+
+		it("sends a message of exactly 2000 characters unchanged", async () => {
+			const message = `${"a".repeat(1999)}b`;
+			expect(await failureMessage(message)).toBe(message);
+		});
+
+		it("does not cut a surrogate pair in half", async () => {
+			// "😀" is two UTF-16 units. A cut at 2000 would leave only its first half.
+			const got = await failureMessage(`${"a".repeat(1999)}😀`);
+			expect(got).toBe("a".repeat(1999));
+		});
+
+		it("keeps a surrogate pair that fits whole", async () => {
+			const message = `${"a".repeat(1998)}😀`;
+			expect(message).toHaveLength(2000);
+			expect(await failureMessage(message)).toBe(message);
+		});
 	});
 
 	it("drops a future-dated event so an attacker cannot freeze the inbox (cursor poisoning)", async () => {

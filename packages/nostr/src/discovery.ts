@@ -8,6 +8,7 @@ import type { AgxSigner } from "./signer";
 import { assertPublicUrl } from "./ssrf";
 import {
 	type AgentCardExtension,
+	type AgentCardMetadataWarning,
 	type AgentSkill,
 	parseAgentCardMetadata,
 } from "./typed-card";
@@ -52,8 +53,7 @@ export interface AgentCard {
 	extensions?: AgentCardExtension[];
 }
 
-/** Build an Agent Card object for the given identity/metadata. */
-export function buildCard(params: {
+type BuildCardParams = {
 	org: string;
 	pubkey: string;
 	nip05?: string | null;
@@ -63,30 +63,45 @@ export function buildCard(params: {
 	encryption?: string[];
 	skills?: AgentSkill[];
 	extensions?: AgentCardExtension[];
-}): AgentCard {
+};
+
+/** Build an Agent Card object for the given identity/metadata. Typed metadata
+ * the card rules refuse is left off (see {@link buildCardWithWarnings}); the
+ * legacy fields are always published. */
+export function buildCard(params: BuildCardParams): AgentCard {
+	return buildCardWithWarnings(params).card;
+}
+
+/** {@link buildCard}, plus why any typed metadata was left off. An invalid
+ * skill is dropped rather than stopping the card, so the legacy capabilities
+ * stay discoverable. */
+export function buildCardWithWarnings(params: BuildCardParams): {
+	card: AgentCard;
+	warnings: AgentCardMetadataWarning[];
+} {
 	const declaredExtensions = new Set(
 		(params.extensions ?? []).map((extension) => extension.uri),
 	);
 	const typed = parseAgentCardMetadata(params, declaredExtensions);
-	if (typed.warning) {
-		throw new Error(typed.warning.message);
-	}
 	const hasTypedMetadata =
-		params.skills !== undefined || params.extensions !== undefined;
+		typed.skills !== undefined || typed.extensions !== undefined;
 	return {
-		v: 1,
-		org: params.org,
-		npub: toNpub(params.pubkey),
-		nip05: params.nip05 ?? null,
-		relays: params.relays,
-		capabilities: params.capabilities,
-		payloadTypes: params.payloadTypes,
-		encryption: params.encryption ?? ["nip44"],
-		version: hasTypedMetadata ? TYPED_CARD_VERSION : CARD_VERSION,
-		...(typed.skills === undefined ? {} : { skills: typed.skills }),
-		...(typed.extensions === undefined
-			? {}
-			: { extensions: typed.extensions }),
+		card: {
+			v: 1,
+			org: params.org,
+			npub: toNpub(params.pubkey),
+			nip05: params.nip05 ?? null,
+			relays: params.relays,
+			capabilities: params.capabilities,
+			payloadTypes: params.payloadTypes,
+			encryption: params.encryption ?? ["nip44"],
+			version: hasTypedMetadata ? TYPED_CARD_VERSION : CARD_VERSION,
+			...(typed.skills === undefined ? {} : { skills: typed.skills }),
+			...(typed.extensions === undefined
+				? {}
+				: { extensions: typed.extensions }),
+		},
+		warnings: typed.warnings ?? [],
 	};
 }
 
@@ -239,9 +254,9 @@ function parsePeerCard(latest: Event | undefined): PeerCard | null {
 		...(typed.extensions === undefined
 			? {}
 			: { extensions: typed.extensions }),
-		...(typed.warning === undefined
+		...(typed.warnings === undefined
 			? {}
-			: { typedMetadataWarning: typed.warning }),
+			: { typedMetadataWarnings: typed.warnings }),
 	};
 }
 

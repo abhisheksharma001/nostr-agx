@@ -8,8 +8,9 @@
  * result). The Nostr binding lives in `@nostr-agx/nostr`.
  */
 
-export const AGX_CORE_VERSION = "0.5.0";
+export const AGX_CORE_VERSION = "0.6.0";
 
+export * from "./agent-card";
 export * from "./auto-reply-guard";
 export * from "./capability";
 export * from "./client";

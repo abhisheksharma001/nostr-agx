@@ -119,7 +119,7 @@ describe("agx card typed skills over a real local relay", () => {
 		expect(output.signatureValid).toBe(true);
 		expect(output.card.version).toBe("1.1.0");
 		expect(output.selectedSkill).toEqual(typedSkill);
-		expect(output.typedMetadata.warning).toBeUndefined();
+		expect(output.typedMetadata.warnings).toBeUndefined();
 
 		const human = await agx(
 			"card",
@@ -177,7 +177,9 @@ describe("agx card typed skills over a real local relay", () => {
 		expect(run.code, run.stderr).toBe(0);
 		const output = lastJson(run.stdout);
 		expect(output.card.capabilities).toEqual(["invoice.review"]);
-		expect(output.typedMetadata.warning.code).toBe("invalid_typed_metadata");
+		expect(
+			output.typedMetadata.warnings.map((w: { code: string }) => w.code),
+		).toEqual(["invalid_typed_skill"]);
 		expect(output.typedMetadata.skills).toBeUndefined();
 
 		const selected = await agx(
@@ -188,6 +190,79 @@ describe("agx card typed skills over a real local relay", () => {
 		);
 		expect(selected.code).toBe(6);
 		expect(selected.stderr).toContain("duplicate skill ID");
+	}, 30_000);
+
+	it("does not print control characters from a card", async () => {
+		const evil = "\u001b[31mEVIL\u009b";
+		const publisher = generateKeypair();
+		const card = buildCard({
+			org: `Org ${evil}`,
+			pubkey: publisher.publicKey,
+			relays: [relayUrl],
+			capabilities: ["invoice.review"],
+			payloadTypes: ["application/json"],
+			skills: [
+				{
+					...typedSkill,
+					description: `Review ${evil}`,
+					tags: [`tag ${evil}`],
+					inputSchema: { ...typedSkill.inputSchema, title: `Title ${evil}` },
+				},
+			],
+			extensions: [{ uri: `agx.ext.${evil}`, required: false }],
+		});
+		expect(card.skills).toHaveLength(1);
+		expect(card.extensions).toHaveLength(1);
+		await publishCard(card, publisher.secretKey);
+
+		for (const args of [[], ["--skill", "invoice.review"]]) {
+			const run = await agx("card", toNpub(publisher.publicKey), ...args);
+			expect(run.code, run.stderr).toBe(0);
+			expect(run.stdout).not.toContain("\u001b[31mEVIL");
+			expect(run.stdout).not.toContain("\u009b");
+			expect(run.stdout).toContain("\uFFFD[31mEVIL");
+		}
+	}, 30_000);
+
+	it("does not print control characters from a skill ID or a warning", async () => {
+		const evil = "\u001b[31mEVIL\u009b";
+		const evilId = `invoice.${evil}`;
+		const withSkill = generateKeypair();
+		await publishCard(
+			buildCard({
+				org: "Skill agent",
+				pubkey: withSkill.publicKey,
+				relays: [relayUrl],
+				capabilities: [evilId],
+				payloadTypes: ["application/json"],
+				skills: [{ ...typedSkill, id: evilId }],
+			}),
+			withSkill.secretKey,
+		);
+		const withWarning = generateKeypair();
+		await publishCard(
+			buildCard({
+				org: "Extension agent",
+				pubkey: withWarning.publicKey,
+				relays: [relayUrl],
+				capabilities: ["invoice.review"],
+				payloadTypes: ["application/json"],
+				skills: [typedSkill],
+				extensions: [{ uri: `agx.unknown.${evil}`, required: true }],
+			}),
+			withWarning.secretKey,
+		);
+
+		for (const args of [
+			[toNpub(withSkill.publicKey), "--skill", evilId],
+			[toNpub(withWarning.publicKey)],
+		]) {
+			const run = await agx("card", ...args);
+			expect(run.code, run.stderr).toBe(0);
+			expect(run.stdout).not.toContain("\u001b[31mEVIL");
+			expect(run.stdout).not.toContain("\u009b");
+			expect(run.stdout).toContain("\uFFFD[31mEVIL");
+		}
 	}, 30_000);
 
 	it("falls back to legacy capabilities for an unknown required extension", async () => {
@@ -206,9 +281,9 @@ describe("agx card typed skills over a real local relay", () => {
 		expect(run.code, run.stderr).toBe(0);
 		const output = lastJson(run.stdout);
 		expect(output.card.capabilities).toEqual(["invoice.review"]);
-		expect(output.typedMetadata.warning.code).toBe(
-			"unsupported_required_extension",
-		);
+		expect(
+			output.typedMetadata.warnings.map((w: { code: string }) => w.code),
+		).toEqual(["unsupported_required_extension"]);
 		expect(output.typedMetadata.skills).toBeUndefined();
 		expect(output.typedMetadata.extensions).toEqual([
 			{ uri: "agx.unknown.v1", required: true },

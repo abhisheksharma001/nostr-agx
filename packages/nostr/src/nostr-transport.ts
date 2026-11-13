@@ -18,8 +18,7 @@ import {
 import type { Event } from "nostr-tools";
 import { normalizePubkey } from "./address";
 import {
-	type AgentCard,
-	buildCard,
+	buildCardWithWarnings,
 	resolveNip05,
 	resolvePeerCard,
 	resolvePeerRelays,
@@ -795,7 +794,7 @@ export class NostrTransport implements AgxTransport {
 		skills?: AgentSkill[];
 		extensions?: AgentCardExtension[];
 	}): Promise<{ ok: boolean }> {
-		const card: AgentCard = buildCard({
+		const { card, warnings } = buildCardWithWarnings({
 			org: params.org,
 			pubkey: this.publicKey,
 			nip05: params.nip05 ?? null,
@@ -806,6 +805,12 @@ export class NostrTransport implements AgxTransport {
 			skills: params.skills,
 			extensions: params.extensions,
 		});
+		for (const warning of warnings) {
+			this.logger?.warn?.("AGX: typed metadata left off the Agent Card", {
+				code: warning.code,
+				message: warning.message,
+			});
+		}
 		const now = nowSec();
 		const a = await publishToRelays(
 			this.relays,
