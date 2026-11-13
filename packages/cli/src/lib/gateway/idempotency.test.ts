@@ -340,6 +340,31 @@ async function waitForStatus(
 }
 
 describe("TaskOperationStore background tasks", () => {
+	it("logs an onSettled that throws instead of rejecting", async () => {
+		const lines: string[] = [];
+		const store = new TaskOperationStore("test", { log: (line) => lines.push(line) });
+		const unhandled = vi.fn();
+		process.on("unhandledRejection", unhandled);
+		try {
+			const accepted = store.submit(
+				"credential-a",
+				null,
+				{ background: true },
+				async () => ({ status: "completed" }),
+				() => {
+					throw new Error("listener broke");
+				},
+			);
+			await vi.waitFor(() => expect(lines.some((line) => line.includes("listener broke"))).toBe(true));
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(unhandled).not.toHaveBeenCalled();
+			expect(store.get("credential-a", accepted.id as string)).toMatchObject({ status: "completed" });
+		} finally {
+			process.off("unhandledRejection", unhandled);
+			store.close();
+		}
+	});
+
 	it("calls onSettled with the public id after the outcome is stored", async () => {
 		const store = new TaskOperationStore("test");
 		const seen: Array<[string, unknown]> = [];

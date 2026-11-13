@@ -270,5 +270,17 @@ describe("serveTaskEvents", () => {
 		expect(reconnect.status()).toBe(200);
 		expect(reconnect.body()).toContain("event: completed");
 	});
+
+	it("ends the stream instead of throwing when the store fails during a push", () => {
+		const { stream, open, getView, slots } = setup();
+		const response = open();
+		getView.mockImplementation(() => {
+			throw new Error("store unreadable");
+		});
+		stream.push(working(1));
+		stream.markTerminal();
+		expect(response.ended()).toBe(true);
+		expect(slots.open()).toBe(0);
+	});
 });
 
