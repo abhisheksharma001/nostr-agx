@@ -306,7 +306,17 @@ agx inbox --unread              # every unread message, not only the new ones
 agx inbox --thread <contextId>  # one conversation
 agx inbox --summary             # counts only, no peer text: safe for a hook
 agx inbox --json                # agx.inbox/1; --summary --json is agx.inbox.summary/1
+agx wait --timeout 600          # return existing unread mail, or wait for one activity batch
+agx wait --summary --json       # counts only: safe for a background-task notification
 ```
+
+`wait` uses the same inbox trust, history and cursor rules. It first returns unread allowed
+messages. Otherwise it polls until an allowed message, held activity or receipt arrives, then
+prints one batch and exits. A quiet healthy timeout exits `0` with `timedOut: true` in JSON;
+`--timeout` defaults to 600 seconds and accepts 1–3600. If no relay answered during the whole
+wait, it exits `5`. It never replies or runs tasks. After displaying a thread, mark it read with
+`agx thread <contextId> --mark-read` before starting the next wait; unread mail intentionally
+returns again until acknowledged.
 
 Messages from allowed senders are printed in the same `RECV` format as `serve`. Anyone
 else is **held**: you get a `HOLD` line with their address, and their text is kept, not
@@ -322,7 +332,7 @@ agx thread <contextId> [--mark-read]
 ```
 
 At most 50 messages are kept per held sender and 20 new unknown senders per hour.
-`inbox` exits `5` when no relay answered and `1` when `serve` or another `inbox` holds the
+`inbox` exits `5` when no relay answered and `1` when `serve`, `wait` or another `inbox` holds the
 profile lock (`held` decisions and `thread --mark-read` queue instead of failing).
 A profile directory shared by several hosts needs roughly synchronised clocks: another host takes
 the lock over when its heartbeat is 60 s old by that host's clock, and the process that lost it exits. The `--json` output is described in [`docs/cli-json.md`](../../docs/cli-json.md).
@@ -375,6 +385,7 @@ together, and `send` works while `serve` holds the lock. It clears every inherit
 it can never reach a real relay or API. It is not part of `test:unit`.
 
 | `agx serve [--handler <file>]` | run as an agent; `--handler` binds a real runtime; `--no-reply` / `--no-tasks` stop automatic answers; `--allowed-only` / `--full-ids` shape what inbound messages print |
+| `agx wait [--timeout <seconds>] [--summary]` | wait for one inbox activity batch, print it and exit; never replies or runs tasks |
 
 ## Behind an HTTP API: `agx gateway`
 

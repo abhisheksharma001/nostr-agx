@@ -99,7 +99,7 @@ function lostLock(): never {
 }
 
 /**
- * Per-profile single-writer lock shared by `agx serve`, `agx inbox` and `agx ui`.
+ * Per-profile single-writer lock shared by `agx serve`, `agx inbox`, `agx wait` and `agx ui`.
  * `onLost` runs if another process ends up holding the lock; the default exits.
  */
 export function acquireLock(
@@ -130,7 +130,7 @@ export function acquireLock(
 			const holder = existsSync(path) ? readRecord(path) : null;
 			if (holder !== null && heldByLiveOwner(path, holder)) {
 				throw new LockHeldError(
-					`Another \`agx serve\`, \`agx inbox\` or \`agx ui\` is already running for profile "${profile}" (pid ${holder.pid}${holder.host && holder.host !== hostname() ? ` on ${holder.host}` : ""}).`,
+					`Another \`agx serve\`, \`agx inbox\`, \`agx wait\` or \`agx ui\` is already running for profile "${profile}" (pid ${holder.pid}${holder.host && holder.host !== hostname() ? ` on ${holder.host}` : ""}).`,
 					{
 						exitCode,
 						remediation:

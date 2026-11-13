@@ -16,6 +16,7 @@ import { json, say, warn } from "../lib/output.js";
 import { profileDir } from "../lib/paths.js";
 import { toHexPubkey } from "../lib/peer.js";
 import { probeRelay } from "../lib/relay-probe.js";
+import { runtime } from "../lib/runtime.js";
 import { FileSeenStore, loadState, updateState } from "../lib/state.js";
 import { MessageStore } from "../lib/store/message-store.js";
 import { createTransport, makeLogger } from "../lib/transport.js";
@@ -46,14 +47,44 @@ function parseWait(value: string | undefined): number {
 	return seconds;
 }
 
+export type InboxRunControl =
+	| { activity: false }
+	| { activity: true; timeoutSec: number; signal?: AbortSignal };
+
+const WAIT_POLL_INTERVAL_MS = 1000;
+
+async function pumpWithin(client: AgxClient, timeoutMs: number, signal?: AbortSignal) {
+	let timer: NodeJS.Timeout | undefined;
+	let onAbort: (() => void) | undefined;
+	try {
+		return await Promise.race([
+			client.pump().then((result) => ({ result, interrupted: false })),
+			new Promise<{ result: null; interrupted: boolean }>((done) => {
+				timer = setTimeout(() => done({ result: null, interrupted: false }), Math.max(1, timeoutMs));
+				if (signal) {
+					onAbort = () => done({ result: null, interrupted: true });
+					if (signal.aborted) {
+						onAbort();
+					} else {
+						signal.addEventListener("abort", onAbort, { once: true });
+					}
+				}
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+		if (signal && onAbort) {
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
+}
+
 /**
- * One pull of the inbox, then exit. It applies the trust rules of
- * `agx serve --allowed-only --no-reply --no-tasks`: it publishes nothing,
- * answers nothing and runs no task. Allowed senders go into the history; anyone
- * else is held with their text for `agx held`.
+ * Pull the inbox without replying or running tasks. `activity` changes only the
+ * loop: persist every poll and stop after activity, timeout or interruption.
  */
-export async function inboxCommand(options: InboxOptions): Promise<void> {
-	const waitSec = parseWait(options.wait);
+export async function runInboxCommand(options: InboxOptions, control: InboxRunControl = { activity: false }): Promise<void> {
+	const waitSec = control.activity ? control.timeoutSec : parseWait(options.wait);
 	const profileName = resolveProfileName(options.profile);
 	const profile = effectiveProfile(profileName);
 	const identity = loadIdentity(profileName);
@@ -62,6 +93,24 @@ export async function inboxCommand(options: InboxOptions): Promise<void> {
 
 	try {
 		const allowed = new Set(profile.allow.map((entry) => toHexPubkey(entry, "allowlist entry")));
+		let warnedAllowlist = false;
+		function refreshAllowed(): void {
+			let current: string[];
+			try {
+				current = effectiveProfile(profileName).allow.map((entry) => toHexPubkey(entry, "allowlist entry"));
+			} catch (error) {
+				if (!warnedAllowlist) {
+					warnedAllowlist = true;
+					warn(`The allowlist could not be re-read, so the last good one stays in use: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				return;
+			}
+			warnedAllowlist = false;
+			allowed.clear();
+			for (const entry of current) {
+				allowed.add(entry);
+			}
+		}
 		const state = loadState(profileName);
 		const store = new MessageStore(profileDir(profileName), undefined, { claimSpool: true });
 		const seen = new FileSeenStore(profileName);
@@ -78,7 +127,6 @@ export async function inboxCommand(options: InboxOptions): Promise<void> {
 			logger,
 			identity: { org: profile.org ?? undefined, nip05: profile.nip05 },
 			startCursor: state.cursor,
-			// No capability is served, so nothing is authorized to run.
 			authorize: () => false,
 			onMessage: (msg) => {
 				collector.onMessage(msg);
@@ -93,41 +141,113 @@ export async function inboxCommand(options: InboxOptions): Promise<void> {
 
 		let truncated = false;
 		let cursor = state.cursor;
-		let deadline: NodeJS.Timeout | undefined;
-		try {
-			const outcome = await Promise.race([
-				client.pump().then((result) => ({ result })),
-				new Promise<{ result: null }>((done) => {
-					deadline = setTimeout(() => done({ result: null }), waitSec * 1000);
-				}),
-			]);
-			if (outcome.result?.complete) {
-				cursor = outcome.result.cursor;
-			} else {
-				truncated = true;
-			}
-		} finally {
-			// A pending timer would keep the process alive for the whole --wait after the pull is done.
-			clearTimeout(deadline);
-			await client.stop().catch(() => undefined);
-		}
-
-		// History first: a crash before the cursor moves re-delivers, and the store dedupes by event id.
-		store.flush();
-		seen.flush();
-		updateState(profileName, { cursor, lastPumpAt: new Date().toISOString() });
-
-		const relays = await Promise.all(
+		let timedOut: boolean | undefined = control.activity ? false : undefined;
+		let interrupted = false;
+		let everRelayAnswered = false;
+		let relays: InboxReport["relays"] = [];
+		const probe = async () => Promise.all(
 			profile.relays.map(async (url) => ({
 				url,
 				status: (await probeRelay(url, PROBE_TIMEOUT_MS)) ? ("ok" as const) : ("unreachable" as const),
 			})),
 		);
 
+		try {
+			if (control.activity) {
+				const deadline = Date.now() + waitSec * 1000;
+				while (true) {
+					const remaining = deadline - Date.now();
+					if (remaining <= 0) {
+						timedOut = true;
+						break;
+					}
+					store.absorbSpool();
+					refreshAllowed();
+					try {
+						const outcome = await pumpWithin(client, remaining, control.signal);
+						if (outcome.interrupted) {
+							interrupted = true;
+							break;
+						}
+						if (outcome.result === null) {
+							truncated = true;
+							timedOut = true;
+							break;
+						}
+						if (outcome.result.complete) {
+							everRelayAnswered = true;
+							cursor = outcome.result.cursor;
+							truncated = false;
+						} else {
+							truncated = true;
+						}
+					} catch (error) {
+						if (control.signal?.aborted) {
+							interrupted = true;
+							break;
+						}
+						truncated = true;
+						warn(`poll failed: ${error instanceof Error ? error.message : String(error)}`);
+					}
+
+					seen.holdFor(cursor);
+					store.flush();
+					seen.flush();
+					updateState(profileName, { cursor, lastPumpAt: new Date().toISOString() });
+					relays = await probe();
+					everRelayAnswered ||= relays.some((relay) => relay.status === "ok");
+					const unread = store.listMessages({ direction: "in", unreadOnly: true }).length;
+					if (unread > 0 || collector.messages.length > 0 || collector.heldNow.size > 0 || collector.receipts.length > 0) {
+						break;
+					}
+					if (Date.now() >= deadline) {
+						timedOut = true;
+						break;
+					}
+					try {
+						await runtime().sleep(Math.min(WAIT_POLL_INTERVAL_MS, deadline - Date.now()), control.signal);
+					} catch (error) {
+						if (control.signal?.aborted) {
+							interrupted = true;
+							break;
+						}
+						throw error;
+					}
+				}
+			} else {
+				const outcome = await pumpWithin(client, waitSec * 1000);
+				if (outcome.result?.complete) {
+					cursor = outcome.result.cursor;
+				} else {
+					truncated = true;
+				}
+			}
+		} finally {
+			await client.stop().catch(() => undefined);
+		}
+
+		if (!interrupted) {
+			if (control.activity) {
+				seen.holdFor(cursor);
+			}
+			store.flush();
+			seen.flush();
+			updateState(profileName, { cursor, lastPumpAt: new Date().toISOString() });
+		}
+		if (!control.activity) {
+			relays = await probe();
+		}
+
+		if (interrupted) {
+			process.exitCode = EXIT.interrupted;
+			return;
+		}
+
+		const unreadCount = store.listMessages({ direction: "in", unreadOnly: true }).length;
 		let messages = collector.messages;
 		if (options.thread) {
 			messages = store.getThread(options.thread);
-		} else if (options.unread) {
+		} else if (options.unread || (control.activity && unreadCount > 0)) {
 			messages = store.listMessages({ direction: "in", unreadOnly: true });
 		}
 		const report: InboxReport = {
@@ -139,8 +259,8 @@ export async function inboxCommand(options: InboxOptions): Promise<void> {
 			held: heldList(store),
 			receipts: collector.receipts,
 			truncated,
+			...(timedOut === undefined ? {} : { timedOut }),
 		};
-		const unreadCount = store.listMessages({ direction: "in", unreadOnly: true }).length;
 		const summary = summarize(report, collector.messages.length, unreadCount);
 
 		if (options.summary) {
@@ -158,10 +278,14 @@ export async function inboxCommand(options: InboxOptions): Promise<void> {
 			}
 		}
 
-		if (summary.relays.ok === 0) {
+		if (control.activity ? !everRelayAnswered : summary.relays.ok === 0) {
 			process.exitCode = EXIT.network;
 		}
 	} finally {
 		releaseLock();
 	}
+}
+
+export async function inboxCommand(options: InboxOptions): Promise<void> {
+	return runInboxCommand(options);
 }
