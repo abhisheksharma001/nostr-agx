@@ -163,6 +163,16 @@ describe("collector", () => {
 			expect(c.receipts).toHaveLength(1);
 		});
 
+		it("matches the exact id of a message we sent, not a prefix, another case or an extended id", () => {
+			store.addOutbound({ id: "Out3abcdef", peer: MALLORY, subject: null, contextId: "ctx-1", text: "yo", at: NOW.toISOString(), deliveryStatus: "sent" });
+			const c = collector();
+			for (const ref of ["Out3", "out3abcdef", "Out3abcdefXYZ"]) {
+				expect(c.onReceipt(receiptFor(MALLORY_HEX, ref))).toBe(false);
+			}
+			expect(c.receipts).toHaveLength(0);
+			expect(c.onReceipt(receiptFor(MALLORY_HEX, "Out3abcdef"))).toBe(true);
+		});
+
 		it("counts a receipt from an allowed sender even when it matches no stored message", () => {
 			const c = collector();
 			expect(c.onReceipt(receiptFor(BOB_HEX, "unknown"))).toBe(true);
