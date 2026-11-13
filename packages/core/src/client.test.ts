@@ -912,7 +912,7 @@ describe("AgxClient task request/response", () => {
 			await bob.pump();
 			await bob.tasksSettled();
 
-			const wire = (bus.inbox.get(ALICE) ?? []).flatMap((message) => {
+			const wire = (bus.inbox.get(ALICE) ?? []).flatMap((message): Record<string, unknown>[] => {
 				const envelope = parseTaskEnvelope(message.text);
 				if (envelope?.t !== "res") return [];
 				if (envelope.status === "working") {
