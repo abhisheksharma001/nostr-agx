@@ -492,10 +492,8 @@ export class AgxClient {
 			if (!registered.contract) {
 				return [];
 			}
-			const features = [
-				...new Set([...(registered.contract.features ?? []), "working"]),
-			];
-			return [{ ...registered.contract, features, id }];
+			// Features are the contract author's to declare; add none here.
+			return [{ ...registered.contract, id }];
 		});
 	}
 
