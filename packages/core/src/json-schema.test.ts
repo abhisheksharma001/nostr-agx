@@ -146,6 +146,17 @@ describe("AGX JSON Schema validation", () => {
 		expect(validateAgxJsonSchema(schema)).toBeNull();
 	});
 
+	it("checks number bounds whatever the type, and only the keywords", () => {
+		// A string passes a number bound untouched, but the rule reads keywords only.
+		expect(
+			validateAgxJsonSchema({ type: "string", exclusiveMinimum: 4, maximum: 4 }),
+		).toMatch(/exclusiveMinimum.*maximum/);
+		// No integer lies between 4 and 5, but the rule does not look at the type.
+		expect(
+			validateAgxJsonSchema({ type: "integer", exclusiveMinimum: 4, exclusiveMaximum: 5 }),
+		).toBeNull();
+	});
+
 	it("rejects impossible bounds on a nested node", () => {
 		const impossible = { exclusiveMinimum: 4, maximum: 4 };
 		expect(
