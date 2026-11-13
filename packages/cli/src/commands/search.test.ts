@@ -36,7 +36,7 @@ describe("agx search --json", () => {
 		const listing = {
 			id: "l_1",
 			slug: "evil",
-			displayName: "Evil\u009b2JBot Inc",
+			displayName: "Evil\u009b2JBot\u2028Inc",
 			handle: null,
 			npub: "npub1".padEnd(63, "q"),
 			verified: false,
@@ -53,7 +53,7 @@ describe("agx search --json", () => {
 		const run = await agx("search", "--json");
 
 		expect(run.code).toBe(0);
-		for (const ch of ["\u007f", "\u0085", "\u009b", " ", " "]) {
+		for (const ch of ["\u007f", "\u0085", "\u009b", "\u2028", "\u2029"]) {
 			expect(run.stdout).not.toContain(ch);
 		}
 		const [doc] = jsonDocuments(run.stdout) as [{ listings: unknown[]; total: number }];
