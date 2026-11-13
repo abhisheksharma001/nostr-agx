@@ -868,9 +868,10 @@ describe("AgxClient task request/response", () => {
 
 		it("drops a working report made while waiting for input, then reports again after the answer", async () => {
 			const bob = new AgxClient({ transport: bus.transport(BOB), authorize: "accept-all" });
+			let reportWhileWaiting: () => Promise<void> = async () => undefined;
 			bob.handle("ask", async (_task, ctx) => {
 				const answer = ctx.requestInput({ prompt: "Continue?" });
-				void ctx.report("waiting");
+				reportWhileWaiting = () => ctx.report("waiting");
 				const input = await answer;
 				await ctx.report("resumed");
 				return input;
@@ -896,8 +897,8 @@ describe("AgxClient task request/response", () => {
 			if (prompt?.t !== "res" || prompt.status !== "input-required") {
 				throw new Error("expected input-required");
 			}
-			// Let the dropped report settle before the answer arrives.
-			await new Promise((resolve) => setTimeout(resolve, 20));
+			// The prompt is out and the handler is waiting for the answer.
+			await reportWhileWaiting();
 			await bus.transport(ALICE).publishMessage(BOB, {
 				text: encodeTaskEnvelope({
 					t: "input",
