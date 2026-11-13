@@ -232,5 +232,17 @@ describe("serveTaskEvents", () => {
 		expect(vi.getTimerCount()).toBe(0);
 		expect(response.body()).not.toMatch(/event: (completed|failed)/);
 	});
+
+	it("clears its timers and its slot when the client disconnects", () => {
+		const { stream, open, slots } = setup();
+		const response = open();
+		expect(vi.getTimerCount()).toBe(2);
+		expect(slots.open(CREDENTIAL)).toBe(1);
+		response.close();
+		expect(vi.getTimerCount()).toBe(0);
+		expect(slots.open(CREDENTIAL)).toBe(0);
+		stream.push(working(1));
+		expect(response.body()).not.toContain("event: working");
+	});
 });
 

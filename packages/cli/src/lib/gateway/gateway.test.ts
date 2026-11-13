@@ -955,6 +955,45 @@ describe("agx gateway: outbound", () => {
 		}
 	}, 45_000);
 
+	it("closes an open task stream on shutdown", async () => {
+		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
+		let release: () => void = () => undefined;
+		let started = false;
+		reviewer.client.handle("invoice.background.shutdown", async () => {
+			started = true;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { ok: true };
+		});
+		try {
+			const accepted = await api("/v1/tasks", {
+				method: "POST",
+				body: JSON.stringify({ peer: reviewer.npub, capability: "invoice.background.shutdown", background: true, timeoutSec: 20 }),
+			});
+			const id = (await json(accepted)).id as string;
+			await waitForPeer(() => started, reviewer.client);
+			const open = await api(`/v1/tasks/${id}/events`);
+			expect(open.status).toBe(200);
+			const live = sseConnection(open);
+			await live.readUntil(reviewer.client, (text) => text.includes(": connected"));
+
+			const closing = Date.now();
+			await gateway.close();
+			expect(Date.now() - closing).toBeLessThan(9_000);
+			// Shutdown closes the socket: the reader sees the stream end or the
+			// connection terminate, never a stream left hanging.
+			const outcome = await live.readToEnd(reviewer.client).then(
+				() => "ended",
+				(error: Error) => error.message,
+			);
+			expect(["ended", "terminated"]).toContain(outcome);
+		} finally {
+			release();
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 45_000);
+
 	it("restores completed and failed background outcomes after restart", async () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 4 });
 		let completedRuns = 0;
