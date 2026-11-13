@@ -224,6 +224,47 @@ describe("agx card typed skills over a real local relay", () => {
 		}
 	}, 30_000);
 
+	it("does not print control characters from a skill ID or a warning", async () => {
+		const evil = "\u001b[31mEVIL\u009b";
+		const evilId = `invoice.${evil}`;
+		const withSkill = generateKeypair();
+		await publishCard(
+			buildCard({
+				org: "Skill agent",
+				pubkey: withSkill.publicKey,
+				relays: [relayUrl],
+				capabilities: [evilId],
+				payloadTypes: ["application/json"],
+				skills: [{ ...typedSkill, id: evilId }],
+			}),
+			withSkill.secretKey,
+		);
+		const withWarning = generateKeypair();
+		await publishCard(
+			buildCard({
+				org: "Extension agent",
+				pubkey: withWarning.publicKey,
+				relays: [relayUrl],
+				capabilities: ["invoice.review"],
+				payloadTypes: ["application/json"],
+				skills: [typedSkill],
+				extensions: [{ uri: `agx.unknown.${evil}`, required: true }],
+			}),
+			withWarning.secretKey,
+		);
+
+		for (const args of [
+			[toNpub(withSkill.publicKey), "--skill", evilId],
+			[toNpub(withWarning.publicKey)],
+		]) {
+			const run = await agx("card", ...args);
+			expect(run.code, run.stderr).toBe(0);
+			expect(run.stdout).not.toContain("\u001b[31mEVIL");
+			expect(run.stdout).not.toContain("\u009b");
+			expect(run.stdout).toContain("\uFFFD[31mEVIL");
+		}
+	}, 30_000);
+
 	it("falls back to legacy capabilities for an unknown required extension", async () => {
 		const publisher = generateKeypair();
 		const card = buildCard({
