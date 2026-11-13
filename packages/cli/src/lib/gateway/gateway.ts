@@ -33,6 +33,7 @@ import { type OperationDeps, parseTaskRequest, readCard, runTaskRequest, sendMes
 import { Requester } from "./requester.js";
 import { KeyedSlots } from "./slots.js";
 import { TaskEventStream, TaskEventStreams } from "./task-events.js";
+import { serveTaskEvents } from "./task-events-http.js";
 import {
 	assertWebhookHost,
 	parseSubscriptionInput,
@@ -129,90 +130,6 @@ function nowSec(): number {
 function bearer(req: IncomingMessage): string {
 	const header = req.headers.authorization ?? "";
 	return header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-}
-
-function serveTaskEvents(
-	req: IncomingMessage,
-	res: ServerResponse,
-	id: string,
-	taskOperations: TaskOperationStore,
-	taskEvents: TaskEventStreams,
-	heartbeatMs: number,
-): void {
-	const initial = taskOperations.get(bearer(req), id);
-	if (initial === null) {
-		throw new ApiError(404, "not_found", "No background task with that ID for this credential");
-	}
-	const stream = taskEvents.ensure(id);
-	const refreshTerminal = () => {
-		const view = taskOperations.get(bearer(req), id);
-		if (view !== null) {
-			stream.complete(view);
-		}
-	};
-	refreshTerminal();
-	const parsedLastId = Number(req.headers["last-event-id"] ?? 0);
-	let lastId = Number.isSafeInteger(parsedLastId) && parsedLastId > 0 ? parsedLastId : 0;
-	let finished = false;
-	let terminalTimer: ReturnType<typeof setInterval> | undefined;
-	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-	const cleanup = () => {
-		if (finished) {
-			return;
-		}
-		finished = true;
-		if (terminalTimer) {
-			clearInterval(terminalTimer);
-		}
-		if (heartbeatTimer) {
-			clearInterval(heartbeatTimer);
-		}
-	};
-	const finish = () => {
-		cleanup();
-		res.end();
-	};
-	const writeEvents = () => {
-		const writeEvent = (event: ReturnType<TaskEventStream["after"]>[number]) => {
-			res.write(`id: ${event.id}\nevent: ${event.event}\ndata: ${JSON.stringify({ taskId: id, ...event.data })}\n\n`);
-			lastId = event.id;
-		};
-		const events = stream.after(lastId);
-		for (const event of events) {
-			writeEvent(event);
-		}
-		const terminal = stream.terminalEvent();
-		if (terminal && !events.some((event) => event.id === terminal.id)) {
-			writeEvent(terminal);
-		}
-		if (terminal) {
-			finish();
-		}
-	};
-
-	res.writeHead(200, {
-		"content-type": "text/event-stream; charset=utf-8",
-		"cache-control": "no-store, no-transform",
-		"connection": "keep-alive",
-		"x-accel-buffering": "no",
-		"x-content-type-options": "nosniff",
-	});
-	res.write("retry: 1000\n: connected\n\n");
-	res.on("close", cleanup);
-	terminalTimer = setInterval(() => {
-		try {
-			refreshTerminal();
-			writeEvents();
-		} catch {
-			finish();
-		}
-	}, 250);
-	heartbeatTimer = setInterval(() => {
-		if (!res.writableEnded) {
-			res.write(": heartbeat\n\n");
-		}
-	}, heartbeatMs);
-	writeEvents();
 }
 
 export async function startGateway(options: GatewayOptions): Promise<RunningGateway> {
@@ -594,6 +511,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 					req,
 					res,
 					decodeURIComponent(eventRoute[1]),
+					bearer(req),
 					taskOperations,
 					taskEvents,
 					Math.max(10, options.taskSseHeartbeatMs ?? 15_000),
