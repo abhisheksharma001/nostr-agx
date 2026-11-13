@@ -4,7 +4,7 @@
 
 ### Changed
 
-- `agx gateway`: a task request that is still in flight when the gateway stops, and has no idempotency key or background handle, now gets a task cancel sent to the remote agent. Before, the gateway's requester client was never stopped, so that agent kept running a task nobody was waiting for. Requests with a key or a handle are kept and picked up again after the restart, with no cancel.
+- `agx gateway`: a task request that is still in flight when the gateway stops, and has no idempotency key or background handle, now gets a task cancel sent to the remote agent. Before, the gateway's requester client was never stopped, so that agent kept running a task nobody was waiting for. Requests with a key or a handle get no cancel: after the restart they are picked up again, or answered with `409 result_unknown` if the gateway stopped while still sending them.
 
 ## 0.6.0
 
