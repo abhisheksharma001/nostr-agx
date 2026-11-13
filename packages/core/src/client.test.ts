@@ -672,6 +672,65 @@ describe("AgxClient task request/response", () => {
 			).rejects.toThrow("invalid_output");
 		});
 
+		it("sends the output that was checked, not a second encoding of it", async () => {
+			// A toJSON that answers differently on each call: the first answer
+			// passes the schema, a later one would not.
+			let calls = 0;
+			const output = {
+				toJSON: () => (calls++ === 0 ? { approved: true } : { approved: "no" }),
+			};
+			await expect(
+				runTyped(() => output, {
+					type: "object",
+					required: ["approved"],
+					properties: { approved: { type: "boolean" } },
+				}),
+			).resolves.toEqual({ approved: true });
+		});
+
+		it("preflight sends the input that was checked, not a second encoding of it", async () => {
+			const transport: AgxTransport = {
+				...bus.transport(ALICE),
+				resolvePeer: vi.fn(async () => ({
+					relays: [],
+					card: {
+						displayName: "Billing",
+						capabilities: ["invoice.review"],
+						nip05: null,
+						skills: [{
+							id: "invoice.review",
+							description: "Review an invoice",
+							inputSchema: {
+								type: "object",
+								required: ["a"],
+								properties: { a: { type: "number" } },
+							},
+						}],
+					},
+				})),
+			};
+			const publishMessage = vi.spyOn(transport, "publishMessage");
+			const alice = new AgxClient({ transport });
+			const received = vi.fn((task: { payload: unknown }) => task.payload);
+			const bob = new AgxClient({
+				transport: bus.transport(BOB),
+				authorize: "accept-all",
+			});
+			bob.handle("invoice.review", received);
+			let calls = 0;
+			const input = {
+				toJSON: () => (calls++ === 0 ? { a: 1 } : { a: "one" }),
+			};
+
+			const pending = alice.request(BOB, "invoice.review", input, {
+				validate: true,
+			});
+			await vi.waitFor(() => expect(publishMessage).toHaveBeenCalled());
+			await bob.pump();
+			await alice.pump();
+			await expect(pending).resolves.toEqual({ a: 1 });
+		});
+
 		it("preflight accepts a payload whose undefined member the wire drops", async () => {
 			const transport: AgxTransport = {
 				...bus.transport(ALICE),
