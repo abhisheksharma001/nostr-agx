@@ -773,7 +773,11 @@ export class AgxClient {
 				// a caller-chosen storage key may have replaced the record of a request
 				// that was sent, so for that a restart stop leaves the record in place.
 				if (!pending.preservePending || durableKey === taskId) {
-					await Promise.resolve(this.pendingRequests.remove(durableKey)).catch(() => undefined);
+					try {
+						await this.pendingRequests.remove(durableKey);
+					} catch {
+						// A store that cannot remove it leaves the record; the stop is still reported.
+					}
 				}
 				return { taskId, result };
 			}
