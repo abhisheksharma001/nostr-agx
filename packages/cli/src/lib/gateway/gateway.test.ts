@@ -15,7 +15,7 @@ import { profileDir, seenPath } from "../paths.js";
 import { MESSAGES_FILE } from "../store/message-store.js";
 import { AGX_CLI_VERSION } from "../version.js";
 import { type RunningGateway, startGateway } from "./gateway.js";
-import { createGatewayKey } from "./keys.js";
+import { createGatewayKey, revokeGatewayKey } from "./keys.js";
 
 /**
  * `agx gateway` end to end: a real gateway on a sandboxed profile, the CLI's
@@ -910,6 +910,46 @@ describe("agx gateway: outbound", () => {
 			if (id !== undefined) {
 				await settledBackgroundTask(id, reviewer.client);
 			}
+			await gateway.close();
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 45_000);
+
+	it("ends an open task stream when its API key is revoked, and refuses the reconnect", async () => {
+		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
+		let release: () => void = () => undefined;
+		let started = false;
+		reviewer.client.handle("invoice.background.revoked", async () => {
+			started = true;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { ok: true };
+		});
+		await gateway.close();
+		gateway = await startGateway({ ...gatewayOptions(), taskSseRevalidateMs: 50 });
+		const revocable = createGatewayKey(profile, "sse-revoked");
+		let id: string | undefined;
+		try {
+			const accepted = await api("/v1/tasks", {
+				method: "POST",
+				key: revocable.key,
+				body: JSON.stringify({ peer: reviewer.npub, capability: "invoice.background.revoked", background: true, timeoutSec: 20 }),
+			});
+			expect(accepted.status).toBe(202);
+			id = (await json(accepted)).id as string;
+			await waitForPeer(() => started, reviewer.client);
+			const open = await api(`/v1/tasks/${id}/events`, { key: revocable.key });
+			expect(open.status).toBe(200);
+			const live = sseConnection(open);
+			await live.readUntil(reviewer.client, (text) => text.includes(": connected"));
+
+			expect(revokeGatewayKey(profile, revocable.id)).toBe(true);
+			const ended = await live.readToEnd(reviewer.client);
+			expect(ended).not.toContain("event: completed");
+			expect((await api(`/v1/tasks/${id}/events`, { key: revocable.key })).status).toBe(401);
+		} finally {
+			release();
 			await gateway.close();
 			gateway = await startGateway(gatewayOptions());
 		}

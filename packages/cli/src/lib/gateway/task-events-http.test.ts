@@ -210,5 +210,27 @@ describe("serveTaskEvents", () => {
 			response.close();
 		}
 	});
+
+	it("ends the stream when the key is revoked", () => {
+		let authorized = true;
+		const { open, slots } = setup({ authorized: () => authorized });
+		const response = open();
+		authorized = false;
+		vi.advanceTimersByTime(5_000);
+		expect(response.ended()).toBe(true);
+		expect(vi.getTimerCount()).toBe(0);
+		expect(slots.open()).toBe(0);
+		expect(response.body()).not.toContain("event: completed");
+	});
+
+	it("ends the stream when the task record is gone", () => {
+		const { open, setView } = setup();
+		const response = open();
+		setView(null);
+		vi.advanceTimersByTime(5_000);
+		expect(response.ended()).toBe(true);
+		expect(vi.getTimerCount()).toBe(0);
+		expect(response.body()).not.toMatch(/event: (completed|failed)/);
+	});
 });
 
