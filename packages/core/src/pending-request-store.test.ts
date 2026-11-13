@@ -511,6 +511,41 @@ describe("durable pending-request races", () => {
 		await second.stop();
 	});
 
+	it("keeps the record of a request sent earlier under a reused storage key when a restart stop lands during the first save", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		const first = durableClient(bus, store);
+		await restore(first);
+		const earlier = first.request(BOB, "math.add", {}, { timeoutMs: 0, storageKey: "k" });
+		earlier.catch(() => undefined);
+		await waitFor(() => bus.requests(BOB).length === 1);
+		const sentTaskId = bus.requests(BOB)[0];
+		await first.stop({ preservePending: true });
+		await expect(earlier).rejects.toThrow("AGX client stopped");
+
+		const second = durableClient(bus, store);
+		const [recovered] = await restore(second);
+		recovered.result.catch(() => undefined);
+		const firstSave = gate();
+		store.saveGate = firstSave.promise;
+		const savesBefore = store.saves.length;
+		const reused = second.request(BOB, "math.add", {}, { timeoutMs: 0, storageKey: "k" });
+		reused.catch(() => undefined);
+		await waitFor(() => store.saves.length === savesBefore + 1);
+		const stopping = second.stop({ preservePending: true });
+		await settle();
+		firstSave.open();
+		await stopping;
+		await settle();
+		expect(bus.requests(BOB)).toEqual([sentTaskId]);
+
+		// The earlier request was sent: its key must still come back, so a caller
+		// that retries with it is told the outcome is unknown instead of sending twice.
+		const third = durableClient(bus, store);
+		expect((await restore(third)).map((entry) => entry.key)).toEqual(["k"]);
+		await third.stop();
+	});
+
 	it("does not write back or cancel a request whose result beats the publish acknowledgement", async () => {
 		const bus = new MemoryTransport(ALICE);
 		const gated = gatedTransport(bus);
