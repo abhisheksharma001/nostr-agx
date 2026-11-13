@@ -931,6 +931,36 @@ describe("AgxClient task request/response", () => {
 			await bob.stop();
 		});
 
+		it("reports again after an input request that could not be sent", async () => {
+			const bob = new AgxClient({ transport: bus.transport(BOB), authorize: "accept-all" });
+			let failure: unknown;
+			bob.handle("ask", async (_task, ctx) => {
+				try {
+					// A BigInt cannot be encoded, so the input requirement is never sent.
+					await ctx.requestInput({ prompt: "Continue?", inputSchema: { const: 10n } as never });
+				} catch (error) {
+					failure = error;
+				}
+				await ctx.report("carrying on");
+				return "done";
+			});
+			pushTaskEnvelope(BOB, ALICE, {
+				t: "req",
+				taskId: "input-unsent",
+				capability: "ask",
+				payload: {},
+				supportsInput: true,
+				supportsWorking: true,
+				timeoutMs: 0,
+			});
+			await bob.pump();
+			await bob.tasksSettled();
+
+			expect(failure).toBeDefined();
+			expect(statusesSentTo(ALICE, "input-unsent")).toEqual(["working", "completed"]);
+			await bob.stop();
+		});
+
 		it("drops a working report made while the input request is being sent", async () => {
 			const base = bus.transport(BOB);
 			// A slow relay for input-required, so a report lands mid-publish.
