@@ -846,6 +846,66 @@ describe("agx gateway: outbound", () => {
 		expect(runs).toBe(1);
 	}, 45_000);
 
+	it("refuses a third task stream for one credential until one closes", async () => {
+		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
+		let release: () => void = () => undefined;
+		let started = false;
+		reviewer.client.handle("invoice.background.capped", async () => {
+			started = true;
+			await new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			return { ok: true };
+		});
+		await gateway.close();
+		gateway = await startGateway({ ...gatewayOptions(), maxTaskStreamsPerCredential: 2 });
+		const aborts: AbortController[] = [];
+		const stream = (id: string) => {
+			const abort = new AbortController();
+			aborts.push(abort);
+			return api(`/v1/tasks/${id}/events`, { signal: abort.signal });
+		};
+		let id: string | undefined;
+		try {
+			const accepted = await api("/v1/tasks", {
+				method: "POST",
+				body: JSON.stringify({ peer: reviewer.npub, capability: "invoice.background.capped", background: true, timeoutSec: 20 }),
+			});
+			expect(accepted.status).toBe(202);
+			id = (await json(accepted)).id as string;
+			await waitForPeer(() => started, reviewer.client);
+			expect((await stream(id)).status).toBe(200);
+			expect((await stream(id)).status).toBe(200);
+			const refused = await stream(id);
+			expect(refused.status).toBe(429);
+			expect(refused.headers.get("retry-after")).toBe("5");
+			expect(await json(refused)).toMatchObject({ error: { code: "too_many_streams" } });
+
+			// The server frees the slot once it sees the client go.
+			aborts[0].abort();
+			let reopened = 0;
+			for (let attempt = 0; attempt < 50 && reopened !== 200; attempt += 1) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				const res = await stream(id);
+				reopened = res.status;
+				if (reopened !== 200) {
+					await res.body?.cancel();
+				}
+			}
+			expect(reopened).toBe(200);
+		} finally {
+			for (const abort of aborts) {
+				abort.abort();
+			}
+			release();
+			if (id !== undefined) {
+				await settledBackgroundTask(id, reviewer.client);
+			}
+			await gateway.close();
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 45_000);
+
 	it("restores completed and failed background outcomes after restart", async () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 4 });
 		let completedRuns = 0;
