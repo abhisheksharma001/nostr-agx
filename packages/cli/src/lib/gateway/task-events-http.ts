@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ApiError } from "./http.js";
 import type { TaskOperationStore } from "./idempotency.js";
-import type { TaskEventStream, TaskEventStreams } from "./task-events.js";
+import type { TaskEventStreams } from "./task-events.js";
 
 export function serveTaskEvents(
 	req: IncomingMessage,
@@ -17,10 +17,11 @@ export function serveTaskEvents(
 		throw new ApiError(404, "not_found", "No background task with that ID for this credential");
 	}
 	const stream = taskEvents.ensure(id);
+	const isTerminalView = (view: Record<string, unknown> | null) =>
+		view?.status === "completed" || view?.status === "failed";
 	const refreshTerminal = () => {
-		const view = taskOperations.get(credential, id);
-		if (view !== null) {
-			stream.complete(view);
+		if (isTerminalView(taskOperations.get(credential, id))) {
+			stream.markTerminal();
 		}
 	};
 	refreshTerminal();
@@ -45,22 +46,24 @@ export function serveTaskEvents(
 		cleanup();
 		res.end();
 	};
+	const writeEvent = (eventId: number, event: string, data: Record<string, unknown>) => {
+		res.write(`id: ${eventId}\nevent: ${event}\ndata: ${JSON.stringify({ taskId: id, ...data })}\n\n`);
+		lastId = eventId;
+	};
 	const writeEvents = () => {
-		const writeEvent = (event: ReturnType<TaskEventStream["after"]>[number]) => {
-			res.write(`id: ${event.id}\nevent: ${event.event}\ndata: ${JSON.stringify({ taskId: id, ...event.data })}\n\n`);
-			lastId = event.id;
-		};
-		const events = stream.after(lastId);
-		for (const event of events) {
-			writeEvent(event);
+		for (const event of stream.after(lastId)) {
+			writeEvent(event.id, event.event, event.data);
 		}
-		const terminal = stream.terminalEvent();
-		if (terminal && !events.some((event) => event.id === terminal.id)) {
-			writeEvent(terminal);
+		const terminalId = stream.getTerminalId();
+		if (terminalId === undefined) {
+			return;
 		}
-		if (terminal) {
-			finish();
+		// The store owns the outcome; the stream keeps only the terminal ID.
+		const view = taskOperations.get(credential, id);
+		if (isTerminalView(view)) {
+			writeEvent(terminalId, view?.status as string, view as Record<string, unknown>);
 		}
+		finish();
 	};
 
 	res.writeHead(200, {

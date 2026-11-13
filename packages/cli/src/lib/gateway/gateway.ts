@@ -32,7 +32,7 @@ import { verifyGatewayKey } from "./keys.js";
 import { type OperationDeps, parseTaskRequest, readCard, runTaskRequest, sendMessage } from "./operations.js";
 import { Requester } from "./requester.js";
 import { KeyedSlots } from "./slots.js";
-import { TaskEventStream, TaskEventStreams } from "./task-events.js";
+import { TaskEventStreams } from "./task-events.js";
 import { serveTaskEvents } from "./task-events-http.js";
 import {
 	assertWebhookHost,
@@ -562,7 +562,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 					const taskRequest = parseTaskRequest(body);
 					const operation = () => runTaskRequest(deps, taskRequest);
 					if (taskRequest.background) {
-						const pendingEvents = new TaskEventStream();
+						const pendingEvents = taskEvents.create();
 						const backgroundOperation = () => runTaskRequest(
 							deps,
 							taskRequest,
