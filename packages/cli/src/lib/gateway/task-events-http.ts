@@ -87,11 +87,20 @@ export function serveTaskEvents(
 		throw new ApiError(404, "not_found", "No background task with that ID for this credential");
 	}
 	const stream = streams.ensure(id);
-	if (isTerminalView(initial)) {
-		stream.markTerminal();
-	}
 	const parsedLastId = Number(req.headers["last-event-id"] ?? 0);
 	let lastId = Number.isSafeInteger(parsedLastId) && parsedLastId > 0 ? parsedLastId : 0;
+	if (isTerminalView(initial)) {
+		// A stream lost to a restart or eviction gets its terminal ID after the
+		// client's, so the client is never told it already has an event it missed.
+		stream.markTerminal(lastId + 1);
+	}
+	const knownTerminalId = stream.getTerminalId();
+	if (knownTerminalId !== undefined && lastId >= knownTerminalId) {
+		// Any non-200 answer stops a browser EventSource from reconnecting.
+		res.writeHead(204);
+		res.end();
+		return;
+	}
 	const slot = route.slots.tryAcquire(route.credential);
 	if (slot === "credential_full") {
 		res.setHeader("retry-after", "5");
