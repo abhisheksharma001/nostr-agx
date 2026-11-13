@@ -340,6 +340,38 @@ async function waitForStatus(
 }
 
 describe("TaskOperationStore background tasks", () => {
+	it("calls onSettled with the public id after the outcome is stored", async () => {
+		const store = new TaskOperationStore("test");
+		const seen: Array<[string, unknown]> = [];
+		const onSettled = (id: string) => {
+			seen.push([id, store.get("credential-a", id)?.status]);
+		};
+		const ok = store.submit(
+			"credential-a",
+			null,
+			{ background: true, n: 1 },
+			async () => ({ status: "completed" }),
+			onSettled,
+		);
+		const bad = store.submit(
+			"credential-a",
+			null,
+			{ background: true, n: 2 },
+			async () => {
+				throw new ApiError(502, "task_failed", "The peer failed");
+			},
+			onSettled,
+		);
+		await vi.waitFor(() => expect(seen).toHaveLength(2));
+		expect(seen).toEqual(
+			expect.arrayContaining([
+				[ok.id, "completed"],
+				[bad.id, "failed"],
+			]),
+		);
+		store.close();
+	});
+
 	it("returns a handle before completion and restores the result only for its credential", async () => {
 		const store = new TaskOperationStore("test");
 		let runs = 0;
