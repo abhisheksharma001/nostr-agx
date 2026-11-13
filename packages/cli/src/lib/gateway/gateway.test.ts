@@ -817,6 +817,15 @@ describe("agx gateway: outbound", () => {
 		expect(liveEnd.match(/event: completed/g)).toHaveLength(1);
 		expect(liveEnd.indexOf("event: completed")).toBeGreaterThan(liveEnd.indexOf("event: working"));
 		expect(liveEnd).toContain('"run":1');
+		// A browser EventSource reconnects after the server ends the stream; once it
+		// has the terminal event, 204 tells it to stop.
+		const terminalId = /id: (\d+)\nevent: completed/.exec(liveEnd)?.[1];
+		expect(terminalId).toBeDefined();
+		const done = await api(`/v1/tasks/${id}/events`, {
+			headers: { "last-event-id": String(terminalId) },
+		});
+		expect(done.status).toBe(204);
+		expect(await done.text()).toBe("");
 		const completed = await settledBackgroundTask(id, reviewer.client);
 		expect(completed).toMatchObject({ status: "completed", result: { output: { run: 1 } } });
 		const replayResponse = await api(`/v1/tasks/${id}/events`, {

@@ -170,4 +170,45 @@ describe("serveTaskEvents", () => {
 		expect(attempt().error).toMatchObject({ status: 404 });
 		expect(slots.open()).toBe(0);
 	});
+
+	it("answers 204 to a reconnect that already has the terminal event", () => {
+		const slots = new TaskStreamSlots({ perCredential: 1, total: 1 });
+		const { stream, open } = setup({ slots, view: { id: ID, status: "completed", result: { ok: true } } });
+		stream.push(working(1));
+		stream.push(working(2));
+		stream.markTerminal();
+
+		const done = open("3");
+		expect(done.status()).toBe(204);
+		expect(done.body()).toBe("");
+		expect(done.ended()).toBe(true);
+		expect(slots.open()).toBe(0);
+
+		const behind = open("2");
+		expect(behind.status()).toBe(200);
+		expect(behind.body()).toContain("id: 3\nevent: completed");
+		expect(behind.body()).not.toContain("event: working");
+	});
+
+	it("puts a lost stream's terminal event after the client's last ID", () => {
+		// After a restart the buffer is empty, but the client has seen IDs up to 7.
+		const { open } = setup({ view: { id: ID, status: "failed", error: { code: "task_failed" } } });
+		const first = open("7");
+		expect(first.status()).toBe(200);
+		expect(first.body()).toContain("id: 8\nevent: failed");
+		expect(open("8").status()).toBe(204);
+	});
+
+	it("treats a malformed Last-Event-ID as 0 and replays every buffered event", () => {
+		for (const header of ["abc", "-1", "1.5", "99999999999999999999"]) {
+			const { stream, open } = setup();
+			stream.push(working(1));
+			stream.push(working(2));
+			const response = open(header);
+			expect(response.body()).toContain("id: 1\nevent: working");
+			expect(response.body()).toContain("id: 2\nevent: working");
+			response.close();
+		}
+	});
 });
+
