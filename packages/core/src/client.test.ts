@@ -588,6 +588,90 @@ describe("AgxClient task request/response", () => {
 		await expect(pending).rejects.toThrow("AGX client stopped");
 	});
 
+	it("a slow onTaskStatus listener does not delay the request's own result", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const pending = alice.request(BOB, "long.task", {}, {
+			timeoutMs: 200,
+			onTaskStatus: () => new Promise((resolve) => setTimeout(resolve, 400)),
+		});
+		const request = outboundRequest();
+		pushTaskEnvelope(ALICE, BOB, {
+			t: "res",
+			taskId: request.taskId,
+			status: "working",
+			seq: 1,
+		});
+		pushTaskEnvelope(ALICE, BOB, {
+			t: "res",
+			taskId: request.taskId,
+			status: "completed",
+			output: "done",
+		});
+		await alice.pump();
+
+		await expect(pending).resolves.toBe("done");
+	});
+
+	it("calls onTaskStatus in seq order without awaiting it", async () => {
+		const alice = new AgxClient({ transport: bus.transport(ALICE) });
+		const seen: number[] = [];
+		const pending = alice.request(BOB, "long.task", {}, {
+			timeoutMs: 1_000,
+			onTaskStatus: (update) => {
+				seen.push(update.seq);
+				return new Promise<void>(() => undefined); // never settles
+			},
+		});
+		const request = outboundRequest();
+		for (const seq of [1, 2, 3]) {
+			pushTaskEnvelope(ALICE, BOB, {
+				t: "res",
+				taskId: request.taskId,
+				status: "working",
+				seq,
+			});
+		}
+		await expect(alice.pump()).resolves.toBeDefined();
+
+		expect(seen).toEqual([1, 2, 3]);
+		await alice.stop();
+		await expect(pending).rejects.toThrow("AGX client stopped");
+	});
+
+	it("logs a listener that throws synchronously and keeps dispatching", async () => {
+		const error = vi.fn();
+		const alice = new AgxClient({
+			transport: bus.transport(ALICE),
+			logger: { error },
+		});
+		const seen: number[] = [];
+		const pending = alice.request(BOB, "long.task", {}, {
+			timeoutMs: 1_000,
+			onTaskStatus: (update) => {
+				seen.push(update.seq);
+				if (update.seq === 1) throw new Error("listener threw");
+			},
+		});
+		const request = outboundRequest();
+		for (const seq of [1, 2]) {
+			pushTaskEnvelope(ALICE, BOB, {
+				t: "res",
+				taskId: request.taskId,
+				status: "working",
+				seq,
+			});
+		}
+		await expect(alice.pump()).resolves.toBeDefined();
+
+		expect(seen).toEqual([1, 2]);
+		expect(error).toHaveBeenCalledWith(
+			"AGX: task status listener failed",
+			expect.objectContaining({ seq: 1, error: expect.stringContaining("listener threw") }),
+		);
+		await alice.stop();
+		await expect(pending).rejects.toThrow("AGX client stopped");
+	});
+
 	describe("working updates are opt-in", () => {
 		const statusesSentTo = (peer: string, taskId?: string) =>
 			(bus.inbox.get(peer) ?? []).flatMap((message) => {
