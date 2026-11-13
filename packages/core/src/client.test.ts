@@ -1011,15 +1011,19 @@ describe("AgxClient task request/response", () => {
 			transport: { ...bus.transport(BOB), advertise },
 			authorize: "accept-all",
 		});
+		const amount: Record<string, unknown> = { type: "number" };
 		const inputSchema: Record<string, unknown> = {
 			type: "object",
 			required: ["a"],
+			properties: { a: amount },
 		};
 		bob.handle("invoice.review", () => "ok", {
 			description: "Review an invoice",
 			inputSchema,
 		});
 		inputSchema.required = [42];
+		// Two levels down, below the copy the schema parser makes anyway.
+		amount.type = "string";
 
 		const pending = alice.request(BOB, "invoice.review", { a: 1 });
 		await bob.pump();
@@ -1033,7 +1037,11 @@ describe("AgxClient task request/response", () => {
 				skills: [{
 					id: "invoice.review",
 					description: "Review an invoice",
-					inputSchema: { type: "object", required: ["a"] },
+					inputSchema: {
+						type: "object",
+						required: ["a"],
+						properties: { a: { type: "number" } },
+					},
 				}],
 			}),
 		);
