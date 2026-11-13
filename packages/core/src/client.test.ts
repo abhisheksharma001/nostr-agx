@@ -1692,10 +1692,58 @@ describe("AgxClient task request/response", () => {
 					id: "invoice.review",
 					description: "Review an invoice",
 					inputSchema: { type: "object" },
-					features: ["working"],
 				}],
 			}),
 		);
+	});
+
+	it("advertises a 16-feature contract with exactly its declared features", async () => {
+		const advertise = vi.fn(async () => ({ ok: true }));
+		const warn = vi.fn();
+		const bob = new AgxClient({
+			transport: { ...bus.transport(BOB), advertise },
+			logger: { warn },
+		});
+		const features = Array.from({ length: 16 }, (_, index) => `f${index + 1}`);
+		bob.handle("invoice.review", () => null, {
+			description: "Review an invoice",
+			features,
+		});
+
+		await bob.start({ pollIntervalMs: 0 });
+		expect(advertise).toHaveBeenCalledWith(
+			["invoice.review"],
+			expect.objectContaining({
+				skills: [{ id: "invoice.review", description: "Review an invoice", features }],
+			}),
+		);
+		expect(warn).not.toHaveBeenCalledWith("AGX: advertise failed", expect.anything());
+	});
+
+	it("advertises working only when the contract declares it", async () => {
+		const advertise = vi.fn(async () => ({ ok: true }));
+		const bob = new AgxClient({
+			transport: { ...bus.transport(BOB), advertise },
+		});
+		bob.handle("report.build", () => null, {
+			description: "Build a report",
+			features: ["working"],
+		});
+		bob.handle("invoice.review", () => null, {
+			description: "Review an invoice",
+		});
+
+		await bob.start({ pollIntervalMs: 0 });
+		const skills = (
+			advertise.mock.calls[0] as unknown as [string[], { skills: Record<string, unknown>[] }]
+		)[1].skills;
+		expect(skills[0]).toEqual({
+			id: "report.build",
+			description: "Build a report",
+			features: ["working"],
+		});
+		expect(skills[1]).toEqual({ id: "invoice.review", description: "Review an invoice" });
+		expect(skills[1]).not.toHaveProperty("features");
 	});
 
 	it("does not auto-reply to a task whose capability has no handler; routes it to onMessage", async () => {
