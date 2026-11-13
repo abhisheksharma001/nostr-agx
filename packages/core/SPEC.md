@@ -171,7 +171,7 @@ request normally. A responder **MUST NOT** send `working` after the task has fin
 the reference client stops accepting reports as soon as the handler returns or throws, and waits for any
 update already being published before it sends the terminal result. A responder **MUST NOT** send
 `working` while an `input-required` it sent is outstanding: from when it starts sending the input
-requirement until the matching input arrives or the task ends. Reports made in that window are dropped,
+requirement until the handler resumes with the matching input or the task ends. Reports made in that window are dropped,
 not queued, and use no `seq`. A `working` update already being published when input is requested is sent
 before the `input-required`. The message is handler-supplied
 public text, never raw reasoning or internal error details. A transport failure or oversized message

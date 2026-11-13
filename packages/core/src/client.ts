@@ -89,8 +89,8 @@ export type HandlerContext = {
 	requestInput(requirement: InputRequirement): Promise<unknown>;
 	/** Publish a best-effort public `working` update (at most 2000 characters; never
 	 * raw reasoning or internal error detail). Sends nothing unless the request
-	 * opted in with `supportsWorking`, nothing while an input request is
-	 * outstanding, and nothing once the task has finished or been canceled. A
+	 * opted in with `supportsWorking`, nothing from the moment an input request
+	 * starts sending until the handler resumes with the answer, and nothing once the task has finished or been canceled. A
 	 * failed or oversized publish is logged and dropped; it never fails the task. */
 	report(message?: string): Promise<void>;
 };

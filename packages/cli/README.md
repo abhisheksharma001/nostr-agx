@@ -508,7 +508,7 @@ reconnecting; some proxies alter or retry a 204, so let it through unchanged.
 
 Intermediate replay is bounded, in memory, and does not survive restart; the stored terminal view is
 authoritative and is always available without rerunning the task. The gateway keeps at most 128
-`working` events and 64 KiB per task, and 4 MiB across all tasks for up to 24 hours. Past that it drops
+`working` events and 64 KiB per task, and 4 MiB across at most 1,000 tasks for up to 24 hours. Past that it drops
 the oldest events of finished tasks first, so a running task keeps its live updates. The terminal
 event is read from the task store when it is sent, not kept in the event buffer.
 
