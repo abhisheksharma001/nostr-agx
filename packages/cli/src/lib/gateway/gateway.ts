@@ -88,6 +88,10 @@ export interface GatewayOptions {
 	taskSseHeartbeatMs?: number;
 	/** For tests: how often an open SSE stream rechecks its task. Default 5000. */
 	taskSseRevalidateMs?: number;
+	/** For tests: open SSE task streams per API key. Default 64. */
+	maxTaskStreamsPerCredential?: number;
+	/** For tests: open SSE task streams across the gateway. Default 256. */
+	maxTaskStreams?: number;
 }
 
 export interface RunningGateway {
@@ -174,7 +178,10 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			maxBackgroundInFlight: options.maxBackgroundTasksInFlight,
 		});
 		const taskEvents = new TaskEventStreams();
-		const taskStreamSlots = new TaskStreamSlots();
+		const taskStreamSlots = new TaskStreamSlots({
+			perCredential: options.maxTaskStreamsPerCredential,
+			total: options.maxTaskStreams,
+		});
 		const queue = new DeliveryQueue({
 			retryDelaysMs: options.deliveryRetryDelaysMs,
 			onFailure: (subscription, eventId, detail) =>

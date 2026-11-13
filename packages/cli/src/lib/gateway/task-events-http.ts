@@ -92,6 +92,19 @@ export function serveTaskEvents(
 	}
 	const parsedLastId = Number(req.headers["last-event-id"] ?? 0);
 	let lastId = Number.isSafeInteger(parsedLastId) && parsedLastId > 0 ? parsedLastId : 0;
+	const slot = route.slots.tryAcquire(route.credential);
+	if (slot === "credential_full") {
+		res.setHeader("retry-after", "5");
+		throw new ApiError(
+			429,
+			"too_many_streams",
+			"This API key has too many task event streams open",
+			"Close a stream you no longer read, then try again.",
+		);
+	}
+	if (slot === "gateway_full") {
+		throw new ApiError(503, "busy", "The gateway has too many task event streams open", "Try again shortly.");
+	}
 	let finished = false;
 	let unsubscribe: (() => void) | undefined;
 	let revalidateTimer: ReturnType<typeof setInterval> | undefined;
@@ -108,6 +121,7 @@ export function serveTaskEvents(
 			clearInterval(heartbeatTimer);
 		}
 		unsubscribe?.();
+		route.slots.release(route.credential);
 	};
 	const finish = () => {
 		cleanup();
