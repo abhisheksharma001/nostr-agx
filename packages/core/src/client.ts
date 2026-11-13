@@ -549,6 +549,9 @@ export class AgxClient {
 		opts?: {
 			timeoutMs?: number;
 			validate?: boolean;
+			/** Receives the responder's `working` updates, in `seq` order. It is
+			 * called without being awaited and never delays dispatch; a thrown
+			 * error or rejected promise is logged. */
 			onTaskStatus?: (update: TaskStatusUpdate) => void | Promise<void>;
 		},
 	): Promise<Output> {
@@ -1817,7 +1820,7 @@ export class AgxClient {
 			// Non-terminal progress: never settles the request, never touches its
 			// timer, and cannot cancel it (unlike input-required, which a plain
 			// request() cannot answer).
-			await this.receiveWorkingUpdate(p, env);
+			this.receiveWorkingUpdate(p, env);
 			return;
 		}
 
@@ -1842,10 +1845,7 @@ export class AgxClient {
 		}
 	}
 
-	private async receiveWorkingUpdate(
-		p: Pending,
-		env: TaskWorkingUpdate,
-	): Promise<void> {
+	private receiveWorkingUpdate(p: Pending, env: TaskWorkingUpdate): void {
 		if (env.seq <= p.lastStatusSeq) {
 			this.log.debug?.("AGX: dropping duplicate or older task status", {
 				taskId: env.taskId,
@@ -1858,19 +1858,26 @@ export class AgxClient {
 		// same update replay, and never lets the listener break the inbox.
 		p.lastStatusSeq = env.seq;
 		p.onUpdate?.(env);
-		try {
-			await p.onTaskStatus?.({
-				taskId: env.taskId,
-				status: env.status,
-				seq: env.seq,
-				...(env.message === undefined ? {} : { message: env.message }),
-			});
-		} catch (error) {
+		const failed = (error: unknown) =>
 			this.log.error?.("AGX: task status listener failed", {
 				taskId: env.taskId,
 				seq: env.seq,
 				error: String(error),
 			});
+		// Called in seq order but never awaited, so a slow listener cannot hold
+		// up dispatch of this or any other request's messages.
+		try {
+			const settled = p.onTaskStatus?.({
+				taskId: env.taskId,
+				status: env.status,
+				seq: env.seq,
+				...(env.message === undefined ? {} : { message: env.message }),
+			});
+			if (settled && typeof settled.then === "function") {
+				settled.then(undefined, failed);
+			}
+		} catch (error) {
+			failed(error);
 		}
 	}
 
