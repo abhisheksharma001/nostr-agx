@@ -388,6 +388,39 @@ describe("parseAgentCardMetadata", () => {
 		}
 	});
 
+	it("keeps a skill but drops an annotation nested deeper than a payload may be", () => {
+		let deep: unknown = 0;
+		for (let level = 0; level < 4000; level++) deep = [deep];
+		const parsed = parseAgentCardMetadata({
+			skills: [
+				skill({
+					inputSchema: {
+						type: "object",
+						description: "An invoice",
+						default: deep,
+						properties: {
+							amount: { type: "number", examples: deep, title: "Amount" },
+						},
+					},
+				}),
+			],
+		});
+		expect(parsed.warnings).toBeUndefined();
+		// Compare key lists, not values: printing a 4,000-deep diff overflows.
+		const schema = parsed.skills?.[0]?.inputSchema as {
+			properties: { amount: Record<string, unknown> };
+		};
+		expect(Object.keys(schema).sort()).toEqual([
+			"description",
+			"properties",
+			"type",
+		]);
+		expect(Object.keys(schema.properties.amount).sort()).toEqual([
+			"title",
+			"type",
+		]);
+	});
+
 	it.each(["$ref", "$id", "pattern", "format", "patternProperties"])(
 		"rejects unsupported schema keyword %s without fetching",
 		(keyword) => {
