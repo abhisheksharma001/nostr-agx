@@ -113,6 +113,60 @@ describe("AGX JSON Schema validation", () => {
 		expectInvalid({ pattern: ".*" }, "anything", /invalid schema/);
 	});
 
+	it.each([
+		[{ minimum: 5, maximum: 4 }, /minimum.*maximum/],
+		[{ exclusiveMinimum: 4, maximum: 4 }, /exclusiveMinimum.*maximum/],
+		[{ exclusiveMinimum: 5, maximum: 4 }, /exclusiveMinimum.*maximum/],
+		[{ minimum: 4, exclusiveMaximum: 4 }, /minimum.*exclusiveMaximum/],
+		[{ minimum: 5, exclusiveMaximum: 4 }, /minimum.*exclusiveMaximum/],
+		[{ exclusiveMinimum: 4, exclusiveMaximum: 4 }, /exclusiveMinimum.*exclusiveMaximum/],
+		[{ exclusiveMinimum: 5, exclusiveMaximum: 4 }, /exclusiveMinimum.*exclusiveMaximum/],
+		[{ minLength: 5, maxLength: 4 }, /minLength.*maxLength/],
+		[{ minItems: 5, maxItems: 4 }, /minItems.*maxItems/],
+		[{ minProperties: 5, maxProperties: 4 }, /minProperties.*maxProperties/],
+	])("rejects bounds that can never both hold: %j", (schema, message) => {
+		expect(validateAgxJsonSchema(schema)).toMatch(message);
+		expect(validateAgxJsonSchema({ type: "number", ...schema })).toMatch(message);
+	});
+
+	it.each([
+		{ minimum: 4, maximum: 4 },
+		{ minimum: 4, maximum: 5 },
+		{ exclusiveMinimum: 3, maximum: 4 },
+		{ minimum: 4, exclusiveMaximum: 5 },
+		{ exclusiveMinimum: 3, exclusiveMaximum: 4 },
+		{ exclusiveMinimum: 4, minimum: 4 },
+		{ exclusiveMaximum: 4, maximum: 4 },
+		{ exclusiveMinimum: 4 },
+		{ exclusiveMaximum: 4 },
+		{ minLength: 4, maxLength: 4 },
+		{ minItems: 4, maxItems: 4 },
+		{ minProperties: 4, maxProperties: 4 },
+	])("accepts bounds that can still hold: %j", (schema) => {
+		expect(validateAgxJsonSchema(schema)).toBeNull();
+	});
+
+	it("rejects impossible bounds on a nested node", () => {
+		const impossible = { exclusiveMinimum: 4, maximum: 4 };
+		expect(
+			validateAgxJsonSchema({ type: "object", properties: { a: impossible } }),
+		).toMatch(/exclusiveMinimum.*maximum/);
+		expect(validateAgxJsonSchema({ type: "array", items: impossible })).toMatch(
+			/exclusiveMinimum.*maximum/,
+		);
+		expect(
+			validateAgxJsonSchema({
+				type: "object",
+				additionalProperties: { type: "array", items: impossible },
+			}),
+		).toMatch(/exclusiveMinimum.*maximum/);
+		expectInvalid(
+			{ type: "object", properties: { a: impossible } },
+			{},
+			/invalid schema: exclusiveMinimum.*maximum/,
+		);
+	});
+
 	it("accepts and ignores annotation keywords", () => {
 		const annotations = {
 			description: "an invoice",

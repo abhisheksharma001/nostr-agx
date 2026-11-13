@@ -992,6 +992,26 @@ describe("AgxClient task request/response", () => {
 		expect(bob.capabilities()).toEqual(["other.task"]);
 	});
 
+	it.each([
+		["exclusiveMinimum at maximum", { exclusiveMinimum: 4, maximum: 4 }],
+		["minimum at exclusiveMaximum", { minimum: 4, exclusiveMaximum: 4 }],
+	])("refuses a contract whose schema has bounds that cannot both hold: %s", (_name, bounds) => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		bob.handle("other.task", () => null);
+		for (const contract of [
+			{
+				description: "Review an invoice",
+				inputSchema: { type: "object", properties: { amount: bounds } },
+			},
+			{ description: "Review an invoice", outputSchema: bounds },
+		]) {
+			expect(() => bob.handle("invoice.review", () => null, contract)).toThrow(
+				/AGX handler invoice\.review contract: invoice\.review (input|output)Schema: .*(minimum|maximum)/,
+			);
+		}
+		expect(bob.capabilities()).toEqual(["other.task"]);
+	});
+
 	it("refuses an unknown contract field at registration", () => {
 		const bob = new AgxClient({ transport: bus.transport(BOB) });
 		const contract = {

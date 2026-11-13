@@ -455,6 +455,17 @@ describe("parseAgentCardMetadata", () => {
 		expectSkillDropped(skill({ inputSchema: schema }));
 	});
 
+	it.each([
+		{ minimum: 5, maximum: 4 },
+		{ exclusiveMinimum: 4, maximum: 4 },
+		{ minimum: 4, exclusiveMaximum: 4 },
+		{ exclusiveMinimum: 4, exclusiveMaximum: 4 },
+	])("drops a skill whose schema has bounds that cannot both hold %j", (bounds) => {
+		expectSkillDropped(skill({ inputSchema: bounds }));
+		expectSkillDropped(skill({ outputSchema: { type: "array", items: bounds } }));
+		expectValid({ skills: [skill({ inputSchema: { minimum: 4, maximum: 4 } })] });
+	});
+
 	it("enforces schema depth, node, and property bounds", () => {
 		expectValid({ skills: [skill({ inputSchema: schemaOfDepth(16) })] });
 		expectSkillDropped(skill({ inputSchema: schemaOfDepth(17) }));
