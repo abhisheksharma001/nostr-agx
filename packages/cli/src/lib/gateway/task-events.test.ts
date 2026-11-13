@@ -106,7 +106,8 @@ describe("TaskEventStreams", () => {
 		const streams = new TaskEventStreams({ maxTotalBytes: 30_000, firstEventId: 1 });
 		const big = "\u0001".repeat(2_000); // about 12 KB once escaped
 		const a = streams.ensure("A");
-		a.push(working(1, big));
+		// The finished stream holds the least, so only the finished-first rule picks it.
+		a.push(working(1, "\u0001".repeat(1_000)));
 		a.markTerminal();
 		const b = streams.ensure("B");
 		b.push(working(1, big));
