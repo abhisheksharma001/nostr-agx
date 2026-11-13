@@ -806,7 +806,8 @@ describe("agx gateway: outbound", () => {
 			(text) => text.includes("event: working") && text.includes(": heartbeat"),
 		);
 		expect(early).toContain("retry: 1000\n");
-		expect(early).toContain("id: 1");
+		const workingId = /id: (\d+)\nevent: working/.exec(early)?.[1];
+		expect(workingId).toMatch(/^\d+$/);
 		expect(early).toContain('"message":"reviewing"');
 		expect(early).not.toContain("event: completed");
 		expect(await backgroundTask(id)).toMatchObject({ status: "running" });
@@ -829,7 +830,7 @@ describe("agx gateway: outbound", () => {
 		const completed = await settledBackgroundTask(id, reviewer.client);
 		expect(completed).toMatchObject({ status: "completed", result: { output: { run: 1 } } });
 		const replayResponse = await api(`/v1/tasks/${id}/events`, {
-			headers: { "last-event-id": "1" },
+			headers: { "last-event-id": String(workingId) },
 		});
 		const replay = await readSse(
 			replayResponse,
@@ -843,7 +844,7 @@ describe("agx gateway: outbound", () => {
 		await gateway.close();
 		gateway = await startGateway(gatewayOptions());
 		const restoredResponse = await api(`/v1/tasks/${id}/events`, {
-			headers: { "last-event-id": "1" },
+			headers: { "last-event-id": String(workingId) },
 		});
 		const restored = await readSse(
 			restoredResponse,

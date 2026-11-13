@@ -103,7 +103,7 @@ describe("TaskEventStreams", () => {
 	});
 
 	it("keeps buffered events of all streams under the total budget, evicting finished streams first", () => {
-		const streams = new TaskEventStreams({ maxTotalBytes: 30_000 });
+		const streams = new TaskEventStreams({ maxTotalBytes: 30_000, firstEventId: 1 });
 		const big = "\u0001".repeat(2_000); // about 12 KB once escaped
 		const a = streams.ensure("A");
 		a.push(working(1, big));
@@ -121,7 +121,7 @@ describe("TaskEventStreams", () => {
 	});
 
 	it("drops the largest running stream's oldest event once no finished stream has any", () => {
-		const streams = new TaskEventStreams({ maxTotalBytes: 30_000 });
+		const streams = new TaskEventStreams({ maxTotalBytes: 30_000, firstEventId: 1 });
 		const big = "\u0001".repeat(2_000);
 		const a = streams.ensure("A");
 		a.push(working(1, big));
@@ -142,6 +142,23 @@ describe("TaskEventStreams", () => {
 		expect(streams.get("A")).toBeDefined();
 		expect(streams.get("B")).toBeUndefined();
 		expect(streams.get("C")).toBeDefined();
+	});
+
+	it("numbers events from one rising counter shared by every stream", () => {
+		const streams = new TaskEventStreams({ firstEventId: 500 });
+		const a = streams.ensure("A");
+		const b = streams.ensure("B");
+		a.push(working(1));
+		b.push(working(1));
+		a.markTerminal();
+		expect(a.after(0)[0].id).toBe(500);
+		expect(b.after(0)[0].id).toBe(501);
+		expect(a.getTerminalId()).toBe(502);
+		// Default: start time in microseconds, above any earlier process's IDs.
+		const before = Date.now() * 1000;
+		const fresh = new TaskEventStreams().ensure("C");
+		fresh.markTerminal();
+		expect(fresh.getTerminalId()).toBeGreaterThanOrEqual(before);
 	});
 
 	it("drops streams untouched for 24 hours", () => {

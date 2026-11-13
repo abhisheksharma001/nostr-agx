@@ -22,7 +22,6 @@ const STREAM_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 export class TaskEventStream {
 	private readonly events: TaskStreamEvent[] = [];
-	private nextId = 1;
 	private terminalId: number | undefined;
 	private size = 0;
 	private touchedAt: number;
@@ -30,9 +29,12 @@ export class TaskEventStream {
 	/** Set by the stream set that holds it, to keep the total budget. */
 	owner?: { enforceBudget(): void };
 
+	/** `nextId` hands out event IDs. A stream held by {@link TaskEventStreams}
+	 * draws from one counter for the whole gateway; a lone stream counts from 1. */
 	constructor(
 		private readonly now: () => number = Date.now,
 		private readonly maxBytes: number = MAX_TASK_STREAM_BYTES,
+		private readonly nextId: () => number = counterFrom(1),
 	) {
 		this.touchedAt = now();
 	}
@@ -47,8 +49,7 @@ export class TaskEventStream {
 			...(update.message === undefined ? {} : { message: update.message }),
 		};
 		const bytes = Buffer.byteLength(JSON.stringify(data));
-		this.events.push({ id: this.nextId, event: "working", data, bytes });
-		this.nextId += 1;
+		this.events.push({ id: this.nextId(), event: "working", data, bytes });
 		this.size += bytes;
 		this.touchedAt = this.now();
 		while (
@@ -62,14 +63,12 @@ export class TaskEventStream {
 	}
 
 	/** Ends the stream. Its terminal event takes the next ID, or `minId` if that
-	 * is higher, so a stream recreated after a restart never gives a client a
-	 * terminal ID it has already passed. */
+	 * is higher, so a client is never given a terminal ID it has already passed. */
 	markTerminal(minId = 0): void {
 		if (this.terminalId !== undefined) {
 			return;
 		}
-		this.terminalId = Math.max(this.nextId, minId);
-		this.nextId = this.terminalId + 1;
+		this.terminalId = Math.max(this.nextId(), minId);
 		this.touchedAt = this.now();
 		this.notify();
 	}
@@ -122,8 +121,20 @@ export class TaskEventStream {
 	}
 }
 
+function counterFrom(first: number): () => number {
+	let next = first;
+	return () => {
+		const id = next;
+		next += 1;
+		return id;
+	};
+}
+
 export interface TaskEventStreamsOptions {
 	now?: () => number;
+	/** The first event ID. Default: the start time in microseconds, so IDs keep
+	 * rising across restarts and above any ID of a stream lost before. */
+	firstEventId?: number;
 	maxStreams?: number;
 	maxStreamBytes?: number;
 	maxTotalBytes?: number;
@@ -137,9 +148,11 @@ export class TaskEventStreams {
 	private readonly maxStreamBytes: number;
 	private readonly maxTotalBytes: number;
 	private readonly retentionMs: number;
+	private readonly nextEventId: () => number;
 
 	constructor(options: TaskEventStreamsOptions = {}) {
 		this.now = options.now ?? Date.now;
+		this.nextEventId = counterFrom(options.firstEventId ?? Date.now() * 1000);
 		this.maxStreams = options.maxStreams ?? MAX_STREAMS;
 		this.maxStreamBytes = options.maxStreamBytes ?? MAX_TASK_STREAM_BYTES;
 		this.maxTotalBytes = options.maxTotalBytes ?? MAX_TASK_EVENT_BYTES;
@@ -149,7 +162,7 @@ export class TaskEventStreams {
 	/** A stream not yet registered under an ID, for events that may arrive
 	 * before the task's public ID is known. */
 	create(): TaskEventStream {
-		const stream = new TaskEventStream(this.now, this.maxStreamBytes);
+		const stream = new TaskEventStream(this.now, this.maxStreamBytes, this.nextEventId);
 		stream.owner = this;
 		return stream;
 	}
