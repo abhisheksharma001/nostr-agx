@@ -1603,10 +1603,18 @@ export class AgxClient {
 					// A `working` publish still in flight must land first, or a requester
 					// would see `working` after `input-required`.
 					await reportsInFlight;
+					// A requirement that cannot be encoded fails like one that could
+					// not be published, so the wait below ends and resets the state.
 					const sent = await this.sendResult(msg.from, env.taskId, {
 						status: "input-required",
 						inputRequestId,
 						requirement: effectiveRequirement,
+					}).catch((error) => {
+						this.log.error?.("AGX: failed to encode the input requirement", {
+							taskId: env.taskId,
+							error: String(error),
+						});
+						return false;
 					});
 					if (!sent) {
 						this.rejectTaskInput(
