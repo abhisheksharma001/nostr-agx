@@ -511,6 +511,25 @@ describe("durable pending-request races", () => {
 		await second.stop();
 	});
 
+	it("still reports the stop when the store throws while removing the first record", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		const firstSave = gate();
+		store.saveGate = firstSave.promise;
+		const first = durableClient(bus, store);
+		await restore(first);
+		const original = first.request(BOB, "math.add", {}, { timeoutMs: 0 });
+		original.catch(() => undefined);
+		await waitFor(() => store.saves.length === 1);
+		const stopping = first.stop({ preservePending: true });
+		await settle();
+		store.failRemove = true;
+		firstSave.open();
+		await stopping;
+		await expect(original).rejects.toThrow("AGX client stopped");
+		expect(bus.requests(BOB)).toEqual([]);
+	});
+
 	it("keeps the record of a request sent earlier under a reused storage key when a restart stop lands during the first save", async () => {
 		const bus = new MemoryTransport(ALICE);
 		const store = new MemoryPendingStore();
