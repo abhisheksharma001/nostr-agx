@@ -169,9 +169,18 @@ export function serveTaskEvents(
 	res.write("retry: 1000\n: connected\n\n");
 	res.on("close", cleanup);
 	unsubscribe = stream.subscribe(flush);
+	// The key is checked once per request, so recheck it and the task record
+	// while the stream stays open: a revoked key or an evicted record ends it.
 	revalidateTimer = setInterval(() => {
 		try {
-			if (isTerminalView(getView())) {
+			if (!route.stillAuthorized()) {
+				finish();
+				return;
+			}
+			const view = getView();
+			if (view === null) {
+				finish();
+			} else if (isTerminalView(view)) {
 				stream.markTerminal();
 			}
 		} catch {
