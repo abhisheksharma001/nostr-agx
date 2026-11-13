@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `agx gateway`: a task request that is still in flight when the gateway stops, and has no idempotency key or background handle, now gets a task cancel sent to the remote agent. Before, the gateway's requester client was never stopped, so that agent kept running a task nobody was waiting for. Requests with a key or a handle are kept and picked up again after the restart, with no cancel.
+
 ## 0.6.0
 
 Released with `@nostr-agx/core` and `@nostr-agx/nostr` 0.6.0, which add interactive input to tasks: a handler can call `ctx.requestInput(...)` to ask its requester a question, and a requester that opts in through `streamRequest()` answers it (see "Task lifecycle" in the core `SPEC.md`). `NostrTransport` can also receive over live relay subscriptions instead of only polling.
