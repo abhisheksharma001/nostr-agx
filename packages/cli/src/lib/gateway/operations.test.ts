@@ -1,6 +1,7 @@
 import {
 	AgxPendingRequestStoreError,
 	AgxRequestUnknownError,
+	AgxTaskFailedError,
 	type AgxTransport,
 	type PendingRequestRecord,
 	type PendingRequestStore,
@@ -50,6 +51,26 @@ describe("task result errors", () => {
 		expect(await recoveredFailure(new AgxPendingRequestStoreError())).toMatchObject({
 			status: 500,
 			code: "idempotency_store_failed",
+		});
+	});
+
+	it("labels a planned local stop as the gateway stopping, never as the peer's failure", async () => {
+		for (const failure of [
+			await taskFailure(new Error("AGX client stopped")),
+			await recoveredFailure(new Error("AGX client stopped")),
+		]) {
+			expect(failure).toMatchObject({ status: 503, code: "gateway_stopping" });
+			const text = `${(failure as Error).message} ${(failure as { description?: string }).description}`;
+			expect(text).not.toMatch(/npub1peer|reported|AGX client/i);
+		}
+		// The peer's own text of the same words is still the peer's failure.
+		expect(await taskFailure(new AgxTaskFailedError("AGX client stopped"))).toMatchObject({
+			status: 502,
+			code: "task_failed",
+		});
+		expect(await recoveredFailure(new AgxTaskFailedError("AGX client stopped"))).toMatchObject({
+			status: 502,
+			code: "task_failed",
 		});
 	});
 
