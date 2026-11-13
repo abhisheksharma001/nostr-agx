@@ -153,6 +153,12 @@ async function awaitTaskResult(
 		if (error instanceof AgxTaskFailedError) {
 			throw new ApiError(502, "task_failed", `${req.npub} reported that the task failed: ${message}`);
 		}
+		// This client's own planned stop (the gateway shutting down), not the peer's
+		// word: the peer's failure was classified above. Nothing from the error text
+		// goes to the caller, and the code is the one the task store already uses.
+		if (message === "AGX client stopped") {
+			throw new ApiError(503, "gateway_stopping", "The gateway is stopping");
+		}
 		if (message.startsWith("AGX request timed out")) {
 			throw new ApiError(
 				504,
