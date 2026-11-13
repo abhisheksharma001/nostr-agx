@@ -35,6 +35,8 @@ class MemoryPendingStore {
 	/** When set, the next list() or remove() waits for it (an asynchronous store). */
 	listGate?: Promise<void>;
 	removeGate?: Promise<void>;
+	/** When set, the next save() records its write only once this opens (an asynchronous store). */
+	saveGate?: Promise<void>;
 
 	list(): PendingRecord[] | Promise<PendingRecord[]> {
 		const read = () => [...this.records.values()].map((record) => ({ ...record }));
@@ -43,8 +45,17 @@ class MemoryPendingStore {
 		return gate ? gate.then(read) : read();
 	}
 
-	save(record: PendingRecord): void {
+	save(record: PendingRecord): void | Promise<void> {
 		this.saves.push(record.phase);
+		const gate = this.saveGate;
+		this.saveGate = undefined;
+		if (gate) {
+			return gate.then(() => this.write(record));
+		}
+		this.write(record);
+	}
+
+	private write(record: PendingRecord): void {
 		if (this.failSavePhase === record.phase) {
 			throw new Error("disk full");
 		}
@@ -473,6 +484,30 @@ describe("durable pending-request races", () => {
 		expect(await restore(durableClient(bus, store))).toEqual([]);
 		expect(bus.requests(BOB)).toEqual([taskId]);
 		expect(cancels(bus)).toBe(0);
+		await second.stop();
+	});
+
+	it("leaves no record to recover as unknown when a restart stop lands during the first save", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		const firstSave = gate();
+		store.saveGate = firstSave.promise;
+		const first = durableClient(bus, store);
+		await restore(first);
+		const original = first.request(BOB, "math.add", {}, { timeoutMs: 0 });
+		original.catch(() => undefined);
+		await waitFor(() => store.saves.length === 1);
+		const stopping = first.stop({ preservePending: true });
+		await settle();
+		firstSave.open();
+		await stopping;
+		await expect(original).rejects.toThrow("AGX client stopped");
+		await settle();
+		expect(bus.requests(BOB)).toEqual([]);
+		expect(store.records.size).toBe(0);
+
+		const second = durableClient(bus, store);
+		expect(await restore(second)).toEqual([]);
 		await second.stop();
 	});
 
