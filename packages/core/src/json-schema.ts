@@ -290,6 +290,30 @@ function validateSchemaNode(
 	return null;
 }
 
+/** Remove, in place, every annotation whose value is larger or deeper than a
+ * task payload may be. Annotations never make a schema invalid, but one of
+ * any depth would make printing the schema blow up. Call it on a copy. */
+export function dropUnboundedAgxAnnotations(schema: unknown, depth = 1): void {
+	if (!isRecord(schema) || depth > AGX_JSON_SCHEMA_LIMITS.schemaDepth) {
+		return;
+	}
+	for (const keyword of annotationKeywords) {
+		if (
+			Object.hasOwn(schema, keyword) &&
+			boundedJsonValueProblem(schema[keyword])
+		) {
+			delete schema[keyword];
+		}
+	}
+	if (isRecord(schema.properties)) {
+		for (const child of Object.values(schema.properties)) {
+			dropUnboundedAgxAnnotations(child, depth + 1);
+		}
+	}
+	dropUnboundedAgxAnnotations(schema.items, depth + 1);
+	dropUnboundedAgxAnnotations(schema.additionalProperties, depth + 1);
+}
+
 export function validateAgxJsonSchema(schema: unknown): string | null {
 	try {
 		return isRecord(schema)

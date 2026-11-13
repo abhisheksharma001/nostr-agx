@@ -250,7 +250,8 @@ The inline JSON Schema 2020-12 subset permits `type`, `properties`, `required`,
 `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minItems`, `maxItems`, `uniqueItems`,
 `minProperties`, and `maxProperties`. The annotation keywords `description`, `title`, `$schema`,
 `default`, and `examples` are accepted with any value and ignored: they are never checked or fetched,
-and `default` is never applied. Other keywords, including `$ref`, `$id`, `pattern`, `format`, and
+and `default` is never applied. A reader MAY drop an annotation whose value exceeds the validated payload
+bounds below; the schema and its skill stay valid. Other keywords, including `$ref`, `$id`, `pattern`, `format`, and
 `patternProperties`, make the schema invalid, which drops its skill. Schemas are objects, not boolean schemas;
 remote references and format assertions are not supported.
 

@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { AGX_JSON_SCHEMA_LIMITS, validateAgxJsonSchema } from "./json-schema";
+import {
+	AGX_JSON_SCHEMA_LIMITS,
+	dropUnboundedAgxAnnotations,
+	validateAgxJsonSchema,
+} from "./json-schema";
 import type { AgxAgentCardExtension, AgxAgentSkill } from "./transport";
 
 /** Bounds on the typed skills and extensions an Agent Card carries. */
@@ -121,7 +125,10 @@ export function parseAgxAgentSkill(
 				return { problem: `${skill.id} ${keyword}: ${error}` };
 			}
 		}
-		return { skill: JSON.parse(JSON.stringify(skill)) as AgxAgentSkill };
+		const copy = JSON.parse(JSON.stringify(skill)) as AgxAgentSkill;
+		dropUnboundedAgxAnnotations(copy.inputSchema);
+		dropUnboundedAgxAnnotations(copy.outputSchema);
+		return { skill: copy };
 	} catch {
 		return { problem: "skill could not be parsed safely" };
 	}
