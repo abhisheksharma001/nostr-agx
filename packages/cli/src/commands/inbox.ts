@@ -83,7 +83,9 @@ export async function inboxCommand(options: InboxOptions): Promise<void> {
 			onMessage: (msg) => {
 				collector.onMessage(msg);
 			},
-			onReceipt: (receipt) => collector.onReceipt(receipt),
+			onReceipt: (receipt) => {
+				collector.onReceipt(receipt);
+			},
 		});
 		await client.start({
 			pollIntervalMs: 0,
