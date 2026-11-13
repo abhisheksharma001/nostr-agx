@@ -144,19 +144,25 @@ export function serveTaskEvents(
 		if (finished) {
 			return;
 		}
-		for (const event of stream.after(lastId)) {
-			writeEvent(event.id, event.event, event.data);
+		try {
+			for (const event of stream.after(lastId)) {
+				writeEvent(event.id, event.event, event.data);
+			}
+			const terminalId = stream.getTerminalId();
+			if (terminalId === undefined) {
+				return;
+			}
+			// The store owns the outcome; the stream keeps only the terminal ID.
+			const view = getView();
+			if (isTerminalView(view)) {
+				writeEvent(terminalId, view?.status as string, view as Record<string, unknown>);
+			}
+			finish();
+		} catch {
+			// Runs inside the stream's notify and the store's settle callback:
+			// end this connection rather than throw into them.
+			finish();
 		}
-		const terminalId = stream.getTerminalId();
-		if (terminalId === undefined) {
-			return;
-		}
-		// The store owns the outcome; the stream keeps only the terminal ID.
-		const view = getView();
-		if (isTerminalView(view)) {
-			writeEvent(terminalId, view?.status as string, view as Record<string, unknown>);
-		}
-		finish();
 	};
 
 	res.writeHead(200, {

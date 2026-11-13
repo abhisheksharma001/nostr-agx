@@ -348,7 +348,13 @@ export class TaskOperationStore {
 			if (this.inFlight.get(id) === running) {
 				this.inFlight.delete(id);
 			}
-			onSettled?.(publicId);
+			try {
+				onSettled?.(publicId);
+			} catch (error) {
+				this.log(
+					`Background task ${publicId} settle callback failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 		});
 		return this.view(created);
 	}
