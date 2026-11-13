@@ -255,6 +255,18 @@ describe("parseAgentCardMetadata", () => {
 		expect(parsed.warnings?.[0]?.message).toContain("duplicate skill ID");
 	});
 
+	it("drops a valid copy of a skill ID when another copy is invalid", () => {
+		const parsed = parseAgentCardMetadata({
+			skills: [skill(), skill({ description: "" }), skill({ id: "other" })],
+		});
+		expect(parsed.skills?.map((kept) => kept.id)).toEqual(["other"]);
+		expect(codes(parsed)).toEqual([
+			"invalid_typed_skill",
+			"invalid_typed_skill",
+		]);
+		expect(parsed.warnings?.[1]?.message).toContain("duplicate skill ID");
+	});
+
 	it("merges duplicate extension URIs, required if any copy is", () => {
 		const metadata = {
 			skills: [skill()],
