@@ -252,8 +252,10 @@ The inline JSON Schema 2020-12 subset permits `type`, `properties`, `required`,
 `default`, and `examples` are accepted with any value and ignored: they are never checked or fetched,
 and `default` is never applied. A reader MAY drop an annotation whose value exceeds the validated payload
 bounds below; the schema and its skill stay valid. Other keywords, including `$ref`, `$id`, `pattern`, `format`, and
-`patternProperties`, make the schema invalid, which drops its skill. Schemas are objects, not boolean schemas;
-remote references and format assertions are not supported.
+`patternProperties`, make the schema invalid, which drops its skill. So do bounds on one schema object, at any depth, that cannot both hold:
+a lower bound above the upper bound, or an exclusive bound at or past the opposite bound, for example
+`exclusiveMinimum` equal to or above `maximum`. Equal inclusive bounds (`minimum` equal to `maximum`) are valid.
+Schemas are objects, not boolean schemas; remote references and format assertions are not supported.
 
 | Bound | Limit |
 |---|---:|

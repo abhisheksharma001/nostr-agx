@@ -218,6 +218,20 @@ function validateSchemaNode(
 			return `${minimum} exceeds ${maximum}`;
 		}
 	}
+	// An exclusive bound leaves no value once it meets the opposite bound.
+	for (const [minimum, maximum] of [
+		["exclusiveMinimum", "maximum"],
+		["minimum", "exclusiveMaximum"],
+		["exclusiveMinimum", "exclusiveMaximum"],
+	] as const) {
+		if (
+			schema[minimum] !== undefined &&
+			schema[maximum] !== undefined &&
+			(schema[minimum] as number) >= (schema[maximum] as number)
+		) {
+			return `${minimum} is not below ${maximum}`;
+		}
+	}
 
 	if (schema.const !== undefined) {
 		const problem = boundedJsonValueProblem(schema.const);
