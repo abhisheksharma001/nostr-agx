@@ -13,7 +13,18 @@ let box: ReturnType<typeof sandbox>;
 const mine = createIdentity();
 const friend = createIdentity();
 const NSEC = nip19.nsecEncode(hexToBytes(createIdentity().secretKeyHex));
-const secretPart = NSEC.slice(8, 40);
+/** The first 10-character stretch of the key's data part (not the constant `nsec1`) found in `shown`, in any case; null if none. */
+function leakedPart(shown: string, key: string): string | null {
+	const text = shown.toLowerCase();
+	const secret = key.toLowerCase();
+	for (let i = 5; i + 10 <= secret.length; i++) {
+		const part = secret.slice(i, i + 10);
+		if (text.includes(part)) {
+			return part;
+		}
+	}
+	return null;
+}
 
 beforeEach(() => {
 	box = sandbox();
@@ -39,7 +50,7 @@ describe("a secret key given where a peer belongs", () => {
 		expect(run.stderr).toMatch(/secret key/i);
 		for (const out of [run.stdout, run.stderr]) {
 			expect(out).not.toContain(NSEC);
-			expect(out).not.toContain(secretPart);
+			expect(leakedPart(out, NSEC)).toBeNull();
 		}
 	});
 
@@ -54,7 +65,7 @@ describe("a secret key given where a peer belongs", () => {
 		const run = await agx("identity", "allow", NSEC, "--json");
 		expect(run.code).toBe(2);
 		for (const out of [run.stdout, run.stderr]) {
-			expect(out).not.toContain(secretPart);
+			expect(leakedPart(out, NSEC)).toBeNull();
 		}
 	});
 });

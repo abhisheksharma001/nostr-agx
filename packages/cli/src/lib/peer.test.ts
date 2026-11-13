@@ -8,6 +8,19 @@ import { toHexPubkey } from "./peer.js";
 const identity = createIdentity();
 const NSEC = nip19.nsecEncode(hexToBytes(identity.secretKeyHex));
 
+/** The first 10-character stretch of the key's data part (not the constant `nsec1`) found in `shown`, in any case; null if none. */
+function leakedPart(shown: string, key: string): string | null {
+	const text = shown.toLowerCase();
+	const secret = key.toLowerCase();
+	for (let i = 5; i + 10 <= secret.length; i++) {
+		const part = secret.slice(i, i + 10);
+		if (text.includes(part)) {
+			return part;
+		}
+	}
+	return null;
+}
+
 function failure(input: string, label?: string): AgxCliError {
 	try {
 		toHexPubkey(input, label);
@@ -33,14 +46,10 @@ describe("toHexPubkey", () => {
 	});
 
 	describe("given a pasted secret key", () => {
-		// 32 characters from the middle of the key: present in every variant pasted below.
-		const secretPart = NSEC.slice(8, 40);
-
 		it("refuses it without printing it", () => {
 			const error = failure(NSEC, "recipient");
 			expect(error.message).not.toContain(NSEC);
-			expect(error.message).not.toContain(secretPart);
-			expect(error.remediation ?? "").not.toContain(secretPart);
+			expect(leakedPart(`${error.message}\n${error.remediation ?? ""}`, NSEC)).toBeNull();
 			expect(error.exitCode).toBe(EXIT.usage);
 		});
 
@@ -60,8 +69,7 @@ describe("toHexPubkey", () => {
 		])("does not print it %s", (_name, pasted) => {
 			const error = failure(pasted, "peer");
 			const shown = `${error.message}\n${error.remediation ?? ""}`;
-			expect(shown).not.toContain(secretPart);
-			expect(shown.toLowerCase()).not.toContain(secretPart.toLowerCase());
+			expect(leakedPart(shown, NSEC)).toBeNull();
 		});
 	});
 });
