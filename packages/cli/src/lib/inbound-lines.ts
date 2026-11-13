@@ -1,5 +1,5 @@
 import kleur from "kleur";
-import { shortNpub } from "./output.js";
+import { escapeLineBreakers, shortNpub } from "./output.js";
 import type { HoldResult } from "./store/types.js";
 
 /**
@@ -123,15 +123,6 @@ export function oneLineJson(value: unknown): string {
 	return escapeLineBreakers(JSON.stringify(value) ?? "undefined");
 }
 
-/** `JSON.stringify` escapes C0 controls but emits U+2028/U+2029/U+0085 and the
- * rest of C1 raw; escape those too so a quoted subject stays on one line. */
-function escapeLineBreakers(quoted: string): string {
-	return quoted.replace(
-		C1_AND_SEPARATORS_RE,
-		(ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
-	);
-}
-
 const LINE_BREAK_RE = /\r\n|[\n\r\v\f\u0085\u2028\u2029]/;
 /** Ids agx mints (hex, UUIDs) and common peer formats; nothing a shell expands. */
 const SAFE_ID_RE = /^[A-Za-z0-9._:-]{1,200}$/;
@@ -139,4 +130,3 @@ const SAFE_ID_RE = /^[A-Za-z0-9._:-]{1,200}$/;
 const CONTROL_RE = /[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u2028\u2029]/g;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
 const BODY_CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u2028\u2029]/g;
-const C1_AND_SEPARATORS_RE = /[\u007f-\u009f\u2028\u2029]/g;

@@ -74,12 +74,26 @@ export function kv(key: string, value: string | number | null): void {
 	say(`  ${kleur.dim(key.padEnd(16))} ${rendered}`);
 }
 
+const C1_AND_SEPARATORS_RE = /[\u007f-\u009f\u2028\u2029]/g;
+
+/** `JSON.stringify` escapes C0 controls but emits U+2028/U+2029/U+0085 and the
+ * rest of C1 raw; escape those too so a quoted subject stays on one line. */
+export function escapeLineBreakers(quoted: string): string {
+	return quoted.replace(
+		C1_AND_SEPARATORS_RE,
+		(ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+	);
+}
+
 /** Emit the machine-readable payload. Always printed, `--json` or not — but in
  * human mode it is the only thing on stdout that is not decorated, so piping to
  * `jq` still works when the caller opts in. */
 export function json(payload: unknown): void {
 	if (jsonMode) {
-		console.log(JSON.stringify(payload, null, 2));
+		// These characters can only sit inside a JSON string, where `\uXXXX` parses
+		// back to the same value, so escaping the whole text loses nothing. Peer
+		// text can carry them, and a terminal may act on U+009B (CSI).
+		console.log(escapeLineBreakers(JSON.stringify(payload, null, 2)));
 	}
 }
 
