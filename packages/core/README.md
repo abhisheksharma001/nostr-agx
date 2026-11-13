@@ -38,6 +38,7 @@ agx.handle("invoice.review", async (task, ctx) => {
     required: ["approved"],
     properties: { approved: { type: "boolean" } },
   },
+  features: ["working"], // Advertised as written; the client adds no feature.
 });
 
 await agx.start();
@@ -47,7 +48,9 @@ await agx.start();
 const result = await agx.request(peer, "invoice.review", { amount: 25 }, {
   validate: true,
   onTaskStatus(update) {
-    console.log(update.seq, update.message); // Ordered `working` updates; request stays pending.
+    // Ordered `working` updates; the request stays pending. Not awaited: it never delays dispatch,
+    // and a thrown error or rejected promise is logged.
+    console.log(update.seq, update.message);
   },
 });
 ```
@@ -76,7 +79,8 @@ and per-prompt duration are bounded by `maxPendingTaskInputs` and
 The requester uses `streamRequest()` to observe `inputRequired`, `statusUpdate`,
 `progress` (the ordered `working` updates a handler publishes with `ctx.report`;
 `streamRequest()` and `request()` with `onTaskStatus` ask for them with `supportsWorking`,
-and a responder sends none to a request that did not ask),
+and a responder sends none to a request that did not ask, and none while an input request is
+outstanding),
 `completed`, and `error`; its `result` promise resolves with the final output or
 rejects on failure, timeout, or client stop. Stream updates use the same dispatch
 path as polling, so live transport hooks are optional. The requester obtains an

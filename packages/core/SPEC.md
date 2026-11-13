@@ -127,7 +127,8 @@ them like any message:
 - **request** — `{ t: "req", taskId, capability, payload, supportsInput?, supportsWorking?, timeoutMs? }`.
   `payload` is arbitrary JSON the handler interprets (payload-agnostic). `supportsInput` is an explicit
   opt-in to interactive input; it defaults to false. `supportsWorking` is an explicit opt-in to
-  `working` updates; it defaults to false. `timeoutMs` is the requester's end-to-end deadline in
+  `working` updates; it defaults to false, and like `supportsInput` it is a permanent opt-in: a
+  responder sends `working` only when it is `true`. `timeoutMs` is the requester's end-to-end deadline in
   milliseconds; zero means no requester deadline.
 - **result/update** — `{ t: "res", taskId, status: "input-required", inputRequestId, requirement }`
   and `{ t: "res", taskId, status: "working", seq, message? }` are nonterminal updates;
@@ -168,15 +169,20 @@ the pending `taskId`, with the transport `contextId` equal to that `taskId`, exa
 `input-required`. Duplicate or older `seq` values are ignored; a later terminal result still settles the
 request normally. A responder **MUST NOT** send `working` after the task has finished or been canceled:
 the reference client stops accepting reports as soon as the handler returns or throws, and waits for any
-update already being published before it sends the terminal result. The message is handler-supplied
+update already being published before it sends the terminal result. A responder **MUST NOT** send
+`working` while an `input-required` it sent is outstanding: from when it starts sending the input
+requirement until the matching input arrives or the task ends. Reports made in that window are dropped,
+not queued, and use no `seq`. A `working` update already being published when input is requested is sent
+before the `input-required`. The message is handler-supplied
 public text, never raw reasoning or internal error details. A transport failure or oversized message
 drops the update without failing the task. Unknown, late, and post-terminal updates receive no automatic
 reply and follow the plain-message trust path. The opt-in exists because a requester that predates
 `working` cannot be relied on to treat an unrecognized update as a plain message: the reference
-`streamRequest()` before this change reads it as `TaskNotFoundError` and drops its pending input. Such a
-requester never sets `supportsWorking`, so it never receives one; a responder that predates `working`
-ignores the unknown key and sends no updates. Typed contracts advertise the `working` feature; this is
-not token-by-token model streaming.
+`streamRequest()` in every release up to 0.6.0 reads it as `TaskNotFoundError` and drops its pending
+input. A requester that does not set `supportsWorking` never receives `working`; a responder that
+predates `working` ignores the unknown key and sends no updates. A skill advertises `working` in
+`features` only when its contract author declares it; the reference client adds no feature. This is not
+token-by-token model streaming.
 
 **Responder shutdown.** A responder that stops **MUST NOT** treat it as a requester cancellation: a
 handler already running still publishes its terminal result, and a task waiting for input or to
@@ -242,8 +248,8 @@ automatically, and typed metadata does not change wildcard matching or peer sele
 Each skill has a concrete `id` (not `*` or a `.*` wildcard), a public `description`, and optional
 `tags`, `inputModes`, `outputModes`, `inputSchema`, `outputSchema`, and `features`. Modes are media
 types for the inner task payload and result; they do not change the AGX envelope or add artifact
-transport. Feature labels advertise behavior rather than enabling it; client-created typed contracts
-include `working` because their handlers can report status. Schemas are inline metadata and MAY also
+transport. Feature labels advertise behavior rather than enabling it, and are declared by the contract
+author; the reference client never adds one. Schemas are inline metadata and MAY also
 drive local task input/output validation as specified below.
 
 Each extension has a stable `uri` and optional `required` (default `false`). Extensions are declared
