@@ -33,7 +33,7 @@ import { type OperationDeps, parseTaskRequest, readCard, runTaskRequest, sendMes
 import { Requester } from "./requester.js";
 import { KeyedSlots } from "./slots.js";
 import { TaskEventStreams } from "./task-events.js";
-import { serveTaskEvents } from "./task-events-http.js";
+import { serveTaskEvents, TASK_STREAM_REVALIDATE_MS, TaskStreamSlots } from "./task-events-http.js";
 import {
 	assertWebhookHost,
 	parseSubscriptionInput,
@@ -86,6 +86,8 @@ export interface GatewayOptions {
 	maxBackgroundTasksInFlight?: number;
 	/** SSE comment heartbeat interval. Default 15000. */
 	taskSseHeartbeatMs?: number;
+	/** For tests: how often an open SSE stream rechecks its task. Default 5000. */
+	taskSseRevalidateMs?: number;
 }
 
 export interface RunningGateway {
@@ -172,6 +174,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			maxBackgroundInFlight: options.maxBackgroundTasksInFlight,
 		});
 		const taskEvents = new TaskEventStreams();
+		const taskStreamSlots = new TaskStreamSlots();
 		const queue = new DeliveryQueue({
 			retryDelaysMs: options.deliveryRetryDelaysMs,
 			onFailure: (subscription, eventId, detail) =>
@@ -507,15 +510,18 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			}
 			const eventRoute = /^\/v1\/tasks\/([^/]+)\/events$/.exec(path);
 			if (method === "GET" && eventRoute) {
-				serveTaskEvents(
-					req,
-					res,
-					decodeURIComponent(eventRoute[1]),
-					bearer(req),
-					taskOperations,
-					taskEvents,
-					Math.max(10, options.taskSseHeartbeatMs ?? 15_000),
-				);
+				const credential = bearer(req);
+				const taskId = decodeURIComponent(eventRoute[1]);
+				serveTaskEvents(req, res, {
+					id: taskId,
+					credential,
+					getView: () => taskOperations.get(credential, taskId),
+					stillAuthorized: () => verifyGatewayKey(name, credential) !== null,
+					streams: taskEvents,
+					slots: taskStreamSlots,
+					heartbeatMs: Math.max(10, options.taskSseHeartbeatMs ?? 15_000),
+					revalidateMs: Math.max(10, options.taskSseRevalidateMs ?? TASK_STREAM_REVALIDATE_MS),
+				});
 				return;
 			}
 			const task = /^\/v1\/tasks\/([^/]+)$/.exec(path);
@@ -574,6 +580,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 							idempotencyKey,
 							body,
 							backgroundOperation,
+							(publicId) => taskEvents.get(publicId)?.markTerminal(),
 						);
 						if (typeof submitted.id !== "string") {
 							throw new Error("Background task store returned no public task ID");

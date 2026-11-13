@@ -287,6 +287,8 @@ export class TaskOperationStore {
 		key: string | null,
 		body: unknown,
 		operation: () => Promise<Record<string, unknown>>,
+		/** Called with the public ID once the outcome is stored. */
+		onSettled?: (publicId: string) => void,
 	): Record<string, unknown> {
 		this.assertOpen();
 		if (this.prune()) {
@@ -346,6 +348,7 @@ export class TaskOperationStore {
 			if (this.inFlight.get(id) === running) {
 				this.inFlight.delete(id);
 			}
+			onSettled?.(publicId);
 		});
 		return this.view(created);
 	}

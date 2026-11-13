@@ -1,46 +1,113 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { ApiError } from "./http.js";
-import type { TaskOperationStore } from "./idempotency.js";
 import type { TaskEventStreams } from "./task-events.js";
 
+/** Open `/events` connections per API credential. One per running background
+ * task covers a single-key deployment at full background concurrency. */
+export const MAX_TASK_STREAMS_PER_CREDENTIAL = 64;
+/** Open `/events` connections across the gateway: the same as the task
+ * requests that may wait for results, so both pools together leave half of
+ * the server's connections for everything else. */
+export const MAX_TASK_STREAMS = 256;
+/** How often an open stream rechecks its task record. */
+export const TASK_STREAM_REVALIDATE_MS = 5_000;
+
+/** Counts open task event streams, per credential and in total. */
+export class TaskStreamSlots {
+	private readonly perCredential: number;
+	private readonly total: number;
+	private readonly byCredential = new Map<string, number>();
+	private openTotal = 0;
+
+	constructor(limits: { perCredential?: number; total?: number } = {}) {
+		this.perCredential = limits.perCredential ?? MAX_TASK_STREAMS_PER_CREDENTIAL;
+		this.total = limits.total ?? MAX_TASK_STREAMS;
+	}
+
+	tryAcquire(credential: string): "ok" | "credential_full" | "gateway_full" {
+		const held = this.byCredential.get(credential) ?? 0;
+		if (held >= this.perCredential) {
+			return "credential_full";
+		}
+		if (this.openTotal >= this.total) {
+			return "gateway_full";
+		}
+		this.byCredential.set(credential, held + 1);
+		this.openTotal += 1;
+		return "ok";
+	}
+
+	release(credential: string): void {
+		const held = this.byCredential.get(credential) ?? 0;
+		if (held <= 0) {
+			return;
+		}
+		if (held === 1) {
+			this.byCredential.delete(credential);
+		} else {
+			this.byCredential.set(credential, held - 1);
+		}
+		this.openTotal -= 1;
+	}
+
+	open(credential?: string): number {
+		return credential === undefined ? this.openTotal : (this.byCredential.get(credential) ?? 0);
+	}
+}
+
+export interface TaskEventRoute {
+	/** The public background task ID. */
+	id: string;
+	/** The API credential, as sent. */
+	credential: string;
+	/** The task's stored view for this credential, or null if there is none. */
+	getView: () => Record<string, unknown> | null;
+	/** Whether the credential is still a valid API key. */
+	stillAuthorized: () => boolean;
+	streams: TaskEventStreams;
+	slots: TaskStreamSlots;
+	heartbeatMs: number;
+	revalidateMs: number;
+}
+
+const isTerminalView = (view: Record<string, unknown> | null) =>
+	view?.status === "completed" || view?.status === "failed";
+
+/** `GET /v1/tasks/:id/events`: buffered and live `working` updates, then one
+ * terminal event read from the operation store. Events are written as they
+ * are pushed; a slow timer only rechecks the task record. */
 export function serveTaskEvents(
 	req: IncomingMessage,
 	res: ServerResponse,
-	id: string,
-	credential: string,
-	taskOperations: TaskOperationStore,
-	taskEvents: TaskEventStreams,
-	heartbeatMs: number,
+	route: TaskEventRoute,
 ): void {
-	const initial = taskOperations.get(credential, id);
+	const { id, getView, streams } = route;
+	const initial = getView();
 	if (initial === null) {
 		throw new ApiError(404, "not_found", "No background task with that ID for this credential");
 	}
-	const stream = taskEvents.ensure(id);
-	const isTerminalView = (view: Record<string, unknown> | null) =>
-		view?.status === "completed" || view?.status === "failed";
-	const refreshTerminal = () => {
-		if (isTerminalView(taskOperations.get(credential, id))) {
-			stream.markTerminal();
-		}
-	};
-	refreshTerminal();
+	const stream = streams.ensure(id);
+	if (isTerminalView(initial)) {
+		stream.markTerminal();
+	}
 	const parsedLastId = Number(req.headers["last-event-id"] ?? 0);
 	let lastId = Number.isSafeInteger(parsedLastId) && parsedLastId > 0 ? parsedLastId : 0;
 	let finished = false;
-	let terminalTimer: ReturnType<typeof setInterval> | undefined;
+	let unsubscribe: (() => void) | undefined;
+	let revalidateTimer: ReturnType<typeof setInterval> | undefined;
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	const cleanup = () => {
 		if (finished) {
 			return;
 		}
 		finished = true;
-		if (terminalTimer) {
-			clearInterval(terminalTimer);
+		if (revalidateTimer) {
+			clearInterval(revalidateTimer);
 		}
 		if (heartbeatTimer) {
 			clearInterval(heartbeatTimer);
 		}
+		unsubscribe?.();
 	};
 	const finish = () => {
 		cleanup();
@@ -50,7 +117,10 @@ export function serveTaskEvents(
 		res.write(`id: ${eventId}\nevent: ${event}\ndata: ${JSON.stringify({ taskId: id, ...data })}\n\n`);
 		lastId = eventId;
 	};
-	const writeEvents = () => {
+	const flush = () => {
+		if (finished) {
+			return;
+		}
 		for (const event of stream.after(lastId)) {
 			writeEvent(event.id, event.event, event.data);
 		}
@@ -59,7 +129,7 @@ export function serveTaskEvents(
 			return;
 		}
 		// The store owns the outcome; the stream keeps only the terminal ID.
-		const view = taskOperations.get(credential, id);
+		const view = getView();
 		if (isTerminalView(view)) {
 			writeEvent(terminalId, view?.status as string, view as Record<string, unknown>);
 		}
@@ -75,18 +145,20 @@ export function serveTaskEvents(
 	});
 	res.write("retry: 1000\n: connected\n\n");
 	res.on("close", cleanup);
-	terminalTimer = setInterval(() => {
+	unsubscribe = stream.subscribe(flush);
+	revalidateTimer = setInterval(() => {
 		try {
-			refreshTerminal();
-			writeEvents();
+			if (isTerminalView(getView())) {
+				stream.markTerminal();
+			}
 		} catch {
 			finish();
 		}
-	}, 250);
+	}, route.revalidateMs);
 	heartbeatTimer = setInterval(() => {
 		if (!res.writableEnded) {
 			res.write(": heartbeat\n\n");
 		}
-	}, heartbeatMs);
-	writeEvents();
+	}, route.heartbeatMs);
+	flush();
 }
