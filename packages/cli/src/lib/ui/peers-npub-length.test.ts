@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { toNpub } from "@nostr-agx/nostr";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { toDisplayNpub, toHexPubkey } from "../peer.js";
+import { uiToNpub } from "../peer.js";
 import { MessageStore } from "../store/message-store.js";
 import { createAgxStore } from "./agx-store.js";
 import type { ApiDeps } from "./api.js";
@@ -43,7 +43,7 @@ beforeEach(async () => {
 		identity: () => ({ profile: "default", npub: toNpub(GOOD), relays: [], doctor: { status: "unknown", detail: null } }),
 		send: async () => ({ ok: true, detail: null }),
 		lookupAgent: async () => null,
-		toNpub: (input) => toDisplayNpub(toHexPubkey(input.trim(), "recipient")),
+		toNpub: uiToNpub,
 	};
 	ui = await startUiServer({
 		api,
