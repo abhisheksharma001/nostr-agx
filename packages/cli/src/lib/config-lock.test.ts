@@ -4,7 +4,6 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-	CONFIG_LOCK_BREAKER_STALE_MS,
 	CONFIG_LOCK_STALE_MS,
 	CONFIG_LOCK_UNREADABLE_MS,
 	configLockPath,
@@ -60,6 +59,12 @@ function writeLock(record: Record<string, unknown> | string): void {
 function age(seconds: number, path: string = configLockPath()): void {
 	const past = new Date(Date.now() - seconds * 1000);
 	utimesSync(path, past, past);
+}
+
+function writeBreaker(record: Record<string, unknown> | string): string {
+	const path = `${configLockPath()}.break`;
+	writeFileSync(path, typeof record === "string" ? record : `${JSON.stringify(record)}\n`);
+	return path;
 }
 
 /** Everything in the home folder that belongs to the lock: the lock itself, a breaker, a temp file. */
@@ -230,17 +235,44 @@ describe("withConfigLock", () => {
 	});
 
 	describe("clearing a lock nobody holds", () => {
-		it("goes through the breaker file: a fresh breaker means someone else is clearing, so wait", () => {
-			writeLock({ pid: deadPid(), host: hostname(), token: "gone" });
-			writeFileSync(`${configLockPath()}.break`, "12345\n");
+		const deadHolder = () => writeLock({ pid: deadPid(), host: hostname(), token: "gone" });
+
+		it("goes through the breaker file: a breaker whose owner is running means someone else is clearing, so wait", () => {
+			deadHolder();
+			writeBreaker({ pid: liveProcess(), host: hostname(), token: "clearing" });
 			expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
 			expect(JSON.parse(readFileSync(configLockPath(), "utf8")).token).toBe("gone");
 		});
 
-		it("removes a breaker left behind by a process that died while clearing", () => {
-			writeLock({ pid: deadPid(), host: hostname(), token: "gone" });
-			writeFileSync(`${configLockPath()}.break`, "12345\n");
-			age(CONFIG_LOCK_BREAKER_STALE_MS / 1000 + 1, `${configLockPath()}.break`);
+		it("does not take a breaker away because it is old: its owner may only be paused, and would then remove a lock it no longer has the right to", () => {
+			deadHolder();
+			const breaker = writeBreaker({ pid: liveProcess(), host: hostname(), token: "paused" });
+			age(5, breaker);
+			expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
+			expect(JSON.parse(readFileSync(breaker, "utf8")).token).toBe("paused");
+			expect(JSON.parse(readFileSync(configLockPath(), "utf8")).token).toBe("gone");
+		});
+
+		it("removes a breaker whose owner has exited", () => {
+			deadHolder();
+			writeBreaker({ pid: deadPid(), host: hostname(), token: "died" });
+			expect(withConfigLock(() => "ran", { waitMs: 1_000 })).toBe("ran");
+			expect(lockFiles()).toEqual([]);
+		});
+
+		it("removes a breaker its owner has not refreshed for the stale age, as it does a lock", () => {
+			deadHolder();
+			const breaker = writeBreaker({ pid: liveProcess(), host: hostname(), token: "forgotten" });
+			age(CONFIG_LOCK_STALE_MS / 1000 + 5, breaker);
+			expect(withConfigLock(() => "ran", { waitMs: 1_000 })).toBe("ran");
+			expect(lockFiles()).toEqual([]);
+		});
+
+		it("removes a breaker that has stayed unreadable, and waits while it is new", () => {
+			deadHolder();
+			writeBreaker("12345\n");
+			expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
+			age(CONFIG_LOCK_UNREADABLE_MS / 1000 + 0.5, `${configLockPath()}.break`);
 			expect(withConfigLock(() => "ran", { waitMs: 1_000 })).toBe("ran");
 			expect(lockFiles()).toEqual([]);
 		});
