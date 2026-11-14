@@ -114,8 +114,10 @@ function sameRecord(a: LockRecord | null, b: LockRecord | null): boolean {
  * the same judgement as a lock (owner gone, or not refreshed for the stale age), never because it is
  * old: an owner that is only paused would otherwise wake up and remove a lock it has no right to. It
  * is removed afterwards only if it is still ours.
+ *
+ * Exported so a test can hand it a judgement that has gone out of date, which a race cannot be made to do.
  */
-function clearUnderBreaker(path: string, judged: LockRecord | null): void {
+export function clearUnderBreaker(path: string, judged: LockRecord | null): void {
 	const breaker = `${path}.break`;
 	const token = randomUUID();
 	try {

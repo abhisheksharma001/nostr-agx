@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	CONFIG_LOCK_STALE_MS,
 	CONFIG_LOCK_UNREADABLE_MS,
+	clearUnderBreaker,
 	configLockPath,
 	withConfigLock,
 } from "./config-lock.js";
@@ -274,6 +275,28 @@ describe("withConfigLock", () => {
 			expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
 			age(CONFIG_LOCK_UNREADABLE_MS / 1000 + 0.5, `${configLockPath()}.break`);
 			expect(withConfigLock(() => "ran", { waitMs: 1_000 })).toBe("ran");
+			expect(lockFiles()).toEqual([]);
+		});
+	});
+
+	describe("clearUnderBreaker with a judgement that is out of date", () => {
+		it("does not remove a live lock that took the place of the one judged abandoned", () => {
+			const judged = { pid: deadPid(), host: hostname(), token: "judged" };
+			writeLock({ pid: liveProcess(), host: hostname(), token: "newcomer" });
+			clearUnderBreaker(configLockPath(), judged);
+			expect(JSON.parse(readFileSync(configLockPath(), "utf8")).token).toBe("newcomer");
+			expect(lockFiles()).toEqual(["config.json.lock"]);
+		});
+
+		it("removes the lock it judged when that lock is still abandoned, and leaves no breaker", () => {
+			const record = { pid: deadPid(), host: hostname(), token: "judged" };
+			writeLock(record);
+			clearUnderBreaker(configLockPath(), record);
+			expect(lockFiles()).toEqual([]);
+		});
+
+		it("does nothing, and leaves no breaker, when the lock has vanished", () => {
+			clearUnderBreaker(configLockPath(), { pid: deadPid(), host: hostname(), token: "judged" });
 			expect(lockFiles()).toEqual([]);
 		});
 	});
