@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, linkSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { linkSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname } from "node:path";
 import { configError } from "./errors.js";
-import { clearAbandoned } from "./lock.js";
 import { configPath, ensureDir } from "./paths.js";
 
 /**
@@ -21,6 +20,10 @@ import { configPath, ensureDir } from "./paths.js";
 export const CONFIG_LOCK_WAIT_MS = 5_000;
 /** A lock file not touched for this long is abandoned, whatever its pid says: the section it guards takes milliseconds. */
 export const CONFIG_LOCK_STALE_MS = 30_000;
+/** A record that cannot be read is only judged abandoned once the file is this old. A lock is linked in whole, so a live holder's is never unreadable. */
+export const CONFIG_LOCK_UNREADABLE_MS = 1_000;
+/** The breaker file exists for microseconds. One this old was left by a process that died while clearing. */
+export const CONFIG_LOCK_BREAKER_STALE_MS = 2_000;
 const POLL_MS = 10;
 
 interface LockRecord {
@@ -33,9 +36,9 @@ export function configLockPath(): string {
 	return `${configPath()}.lock`;
 }
 
-function readRecord(path: string): LockRecord | null {
+function parseRecord(text: string): LockRecord | null {
 	try {
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		const parsed: unknown = JSON.parse(text);
 		const { pid, host, token } = parsed as Partial<LockRecord>;
 		if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
 			return null;
@@ -43,6 +46,23 @@ function readRecord(path: string): LockRecord | null {
 		return { pid, host: typeof host === "string" ? host : "", token: typeof token === "string" ? token : "" };
 	} catch {
 		return null;
+	}
+}
+
+function readRecord(path: string): LockRecord | null {
+	try {
+		return parseRecord(readFileSync(path, "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+/** What is at the lock path right now: nothing, or a file whose record may be unreadable. Not the same thing. */
+function look(path: string): { exists: boolean; record: LockRecord | null } {
+	try {
+		return { exists: true, record: parseRecord(readFileSync(path, "utf8")) };
+	} catch {
+		return { exists: false, record: null };
 	}
 }
 
@@ -56,16 +76,23 @@ function isAlive(pid: number): boolean {
 	}
 }
 
-/** True when nobody is holding the lock: an empty file, a holder that has exited, or one nobody refreshed for too long. */
+/**
+ * True when nobody is holding the lock: a holder that has exited, one nobody refreshed for too long,
+ * or a file that has stayed unreadable. Only meaningful for a file that exists. A file that has just
+ * vanished was released, not abandoned, so it is never judged abandoned (that mistake let two
+ * writers hold the lock at once).
+ */
 function abandoned(path: string, record: LockRecord | null): boolean {
-	if (record === null) {
-		return true;
-	}
+	let age: number;
 	try {
-		if (Date.now() - statSync(path).mtimeMs > CONFIG_LOCK_STALE_MS) {
-			return true;
-		}
+		age = Date.now() - statSync(path).mtimeMs;
 	} catch {
+		return false;
+	}
+	if (record === null) {
+		return age > CONFIG_LOCK_UNREADABLE_MS;
+	}
+	if (age > CONFIG_LOCK_STALE_MS) {
 		return true;
 	}
 	if (record.host === "" || record.host === hostname()) {
@@ -74,6 +101,46 @@ function abandoned(path: string, record: LockRecord | null): boolean {
 	}
 	// Another host: a pid means nothing there, so only its age counts (above).
 	return false;
+}
+
+/**
+ * Remove a lock judged abandoned, so that only one process at a time can do it and nobody removes a
+ * lock that is not the one judged. A rename-and-put-back (as the profile lock does) leaves the path
+ * empty for a moment; a third writer could link in there and two would hold the lock.
+ */
+function clearUnderBreaker(path: string, judged: LockRecord | null): void {
+	const breaker = `${path}.break`;
+	try {
+		writeFileSync(breaker, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+			throw error;
+		}
+		// Someone else is clearing. If that someone died, its breaker file stays: remove it once it is old.
+		try {
+			if (Date.now() - statSync(breaker).mtimeMs > CONFIG_LOCK_BREAKER_STALE_MS) {
+				rmSync(breaker, { force: true });
+			}
+		} catch {
+			// Already gone.
+		}
+		return;
+	}
+	try {
+		const now = look(path);
+		if (!now.exists) {
+			return;
+		}
+		const same =
+			judged === null
+				? now.record === null
+				: now.record !== null && now.record.token === judged.token && now.record.pid === judged.pid;
+		if (same && abandoned(path, now.record)) {
+			rmSync(path, { force: true });
+		}
+	} finally {
+		rmSync(breaker, { force: true });
+	}
 }
 
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
@@ -95,7 +162,7 @@ function acquire(waitMs: number): () => void {
 			try {
 				// A hard link is created whole or not at all, so no one ever sees a half-written lock.
 				linkSync(mine, path);
-				// A clearer that judged an older record may have removed this link already.
+				// Only our own record means we hold it.
 				if (readRecord(path)?.token === token) {
 					return () => {
 						if (readRecord(path)?.token === token) {
@@ -108,9 +175,10 @@ function acquire(waitMs: number): () => void {
 					throw error;
 				}
 			}
-			const holder = existsSync(path) ? readRecord(path) : null;
-			if (abandoned(path, holder) && Date.now() < deadline) {
-				clearAbandoned(path, holder);
+			const held = look(path);
+			if (held.exists && abandoned(path, held.record) && Date.now() < deadline) {
+				clearUnderBreaker(path, held.record);
+				pause(1);
 				continue;
 			}
 			if (Date.now() >= deadline) {
@@ -119,7 +187,8 @@ function acquire(waitMs: number): () => void {
 					`If no other agx command is running, remove the lock and try again:\n    rm ${path}`,
 				);
 			}
-			pause(POLL_MS);
+			// The lock was released between our link attempt and our look: try again at once.
+			pause(held.exists ? POLL_MS : 1);
 		}
 	} finally {
 		rmSync(mine, { force: true });

@@ -1,9 +1,15 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CONFIG_LOCK_STALE_MS, configLockPath, withConfigLock } from "./config-lock.js";
+import {
+	CONFIG_LOCK_BREAKER_STALE_MS,
+	CONFIG_LOCK_STALE_MS,
+	CONFIG_LOCK_UNREADABLE_MS,
+	configLockPath,
+	withConfigLock,
+} from "./config-lock.js";
 import { AgxCliError } from "./errors.js";
 
 let home: string;
@@ -51,9 +57,14 @@ function writeLock(record: Record<string, unknown> | string): void {
 	writeFileSync(configLockPath(), typeof record === "string" ? record : `${JSON.stringify(record)}\n`);
 }
 
-function age(seconds: number): void {
+function age(seconds: number, path: string = configLockPath()): void {
 	const past = new Date(Date.now() - seconds * 1000);
-	utimesSync(configLockPath(), past, past);
+	utimesSync(path, past, past);
+}
+
+/** Everything in the home folder that belongs to the lock: the lock itself, a breaker, a temp file. */
+function lockFiles(): string[] {
+	return readdirSync(home).filter((name) => name.startsWith("config.json.lock"));
 }
 
 describe("withConfigLock", () => {
@@ -88,6 +99,18 @@ describe("withConfigLock", () => {
 		expect(value).toBe("inner");
 		expect(Date.now() - started).toBeLessThan(40);
 		expect(existsSync(configLockPath())).toBe(false);
+	});
+
+	it("leaves no lock, breaker or temp file behind, after a run, a takeover or a refusal", () => {
+		withConfigLock(() => undefined);
+		expect(lockFiles()).toEqual([]);
+		writeLock({ pid: deadPid(), host: hostname(), token: "gone" });
+		withConfigLock(() => undefined, { waitMs: 500 });
+		expect(lockFiles()).toEqual([]);
+		writeLock({ pid: liveProcess(), host: hostname(), token: "other" });
+		expect(() => withConfigLock(() => undefined, { waitMs: 100 })).toThrow(/config lock/i);
+		// Only the other process's lock remains: no temp file of ours, no breaker.
+		expect(lockFiles()).toEqual(["config.json.lock"]);
 	});
 
 	it("does not remove a lock that another process took while the function ran", () => {
@@ -173,9 +196,53 @@ describe("withConfigLock", () => {
 			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
 		});
 
-		it("is taken over when the file is empty", () => {
+		it("is taken over when the file has stayed empty", () => {
 			writeLock("");
+			age(CONFIG_LOCK_UNREADABLE_MS / 1000 + 1);
 			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
+		});
+
+		it("is NOT taken over while an unreadable file is new: it may be mid-change, and a vanished file is never abandoned", () => {
+			writeLock("");
+			expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
+			expect(readFileSync(configLockPath(), "utf8")).toBe("");
+		});
+
+		it("is taken over when it is from this very pid but we do not hold it (an earlier life of the pid)", () => {
+			writeLock({ pid: process.pid, host: hostname(), token: "earlier-life" });
+			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
+		});
+
+		it("is taken over when its record has no host and its process has exited", () => {
+			writeLock({ pid: deadPid(), token: "no-host" });
+			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
+		});
+
+		it("is NOT taken over when its record has no host and its process is alive", () => {
+			writeLock({ pid: liveProcess(), token: "no-host" });
+			expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
+		});
+
+		it("is NOT taken over when it is fresh, from another host, and its pid is not running here", () => {
+			writeLock({ pid: deadPid(), host: "some-other-container", token: "far" });
+			expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
+		});
+	});
+
+	describe("clearing a lock nobody holds", () => {
+		it("goes through the breaker file: a fresh breaker means someone else is clearing, so wait", () => {
+			writeLock({ pid: deadPid(), host: hostname(), token: "gone" });
+			writeFileSync(`${configLockPath()}.break`, "12345\n");
+			expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
+			expect(JSON.parse(readFileSync(configLockPath(), "utf8")).token).toBe("gone");
+		});
+
+		it("removes a breaker left behind by a process that died while clearing", () => {
+			writeLock({ pid: deadPid(), host: hostname(), token: "gone" });
+			writeFileSync(`${configLockPath()}.break`, "12345\n");
+			age(CONFIG_LOCK_BREAKER_STALE_MS / 1000 + 1, `${configLockPath()}.break`);
+			expect(withConfigLock(() => "ran", { waitMs: 1_000 })).toBe("ran");
+			expect(lockFiles()).toEqual([]);
 		});
 	});
 });
