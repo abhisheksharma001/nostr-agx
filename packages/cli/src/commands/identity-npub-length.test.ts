@@ -71,6 +71,20 @@ describe("an allowlist entry stored by an older agx for an npub of the wrong len
 		expect(effectiveProfile("default").allow).toEqual([JUNK]);
 	});
 
+	it("identity deny matches the listed entry whatever its case", async () => {
+		const run = await agx("identity", "deny", JUNK.toUpperCase());
+		expect(run.code).toBe(EXIT.ok);
+		expect(effectiveProfile("default").allow).toEqual([GOOD]);
+	});
+
+	it("identity deny never matches part of an entry", async () => {
+		for (const part of [JUNK.slice(0, -1), JUNK.slice(0, 4), JUNK.slice(1)]) {
+			const run = await agx("identity", "deny", part);
+			expect(run.code).toBe(EXIT.usage);
+		}
+		expect(effectiveProfile("default").allow).toEqual([GOOD, JUNK]);
+	});
+
 	it("identity deny still refuses hex of the wrong length that is not on the list", async () => {
 		const run = await agx("identity", "deny", "12".repeat(20));
 		expect(run.code).toBe(EXIT.usage);
