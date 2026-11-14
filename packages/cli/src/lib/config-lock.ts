@@ -18,12 +18,10 @@ import { configPath, ensureDir } from "./paths.js";
 
 /** How long a writer waits for another one before it gives up. A holder normally lets go within milliseconds. */
 export const CONFIG_LOCK_WAIT_MS = 5_000;
-/** A lock file not touched for this long is abandoned, whatever its pid says: the section it guards takes milliseconds. */
+/** A lock file older than this is abandoned, whatever its pid says: the section it guards takes milliseconds. The age counts from when its owner started waiting for it, not from when it got it. */
 export const CONFIG_LOCK_STALE_MS = 30_000;
 /** A record that cannot be read is only judged abandoned once the file is this old. A lock is linked in whole, so a live holder's is never unreadable. */
 export const CONFIG_LOCK_UNREADABLE_MS = 1_000;
-/** The breaker file exists for microseconds. One this old was left by a process that died while clearing. */
-export const CONFIG_LOCK_BREAKER_STALE_MS = 2_000;
 const POLL_MS = 10;
 
 interface LockRecord {
@@ -103,26 +101,39 @@ function abandoned(path: string, record: LockRecord | null): boolean {
 	return false;
 }
 
+function sameRecord(a: LockRecord | null, b: LockRecord | null): boolean {
+	return a === null || b === null ? a === b : a.token === b.token && a.pid === b.pid;
+}
+
 /**
  * Remove a lock judged abandoned, so that only one process at a time can do it and nobody removes a
  * lock that is not the one judged. A rename-and-put-back (as the profile lock does) leaves the path
  * empty for a moment; a third writer could link in there and two would hold the lock.
+ *
+ * The breaker file is itself a lock: it carries its owner's pid and a token. It is taken away only by
+ * the same judgement as a lock (owner gone, or not refreshed for the stale age), never because it is
+ * old: an owner that is only paused would otherwise wake up and remove a lock it has no right to. It
+ * is removed afterwards only if it is still ours.
  */
 function clearUnderBreaker(path: string, judged: LockRecord | null): void {
 	const breaker = `${path}.break`;
+	const token = randomUUID();
 	try {
-		writeFileSync(breaker, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+		writeFileSync(breaker, `${JSON.stringify({ pid: process.pid, host: hostname(), token })}\n`, {
+			flag: "wx",
+			mode: 0o600,
+		});
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
 			throw error;
 		}
-		// Someone else is clearing. If that someone died, its breaker file stays: remove it once it is old.
-		try {
-			if (Date.now() - statSync(breaker).mtimeMs > CONFIG_LOCK_BREAKER_STALE_MS) {
+		// Someone else is clearing. Take their breaker away only if its owner is gone.
+		const other = look(breaker);
+		if (other.exists && abandoned(breaker, other.record)) {
+			const again = look(breaker);
+			if (again.exists && sameRecord(again.record, other.record)) {
 				rmSync(breaker, { force: true });
 			}
-		} catch {
-			// Already gone.
 		}
 		return;
 	}
@@ -131,15 +142,13 @@ function clearUnderBreaker(path: string, judged: LockRecord | null): void {
 		if (!now.exists) {
 			return;
 		}
-		const same =
-			judged === null
-				? now.record === null
-				: now.record !== null && now.record.token === judged.token && now.record.pid === judged.pid;
-		if (same && abandoned(path, now.record)) {
+		if (sameRecord(now.record, judged) && abandoned(path, now.record)) {
 			rmSync(path, { force: true });
 		}
 	} finally {
-		rmSync(breaker, { force: true });
+		if (readRecord(breaker)?.token === token) {
+			rmSync(breaker, { force: true });
+		}
 	}
 }
 
