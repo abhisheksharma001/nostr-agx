@@ -11,6 +11,10 @@ import { agx, sandbox } from "../test/helpers.js";
 
 let box: ReturnType<typeof sandbox>;
 const NSEC = nip19.nsecEncode(hexToBytes(createIdentity().secretKeyHex));
+const OTHER_NSEC = nip19.nsecEncode(hexToBytes(createIdentity().secretKeyHex));
+/** The whole of what is printed instead: pinned exactly, so the message cannot be edited into one that shows part of the key. */
+const REPLACED =
+	"error: the command line contains a secret key (nsec1…), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
 
 /** The first 10-character stretch of the key's data part (not the constant `nsec1`) found in `shown`, in any case; null if none. */
 function leakedPart(shown: string, key: string): string | null {
@@ -43,13 +47,20 @@ describe("a secret key on a command line the parser rejects", () => {
 		["an unknown option", [`--${NSEC}`]],
 		["an unknown option of a subcommand", ["send", `--${NSEC}`, "someone", "hello"]],
 		["--json mode", ["--json", "send", NSEC, "hello", "world"]],
+		["a key cut short", [NSEC.slice(0, 25)]],
+		["a key cut very short", [NSEC.slice(0, 12)]],
+		["a key with a typo in it", [`${NSEC.slice(0, 30)}${NSEC[30] === "q" ? "p" : "q"}${NSEC.slice(31)}`]],
+		["a key with one character too many", [`${NSEC}q`]],
+		["two keys on one line", ["send", NSEC, "hello", OTHER_NSEC]],
 	])("%s: says why and prints none of it", async (_name, args) => {
 		const run = await agx(...args);
 		expect(run.code).toBe(1);
-		expect(run.stderr).toMatch(/secret key/i);
+		expect(run.stdout).toBe("");
+		expect(run.stderr).toBe(REPLACED);
 		for (const out of [run.stdout, run.stderr]) {
 			expect(out).not.toContain(NSEC);
 			expect(leakedPart(out, NSEC)).toBeNull();
+			expect(leakedPart(out, OTHER_NSEC)).toBeNull();
 		}
 	});
 });
