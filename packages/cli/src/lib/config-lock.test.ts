@@ -76,9 +76,15 @@ describe("withConfigLock", () => {
 		expect(withConfigLock(() => "again")).toBe("again");
 	});
 
-	it("is re-entrant: a nested call inside the function does not wait for itself", () => {
+	it("is re-entrant: a nested call does not wait for itself, and does not take the outer lock over", () => {
 		const started = Date.now();
-		const value = withConfigLock(() => withConfigLock(() => "inner", { waitMs: 50 }));
+		const value = withConfigLock(() => {
+			const before = readFileSync(configLockPath(), "utf8");
+			const inner = withConfigLock(() => "inner", { waitMs: 50 });
+			// Still the outer call's own lock, not a new one the nested call made.
+			expect(readFileSync(configLockPath(), "utf8")).toBe(before);
+			return inner;
+		});
 		expect(value).toBe("inner");
 		expect(Date.now() - started).toBeLessThan(40);
 		expect(existsSync(configLockPath())).toBe(false);
