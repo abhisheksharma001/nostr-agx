@@ -88,8 +88,10 @@ export async function uiCommand(options: UiOptions): Promise<void> {
 				allowed,
 				loadAllow,
 				changeAllow: (hex, on) => {
-					const current = getProfile(profileName).allow.filter((entry) => toHexPubkey(entry, "allowlist entry") !== hex);
-					updateProfile(profileName, { allow: on ? [...current, hex] : current });
+					updateProfile(profileName, (profile) => {
+						const current = profile.allow.filter((entry) => toHexPubkey(entry, "allowlist entry") !== hex);
+						return { allow: on ? [...current, hex] : current };
+					});
 				},
 				sync: async () => {
 					pull ??= await createAgxSync({

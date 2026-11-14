@@ -16,6 +16,7 @@ import {
 	type ExitCode,
 	usageError,
 } from "./errors.js";
+import { withConfigLock } from "./config-lock.js";
 import { notice } from "./output.js";
 import { configPath, writePrivateJson } from "./paths.js";
 import { runtime } from "./runtime.js";
@@ -112,10 +113,12 @@ function storedConfig(): AgxConfig | null {
  * the server it was used with.
  */
 export function migrateLegacyKeysNow(): void {
-	const config = storedConfig();
-	if (config && Object.values(config.profiles).some((p) => p.apiKey)) {
-		saveConfig(config);
-	}
+	withConfigLock(() => {
+		const config = storedConfig();
+		if (config && Object.values(config.profiles).some((p) => p.apiKey)) {
+			saveConfig(config);
+		}
+	});
 }
 
 /**
@@ -192,10 +195,24 @@ export function saveProfile(name: string, profile: Profile): void {
 	saveConfig(config);
 }
 
-export function updateProfile(name: string, patch: Partial<Profile>): Profile {
-	const next = { ...getProfile(name), ...patch };
-	saveProfile(name, next);
-	return next;
+/**
+ * Change a profile and save it, holding the config lock for the whole read-modify-write
+ * so two overlapping `agx` commands cannot drop each other's change.
+ *
+ * Pass a function when the new value depends on the old one (adding to or removing
+ * from the allowlist): it receives the profile as it is on disk once the lock is held,
+ * not a copy read earlier. A plain patch is applied over the same fresh read.
+ */
+export function updateProfile(
+	name: string,
+	change: Partial<Profile> | ((current: Profile) => Partial<Profile>),
+): Profile {
+	return withConfigLock(() => {
+		const current = getProfile(name);
+		const next = { ...current, ...(typeof change === "function" ? change(current) : change) };
+		saveProfile(name, next);
+		return next;
+	});
 }
 
 /** Environment overrides are applied per-read rather than persisted, so a
