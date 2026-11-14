@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -118,6 +118,47 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 		}
 		expect(result).toEqual({ stillAllowed: [], newPeerLost: [] });
 	}, 120_000);
+
+	// Two writers are not enough to see every way the lock can fail: with many at once, a writer that
+	// judges the lock abandoned can clear the lock a faster writer has just taken.
+	it("keeps every change when eight denies and eight allows all overlap", async () => {
+		const result = { denyUndone: 0, allowLost: 0, nonzeroExits: 0 };
+		for (let round = 0; round < 30; round += 1) {
+			const denied = Array.from({ length: 8 }, () => createIdentity().npub);
+			const added = Array.from({ length: 8 }, () => createIdentity().npub);
+			await agx("identity", "allow", ...denied);
+			const runs = await Promise.all([
+				...denied.map((npub) => agx("identity", "deny", npub)),
+				...added.map((npub) => agx("identity", "allow", npub)),
+			]);
+			result.nonzeroExits += runs.filter((run) => run.code !== 0).length;
+			const have = await allowed();
+			result.denyUndone += denied.filter((npub) => have.has(npub)).length;
+			result.allowLost += added.filter((npub) => !have.has(npub)).length;
+		}
+		expect(result).toEqual({ denyUndone: 0, allowLost: 0, nonzeroExits: 0 });
+	}, 600_000);
+
+	it("keeps every npub when many writers wait on a lock whose owner is killed", async () => {
+		const result = { lost: 0, nonzeroExits: 0 };
+		const asked: string[] = [];
+		for (let round = 0; round < 25; round += 1) {
+			const owner = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+			writeFileSync(
+				join(home, "config.json.lock"),
+				`${JSON.stringify({ pid: owner.pid, host: hostname(), token: "planted" })}\n`,
+			);
+			const npubs = Array.from({ length: 16 }, () => createIdentity().npub);
+			asked.push(...npubs);
+			const runs = Promise.all(npubs.map((npub) => agx("identity", "allow", npub)));
+			await new Promise((resolve) => setTimeout(resolve, 1_000));
+			owner.kill("SIGKILL");
+			result.nonzeroExits += (await runs).filter((run) => run.code !== 0).length;
+		}
+		const have = await allowed();
+		result.lost = asked.filter((npub) => !have.has(npub)).length;
+		expect(result).toEqual({ lost: 0, nonzeroExits: 0 });
+	}, 600_000);
 
 	it("keeps both changes when config use and identity allow overlap", async () => {
 		const asked: string[] = [];
