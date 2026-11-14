@@ -44,6 +44,16 @@ describe("updateProfile with an updater function", () => {
 		expect(getProfile("default").allow).toEqual([A, B, C]);
 	});
 
+	it("holds the config lock while the updater runs, and lets go afterwards", () => {
+		let heldDuring = false;
+		updateProfile("default", (current) => {
+			heldDuring = existsSync(lockFile());
+			return { allow: [...current.allow, A] };
+		});
+		expect(heldDuring).toBe(true);
+		expect(existsSync(lockFile())).toBe(false);
+	});
+
 	it("returns the profile it saved", () => {
 		updateProfile("default", { allow: [A] });
 		const saved = updateProfile("default", (current) => ({ allow: [...current.allow, B] }));

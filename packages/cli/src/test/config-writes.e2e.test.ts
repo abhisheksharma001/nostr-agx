@@ -87,6 +87,38 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 		expect(result).toEqual({ stillAllowed: [], newPeerLost: [] });
 	}, 120_000);
 
+	it("keeps both changes when held allow and identity allow overlap", async () => {
+		const asked: string[] = [];
+		for (let round = 0; round < 15; round += 1) {
+			const a = createIdentity().npub;
+			const b = createIdentity().npub;
+			asked.push(a, b);
+			const runs = await Promise.all([agx("held", "allow", a), agx("identity", "allow", b)]);
+			expect(runs.map((run) => run.code)).toEqual([0, 0]);
+		}
+		const have = await allowed();
+		expect(asked.filter((npub) => !have.has(npub))).toEqual([]);
+	}, 120_000);
+
+	it("a peer that held block removed stays removed when an allow overlaps it", async () => {
+		const result = { stillAllowed: [] as number[], newPeerLost: [] as number[] };
+		for (let round = 0; round < 25; round += 1) {
+			const x = createIdentity().npub;
+			const y = createIdentity().npub;
+			await agx("identity", "allow", x);
+			const runs = await Promise.all([agx("held", "block", x), agx("identity", "allow", y)]);
+			expect(runs.map((run) => run.code)).toEqual([0, 0]);
+			const have = await allowed();
+			if (have.has(x)) {
+				result.stillAllowed.push(round);
+			}
+			if (!have.has(y)) {
+				result.newPeerLost.push(round);
+			}
+		}
+		expect(result).toEqual({ stillAllowed: [], newPeerLost: [] });
+	}, 120_000);
+
 	it("keeps both changes when config use and identity allow overlap", async () => {
 		const asked: string[] = [];
 		for (let round = 0; round < 15; round += 1) {
