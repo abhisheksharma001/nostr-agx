@@ -85,6 +85,14 @@ describe("an allowlist entry stored by an older agx for an npub of the wrong len
 		expect(effectiveProfile("default").allow).toEqual([GOOD, JUNK]);
 	});
 
+	it("identity deny of a valid peer never takes out an entry that only contains it", async () => {
+		const longer = "ab".repeat(32);
+		updateProfile("default", { allow: [JUNK, longer] });
+		const run = await agx("identity", "deny", longer);
+		expect(run.code).toBe(EXIT.ok);
+		expect(effectiveProfile("default").allow).toEqual([JUNK]);
+	});
+
 	it("identity deny still refuses hex of the wrong length that is not on the list", async () => {
 		const run = await agx("identity", "deny", "12".repeat(20));
 		expect(run.code).toBe(EXIT.usage);
