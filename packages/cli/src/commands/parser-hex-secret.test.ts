@@ -1,6 +1,8 @@
 import { bytesToHex, publicKeyFromSecret } from "@nostr-agx/nostr";
+import type { Command } from "commander";
 import { generateSecretKey, nip19 } from "nostr-tools";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { buildProgram } from "../program.js";
 import { type CliRun, agx, sandbox } from "../test/helpers.js";
 
 // The command parser prints its own usage errors, quoting what was typed. A
@@ -70,13 +72,29 @@ const MISPLACED: Array<[string, (hex: string) => string[]]> = [
 	["agx -<hex>", (hex) => [`-${hex}`]],
 	["agx identity --<hex>", (hex) => ["identity", `--${hex}`]],
 	["agx send --<hex> someone hello", (hex) => ["send", `--${hex}`, "someone", "hello"]],
+	["agx gateway key <hex>", (hex) => ["gateway", "key", hex]],
+	["agx gateway --<hex>", (hex) => ["gateway", `--${hex}`]],
 	["a quote before the key", (hex) => [`it's${hex}`]],
 	["a line break before the key", (hex) => [`a\n${hex}`]],
 	["the key inside a longer word", (hex) => [`key-${hex}-copy`]],
 	["a key twice as long", (hex) => [`${hex}${hex}`]],
 ];
 
-describe("a 64-digit hex secret key typed as a command or option name", () => {
+/**
+ * `gateway` is the one command with its own action AND subcommands, so a mistyped
+ * subcommand word is not "unknown command": Commander reports it as "too many
+ * arguments for 'gateway'. Expected 0 arguments but got 1: <what was typed>."
+ */
+const GATEWAY_EXCESS: Array<[string, (hex: string) => string[]]> = [
+	["agx gateway <hex>", (hex) => ["gateway", hex]],
+	["agx gateway --port 1 <hex>", (hex) => ["gateway", "--port", "1", hex]],
+	["agx gateway <hex> --port 1", (hex) => ["gateway", hex, "--port", "1"]],
+	["agx gateway foo <hex>", (hex) => ["gateway", "foo", hex]],
+	["agx gateway <hex> foo", (hex) => ["gateway", hex, "foo"]],
+];
+
+/** Every case, in lower and UPPER case, in text and --json mode: says why and prints none of it. */
+function leakMatrix(cases: Array<[string, (hex: string) => string[]]>) {
 	describe.each([
 		["lower case", SECRET],
 		["UPPER CASE", SECRET.toUpperCase()],
@@ -85,7 +103,7 @@ describe("a 64-digit hex secret key typed as a command or option name", () => {
 			["text", [] as string[]],
 			["--json", ["--json"]],
 		])("%s", (_mode, flags) => {
-			it.each(MISPLACED)("%s: says why and prints none of it", async (_name, make) => {
+			it.each(cases)("%s: says why and prints none of it", async (_name, make) => {
 				const run = await agx(...flags, ...make(hex));
 				expect(summarize(run, SECRET, REPLACED_HEX)).toEqual({
 					code: 1,
@@ -95,6 +113,65 @@ describe("a 64-digit hex secret key typed as a command or option name", () => {
 				});
 			});
 		});
+	});
+}
+
+describe("a 64-digit hex secret key typed as a command or option name", () => {
+	leakMatrix(MISPLACED);
+});
+
+describe("a hex secret key typed after `gateway` (a command with its own action and subcommands)", () => {
+	leakMatrix(GATEWAY_EXCESS);
+
+	it("keeps the normal 'too many arguments' error for a word that is not a key", async () => {
+		const run = await agx("gateway", "foo");
+		expect(run.code).toBe(1);
+		expect(run.stdout).toBe("");
+		expect(run.stderr).toBe("error: too many arguments for 'gateway'. Expected 0 arguments but got 1: foo.\n");
+	});
+
+	it("leaves `gateway key new <hex>` as it was: a zero-argument subcommand is left for issue #57", async () => {
+		const run = await agx("gateway", "key", "new", SECRET);
+		const was = `error: too many arguments for 'new'. Expected 0 arguments but got 1: ${SECRET}.\n`;
+		expect({
+			code: run.code,
+			stdout: run.stdout,
+			stderr: run.stderr === was ? "(unchanged, shows the typed word)" : "(something else)",
+		}).toEqual({ code: 1, stdout: "", stderr: "(unchanged, shows the typed word)" });
+	});
+});
+
+/** The path of every command that has at least one subcommand (the root is `[]`). */
+function commandsWithSubcommands(command: Command, path: string[] = []): string[][] {
+	const found = command.commands.length > 0 ? [path] : [];
+	for (const sub of command.commands) {
+		found.push(...commandsWithSubcommands(sub, [...path, sub.name()]));
+	}
+	return found;
+}
+
+describe("every command that has subcommands", () => {
+	const paths = commandsWithSubcommands(buildProgram());
+
+	it("includes the ones this test exists for", () => {
+		const names = paths.map((path) => path.join(" "));
+		expect(names).toEqual(expect.arrayContaining(["", "identity", "gateway", "gateway key"]));
+		expect(paths.length).toBeGreaterThanOrEqual(8);
+	});
+
+	// A future command with its own action AND subcommands reports a mistyped
+	// subcommand as "too many arguments" and would quote the key: this walk fails then.
+	describe.each([
+		["lower case", SECRET],
+		["UPPER CASE", SECRET.toUpperCase()],
+	])("%s", (_label, hex) => {
+		it.each(paths.map((path) => [path.join(" ") || "(the root)", path] as const))(
+			"`agx %s <hex>` prints no part of the key",
+			async (_name, path) => {
+				const run = await agx(...path, hex);
+				expect({ leaked: leaks(run.stdout + run.stderr, SECRET) }).toEqual({ leaked: false });
+			},
+		);
 	});
 });
 
