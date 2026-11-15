@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { hexToBytes } from "@nostr-agx/nostr";
 import { nip19 } from "nostr-tools";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getProfile, saveProfile } from "../lib/config.js";
 import { createIdentity } from "../lib/identity.js";
 import { agx, sandbox } from "../test/helpers.js";
 
@@ -68,6 +69,8 @@ describe("a secret key given as the profile name with -p", () => {
 	])("agx %s refuses it, prints none of it and writes nothing", async (_name, args) => {
 		const run = await agx("-p", NSEC, ...args);
 		expectRefusedAndSilent(run);
+		expect(run.stderr).toContain("-p/--profile");
+		expect(run.stderr).toContain("agx -p work");
 		expect(existsSync(join(box.home, "profiles"))).toBe(false);
 		for (const text of everythingUnder(box.home)) {
 			expect(leakedPart(text, NSEC)).toBeNull();
@@ -103,6 +106,8 @@ describe("a secret key given as the profile name in AGX_PROFILE", () => {
 		const run = await agx(...args);
 		expectRefusedAndSilent(run);
 		expect(run.stderr).toContain("AGX_PROFILE");
+		expect(run.stderr).toContain("unset AGX_PROFILE");
+		expect(run.stderr).not.toContain("-p/--profile");
 		expect(existsSync(join(box.home, "profiles"))).toBe(false);
 		for (const text of everythingUnder(box.home)) {
 			expect(leakedPart(text, NSEC)).toBeNull();
@@ -114,6 +119,9 @@ describe("a secret key given to `agx config use`", () => {
 	it("refuses it and stores nothing, so it never becomes the active profile", async () => {
 		const run = await agx("config", "use", NSEC);
 		expectRefusedAndSilent(run);
+		expect(run.stderr).toContain("agx config use");
+		expect(run.stderr).toContain("agx config use work");
+		expect(run.stderr).not.toContain("-p/--profile");
 		for (const text of everythingUnder(box.home)) {
 			expect(leakedPart(text, NSEC)).toBeNull();
 		}
@@ -121,6 +129,28 @@ describe("a secret key given to `agx config use`", () => {
 
 	it("refuses a key after nostr: too", async () => {
 		expectRefusedAndSilent(await agx("config", "use", `nostr:${NSEC}`));
+	});
+});
+
+describe("which name is checked", () => {
+	it("checks the name that is used: -p work wins over a key in AGX_PROFILE, so nothing is refused or shown", async () => {
+		process.env.AGX_PROFILE = NSEC;
+		const run = await agx("-p", "work", "identity", "new");
+		expect(run.code).toBe(0);
+		for (const out of [run.stdout, run.stderr]) {
+			expect(leakedPart(out, NSEC)).toBeNull();
+		}
+		expect(existsSync(join(box.home, "profiles", "work", "identity.json"))).toBe(true);
+	});
+
+	it("does not check a profile name already stored by an older agx, so `config use` can still replace it", async () => {
+		saveProfile(NSEC, getProfile(NSEC));
+		const use = await agx("config", "use", "work");
+		expect(use.code).toBe(0);
+		const show = await agx("config", "show");
+		expect(show.code).toBe(0);
+		expect(show.stdout).toContain('"work"');
+		expect(leakedPart(show.stdout + show.stderr, NSEC)).toBeNull();
 	});
 });
 
