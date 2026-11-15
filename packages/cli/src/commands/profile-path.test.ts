@@ -76,10 +76,35 @@ describe("a profile name that is not one folder name, given with -p", () => {
 		expect(run.stdout + run.stderr).not.toContain("escape-me");
 	});
 
+	it("gives the -p advice, not the AGX_PROFILE advice, when AGX_PROFILE is set to a good name too", async () => {
+		process.env.AGX_PROFILE = "work";
+		const run = await agx("-p", "../escape", "identity", "new");
+		expectRefusedAndNothingWritten(run);
+		expect(run.stderr).toContain("-p/--profile");
+		expect(run.stderr).toContain("agx -p work");
+		expect(run.stderr).not.toContain("unset AGX_PROFILE");
+	});
+
 	it("also refuses it in JSON mode", async () => {
 		const run = await agx("-p", "../escape", "config", "show", "--json");
 		expect(run.code).toBe(2);
 		expect(outsideHome()).toEqual([]);
+	});
+});
+
+describe("the refusal never repeats the name, whichever way it was given", () => {
+	it("AGX_PROFILE", async () => {
+		process.env.AGX_PROFILE = "../escape-me";
+		const run = await agx("identity", "new");
+		expect(run.code).toBe(2);
+		expect(run.stdout + run.stderr).not.toContain("escape-me");
+	});
+
+	it("agx config use", async () => {
+		const run = await agx("config", "use", "../escape-me");
+		expect(run.code).toBe(2);
+		expect(run.stdout + run.stderr).not.toContain("escape-me");
+		expect(existsSync(join(home, "config.json"))).toBe(false);
 	});
 });
 
@@ -140,6 +165,7 @@ describe("an ordinary profile name", () => {
 		["three dots", "..."],
 		["a name with a space", "my agent"],
 		["a name that only looks like a path", "a..b"],
+		["two dots and a space", ".. "],
 	])("%s still works with -p", async (_what, name) => {
 		const run = await agx("-p", name, "identity", "new");
 		expect(run.code).toBe(0);
