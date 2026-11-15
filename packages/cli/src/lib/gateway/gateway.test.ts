@@ -106,6 +106,18 @@ function api(path: string, init: RequestInit & { key?: string | null } = {}) {
 	});
 }
 
+/** True when `text` holds any 10-character stretch of the key's data part (not the constant `nsec1`), in any case. */
+function leaksKey(text: string, key: string): boolean {
+	const data = key.toLowerCase().slice(5);
+	const lower = text.toLowerCase();
+	for (let i = 0; i + 10 <= data.length; i++) {
+		if (lower.includes(data.slice(i, i + 10))) {
+			return true;
+		}
+	}
+	return false;
+}
+
 async function json(res: Response): Promise<Record<string, unknown>> {
 	return (await res.json()) as Record<string, unknown>;
 }
@@ -305,15 +317,7 @@ describe("agx gateway: outbound", () => {
 
 	it("refuses a secret key given as the agent, and neither repeats nor stores it", async () => {
 		const nsec = nip19.nsecEncode(generateKeypair().secretKey);
-		const leaks = (text: string) => {
-			const data = nsec.toLowerCase().slice(5);
-			for (let i = 0; i + 10 <= data.length; i++) {
-				if (text.toLowerCase().includes(data.slice(i, i + 10))) {
-					return true;
-				}
-			}
-			return false;
-		};
+		const leaks = (text: string) => leaksKey(text, nsec);
 		const calls = [
 			api("/v1/tasks", { method: "POST", body: JSON.stringify({ peer: nsec, capability: "x.y" }) }),
 			api("/v1/tasks", {
@@ -352,6 +356,34 @@ describe("agx gateway: outbound", () => {
 		}
 		expect(scanned).toBeGreaterThan(0);
 	});
+
+	it("does not repeat a secret key found in a request path, in an answer or in the gateway's log", async () => {
+		const nsec = nip19.nsecEncode(generateKeypair().secretKey);
+		const lines: string[] = [];
+		await gateway.close();
+		gateway = await startGateway({ ...gatewayOptions(), log: (line: string) => lines.push(line) });
+		try {
+			const calls = [
+				api(`/v1/agents/${nsec}`, { method: "POST" }), // the wrong method for that route
+				api(`/v1/agent/${nsec}`), // a typo in the route
+				api(`/agents/${nsec}`, { key: null }), // outside /v1/, answered before any key is checked
+				api(`/v1/subscriptions/${nsec}`),
+				api(`/v1/subscriptions/${nsec}`, { method: "DELETE" }),
+				api(`/v1/agents/${nsec}%zz`), // a bad percent escape: decoding it throws
+				api(`/v1/agents/${nsec}`), // the route that is handled
+			];
+			for (const res of await Promise.all(calls)) {
+				expect(res.status).toBeGreaterThanOrEqual(400);
+				expect(leaksKey(await res.text(), nsec)).toBe(false);
+			}
+			// The log sink is live: the bad escape is the one answer the gateway writes to its log.
+			expect(lines.some((line) => line.startsWith("API error"))).toBe(true);
+			expect(leaksKey(lines.join("\n"), nsec)).toBe(false);
+		} finally {
+			await gateway.close();
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 30_000);
 
 	it("sends a message the peer can read, and bounds automated replies", async () => {
 		const reader = await peer();
