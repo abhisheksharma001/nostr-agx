@@ -145,6 +145,8 @@ describe("which name is checked", () => {
 
 	it("does not check a profile name already stored by an older agx, so `config use` can still replace it", async () => {
 		saveProfile(NSEC, getProfile(NSEC));
+		// `threads` resolves the stored active profile and does not print its name.
+		expect((await agx("threads")).code).toBe(0);
 		const use = await agx("config", "use", "work");
 		expect(use.code).toBe(0);
 		const show = await agx("config", "show");
