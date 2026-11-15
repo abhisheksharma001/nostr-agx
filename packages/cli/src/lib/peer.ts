@@ -9,8 +9,8 @@ export function toHexPubkey(input: string, label = "identity"): string {
 	const hex = normalizePubkey(input.trim());
 	if (!hex) {
 		// A secret key pasted where a peer belongs must not come back in the error: stderr
-		// lives on in terminal scrollback, logs and an agent's context. Matching `nsec1`
-		// anywhere in the value, in any case, also covers a `nostr:` scheme and a typo.
+		// lives on in terminal scrollback, logs and an agent's context. Matching `nsec1` or
+		// `ncryptsec1` anywhere in the value, in any case, also covers a `nostr:` scheme and a typo.
 		if (holdsSecretKey(input)) {
 			throw usageError(
 				`The ${label} you gave is a secret key (nsec1…), not a public one, so it is not shown here. Expected an npub1… or a 64-character hex pubkey.`,
