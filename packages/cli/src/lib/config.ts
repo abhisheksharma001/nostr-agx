@@ -207,11 +207,33 @@ export function refuseSecretKeyAsProfileName(name: string, source: ProfileNameSo
 	}
 }
 
+/** Empty, `.`, `..`, or anything with a path separator in it. */
+const NOT_ONE_FOLDER_NAME = /^\.{0,2}$|[/\\]/;
+
+/**
+ * A profile name becomes a folder under AGX_HOME/profiles/ and that folder holds
+ * the identity file, so it must be exactly one folder name. Anything else puts
+ * the files elsewhere: `../x` outside profiles/ (or outside AGX_HOME), `..` next
+ * to config.json, `.` or an empty name in profiles/ itself, `a/b` in a nested
+ * folder. The message never contains the value.
+ */
+export function refusePathLikeProfileName(name: string, source: ProfileNameSource): void {
+	if (NOT_ONE_FOLDER_NAME.test(name)) {
+		const { given, fix } = PROFILE_NAME_REFUSAL[source];
+		throw usageError(
+			`The profile name given ${given} is not a single folder name (it is empty, is "." or "..", or contains "/" or "\\"), so it is not used.`,
+			fix,
+		);
+	}
+}
+
 /** Resolve the active profile name: flag, then env, then the stored default. */
 export function resolveProfileName(flag?: string): string {
 	const typed = flag ?? process.env.AGX_PROFILE;
 	if (typed !== undefined) {
-		refuseSecretKeyAsProfileName(typed, flag !== undefined ? "flag" : "env");
+		const source = flag !== undefined ? "flag" : "env";
+		refuseSecretKeyAsProfileName(typed, source);
+		refusePathLikeProfileName(typed, source);
 		return typed;
 	}
 	return loadConfig().currentProfile;

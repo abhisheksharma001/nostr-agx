@@ -14,6 +14,7 @@ import {
 	loadConfig,
 	migrateLegacyKeysNow,
 	rebindHint,
+	refusePathLikeProfileName,
 	refuseSecretKeyAsProfileName,
 	resolveProfileName,
 	saveConfig,
@@ -276,6 +277,7 @@ export async function configSetCommand(
 
 export function configUseCommand(profileName: string): void {
 	refuseSecretKeyAsProfileName(profileName, "argument");
+	refusePathLikeProfileName(profileName, "argument");
 	const config = loadConfig();
 	if (!config.profiles[profileName]) {
 		// Creating on switch is deliberate: a new profile is the supported way to
