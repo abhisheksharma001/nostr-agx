@@ -122,7 +122,7 @@ export async function peersDecideCommand(
 	if (isPastedSecretKey(options.peer)) {
 		throw usageError(
 			"The peer id you gave is a secret key (nsec1…), so it is not sent and not shown here.",
-			`Find the id with:  agx peers list --team ${teamId}`,
+			"Find the id with:  agx peers list --team <teamId>",
 		);
 	}
 	if (action === "refuse" && !options.reason) {
