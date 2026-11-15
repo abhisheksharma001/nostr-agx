@@ -6,14 +6,18 @@ import { buildProgram } from "../program.js";
 import { type CliRun, agx, sandbox } from "../test/helpers.js";
 
 // The command parser prints its own usage errors, quoting what was typed. A
-// 64-digit hex SECRET key typed where a command name or an option name belongs
+// hex SECRET key typed where a command name or an option name belongs
 // (`agx <hex>`, `agx --<hex>`, `agx identity <hex>` after forgetting `import`)
 // came back in full in `unknown command '…'` / `unknown option '…'`.
 //
-// This pins only that narrow case. Whether agx should hide ANY 64-hex string
+// A run of 56 or more hex digits counts as a key (a 63-digit paste, a 65-digit
+// one and a doubled key too); a 40-digit commit id or a 55-digit run does not.
+//
+// This pins only that narrow case. Whether agx should hide ANY long hex string
 // (a hex public key is legitimate in other errors) is an open question
 // (issue #57), so every error that is not an unknown-command / unknown-option
-// error quoting 64 hex digits must stay as it was.
+// error quoting such a run (or, for `gateway` only, a "too many arguments"
+// error quoting one) must stay as it was.
 //
 // Assertions compare small summaries, never the printed text itself, so a
 // failing run cannot dump a key into a log.
@@ -26,7 +30,7 @@ const NSEC = nip19.nsecEncode(generateSecretKey());
 
 /** The whole of what is printed instead: pinned exactly, so the message cannot be edited into one that shows part of the key. */
 const REPLACED_HEX =
-	"error: the command line has what may be a secret key (64 hex digits) where a command or option name belongs, so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
+	"error: a long hex string that may be a secret key sits where a command or option name belongs, so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
 /** The text PR #53 prints for an nsec1… key: unchanged. */
 const REPLACED_NSEC =
 	"error: the command line contains a secret key (nsec1…), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
@@ -116,7 +120,7 @@ function leakMatrix(cases: Array<[string, (hex: string) => string[]]>) {
 	});
 }
 
-describe("a 64-digit hex secret key typed as a command or option name", () => {
+describe("a hex secret key typed as a command or option name", () => {
 	leakMatrix(MISPLACED);
 });
 
@@ -172,6 +176,62 @@ describe("every command that has subcommands", () => {
 				expect({ leaked: leaks(run.stdout + run.stderr, SECRET) }).toEqual({ leaked: false });
 			},
 		);
+	});
+});
+
+/** `count` hex digits (up to 128) of the throwaway key, repeated if need be. */
+function digitsOf(key: string, count: number): string {
+	return `${key}${key}`.slice(0, count);
+}
+
+const LENGTH_FORMS: Array<[string, (digits: string) => string[]]> = [
+	["agx <digits>", (digits) => [digits]],
+	["agx --<digits>", (digits) => [`--${digits}`]],
+	["agx gateway <digits>", (digits) => ["gateway", digits]],
+];
+
+describe("how long a hex run has to be to count as a key", () => {
+	describe.each([56, 63, 64, 65, 128])("%i hex digits are hidden", (count) => {
+		describe.each([
+			["lower case", SECRET],
+			["UPPER CASE", SECRET.toUpperCase()],
+		])("%s", (_label, hex) => {
+			it.each(LENGTH_FORMS)("%s: says why and prints none of it", async (_name, make) => {
+				const run = await agx(...make(digitsOf(hex, count)));
+				expect(summarize(run, SECRET, REPLACED_HEX)).toEqual({
+					code: 1,
+					stdout: "",
+					stderr: "(the fixed replacement)",
+					leaked: false,
+				});
+			});
+		});
+	});
+
+	// Public-key digits: a run this short is not taken for a key, so the error shows it.
+	describe.each([40, 55])("%i hex digits stay visible", (count) => {
+		it("an unknown command", async () => {
+			const word = digitsOf(PEER, count);
+			const run = await agx(word);
+			expect(run.code).toBe(1);
+			expect(run.stderr).toBe(`error: unknown command '${word}'\n`);
+		});
+
+		it("an unknown option", async () => {
+			const word = `--${digitsOf(PEER, count)}`;
+			const run = await agx(word);
+			expect(run.code).toBe(1);
+			expect(run.stderr).toBe(`error: unknown option '${word}'\n`);
+		});
+
+		it("a word after `gateway`", async () => {
+			const word = digitsOf(PEER, count);
+			const run = await agx("gateway", word);
+			expect(run.code).toBe(1);
+			expect(run.stderr).toBe(
+				`error: too many arguments for 'gateway'. Expected 0 arguments but got 1: ${word}.\n`,
+			);
+		});
 	});
 });
 
