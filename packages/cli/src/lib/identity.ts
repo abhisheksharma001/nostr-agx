@@ -57,7 +57,12 @@ export function identityFromSecret(
 	secretKey: Uint8Array,
 	source: "generated" | "imported",
 ): IdentityFile {
-	const publicKey = publicKeyFromSecret(secretKey);
+	let publicKey: string;
+	try {
+		publicKey = publicKeyFromSecret(secretKey);
+	} catch {
+		throw usageError(SECRET_IS_NOT_USABLE);
+	}
 	return {
 		version: 1,
 		secretKeyHex: bytesToHex(secretKey),
@@ -73,6 +78,12 @@ export function identityFromSecret(
  * it ("Invalid checksum in nsec1…"), and the secret key must not be printed. */
 const NSEC_DOES_NOT_DECODE =
 	"Could not decode that nsec: it is not a valid secret key (a character is wrong or missing). It is not shown here.";
+
+/** Printed for a key that decodes but cannot be a secret key: all zeros, not below
+ * the curve order, or not 32 bytes. Fixed text, never built from the input or from
+ * the curve library's own message. */
+const SECRET_IS_NOT_USABLE =
+	"Could not use that secret key: it decodes, but it is not a valid secret key (for example all zeros, out of range, or not 32 bytes long). It is not shown here.";
 
 /** Accept either an `nsec1…` (also in capitals, or behind `nostr:`) or a bare 64-char hex secret. */
 export function parseSecretInput(input: string): Uint8Array {
