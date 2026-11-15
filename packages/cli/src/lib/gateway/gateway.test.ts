@@ -1,10 +1,11 @@
 import { createHmac } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { AgxClient, AgxPublicError, DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
 import { generateKeypair, localSigner, NostrTransport, toNpub } from "@nostr-agx/nostr";
+import { nip19 } from "nostr-tools";
 import WebSocket from "ws";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { type RunningRelay, startRelay } from "../../relay/server.js";
@@ -301,6 +302,45 @@ describe("agx gateway: outbound", () => {
 		expect(body.error).toMatchObject({ code: "timeout" });
 		expect(String((body.error as { description: string }).description)).toContain("allowed this one");
 	}, 15_000);
+
+	it("refuses a secret key given as the agent, and neither repeats nor stores it", async () => {
+		const nsec = nip19.nsecEncode(generateKeypair().secretKey);
+		const leaks = (text: string) => {
+			const data = nsec.toLowerCase().slice(5);
+			for (let i = 0; i + 10 <= data.length; i++) {
+				if (text.toLowerCase().includes(data.slice(i, i + 10))) {
+					return true;
+				}
+			}
+			return false;
+		};
+		const calls = [
+			api("/v1/tasks", { method: "POST", body: JSON.stringify({ peer: nsec, capability: "x.y" }) }),
+			api("/v1/tasks", {
+				method: "POST",
+				headers: { "idempotency-key": "secret-as-agent" },
+				body: JSON.stringify({ peer: nsec, capability: "x.y", background: true }),
+			}),
+			api("/v1/messages", { method: "POST", body: JSON.stringify({ peer: nsec, text: "hello" }) }),
+			api(`/v1/agents/${nsec}`),
+		];
+		for (const res of await Promise.all(calls)) {
+			expect(res.status).toBe(400);
+			const text = await res.text();
+			expect(text).toContain("invalid_peer");
+			expect(leaks(text)).toBe(false);
+		}
+		// Nothing the gateway wrote to its profile holds the key either.
+		let scanned = 0;
+		for (const entry of readdirSync(box.home, { recursive: true, encoding: "utf8" })) {
+			const file = join(box.home, entry);
+			if (statSync(file).isFile()) {
+				scanned += 1;
+				expect(leaks(readFileSync(file, "utf8")), file).toBe(false);
+			}
+		}
+		expect(scanned).toBeGreaterThan(0);
+	});
 
 	it("sends a message the peer can read, and bounds automated replies", async () => {
 		const reader = await peer();
