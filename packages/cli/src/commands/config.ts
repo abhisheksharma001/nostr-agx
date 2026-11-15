@@ -275,7 +275,7 @@ export async function configSetCommand(
 }
 
 export function configUseCommand(profileName: string): void {
-	refuseSecretKeyAsProfileName(profileName, "the profile argument");
+	refuseSecretKeyAsProfileName(profileName, "argument");
 	const config = loadConfig();
 	if (!config.profiles[profileName]) {
 		// Creating on switch is deliberate: a new profile is the supported way to
