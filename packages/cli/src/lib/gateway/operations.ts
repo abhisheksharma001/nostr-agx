@@ -16,6 +16,7 @@ import {
 	resolvePeerRelays,
 	toNpub,
 } from "@nostr-agx/nostr";
+import { isPastedSecretKey } from "../peer.js";
 import type { NewOutboundMessage } from "../store/types.js";
 import { ApiError, integer, isRecord, text } from "./http.js";
 import type { Requester } from "./requester.js";
@@ -56,7 +57,8 @@ function peerOf(value: unknown): string {
 	const input = text(value).trim();
 	const hex = normalizePubkey(input);
 	if (!hex) {
-		throw new ApiError(400, "invalid_peer", `The agent must be an npub1… key or a 64-character hex public key, not "${input}"`);
+		const shown = isPastedSecretKey(input) ? "a secret key (nsec1…), which is not shown here" : `"${input}"`;
+		throw new ApiError(400, "invalid_peer", `The agent must be an npub1… key or a 64-character hex public key, not ${shown}`);
 	}
 	return hex;
 }
