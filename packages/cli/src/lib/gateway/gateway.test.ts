@@ -334,10 +334,21 @@ describe("agx gateway: outbound", () => {
 		let scanned = 0;
 		for (const entry of readdirSync(box.home, { recursive: true, encoding: "utf8" })) {
 			const file = join(box.home, entry);
-			if (statSync(file).isFile()) {
-				scanned += 1;
-				expect(leaks(readFileSync(file, "utf8")), file).toBe(false);
+			let content: string;
+			try {
+				if (!statSync(file).isFile()) {
+					continue;
+				}
+				content = readFileSync(file, "utf8");
+			} catch (error) {
+				// A temporary file the gateway renamed away between the listing and the read.
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					continue;
+				}
+				throw error;
 			}
+			scanned += 1;
+			expect(leaks(content), file).toBe(false);
 		}
 		expect(scanned).toBeGreaterThan(0);
 	});
