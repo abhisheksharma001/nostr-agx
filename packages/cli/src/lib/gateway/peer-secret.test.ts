@@ -52,6 +52,16 @@ describe("a secret key given as the agent in a gateway request", () => {
 		expect(leakedPart(refusal.message, NSEC)).toBeNull();
 	});
 
+	it.each([
+		["in capitals", NSEC.toUpperCase()],
+		["after nostr:", `nostr:${NSEC}`],
+		["after other text", `key=${NSEC}`],
+	])("does not repeat a key %s", async (_form, value) => {
+		const error = await refused(() => parseTaskRequest({ peer: value, capability: "invoice.review" }));
+		expect((error as ApiError).code).toBe("invalid_peer");
+		expect(leakedPart((error as ApiError).message, NSEC)).toBeNull();
+	});
+
 	it("is not repeated in a webhook's allowed agents either", () => {
 		let message = "";
 		try {

@@ -78,6 +78,27 @@ describe("a secret key given as the peer to look up at the index", () => {
 		}
 	});
 
+	// The refusal looks for `nsec1` anywhere in the value, in any case, so a pasted
+	// key is caught however it is wrapped. Each form runs through both commands.
+	it.each([
+		["in capitals", NSEC.toUpperCase()],
+		["after nostr:", `nostr:${NSEC}`],
+		["with spaces around it", `  ${NSEC}  `],
+		["after other text", `key=${NSEC}`],
+	])("refuses a key %s and sends nothing", async (_form, value) => {
+		for (const args of [
+			["peers", "allowlist", "--team", "t1", "--npub", value],
+			["listing", "create", ...LISTING, "--pubkey", value],
+		]) {
+			const run = await agx(...args);
+			expect(run.code).toBe(2);
+			for (const out of [run.stdout, run.stderr]) {
+				expect(leakedPart(out, NSEC)).toBeNull();
+			}
+		}
+		expect(received).toEqual([]);
+	});
+
 	it("prints no secret in JSON mode either", async () => {
 		const run = await agx("peers", "allowlist", "--team", "t1", "--npub", NSEC, "--json");
 		expect(run.code).toBe(2);
