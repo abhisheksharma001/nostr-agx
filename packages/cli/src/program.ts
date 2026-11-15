@@ -78,6 +78,21 @@ import { AGX_CLI_VERSION } from "./lib/version.js";
 const CATEGORY_HELP =
 	"category slug (repeatable): finance, sales, marketing, customer-support, hr, legal, operations, engineering, devops, data, research, productivity, communication, commerce, security";
 
+/**
+ * An unknown-command or unknown-option parser error (the two that quote only the
+ * typed token) whose token holds 64 hex digits in a row, in any case. Matched
+ * anywhere in the token, so also behind `--`, `-`, a quote or a line break, or
+ * with `=value` after it. A real command or option name never holds a 64-digit
+ * hex string. This is the narrow part of the open question whether agx should
+ * hide ANY 64-hex string (issue #57): every other parser error, including
+ * "too many arguments" that shows a hex public key, is left as it is.
+ */
+const UNKNOWN_NAME_WITH_HEX_KEY = /^error: unknown (?:command|option) '[\s\S]*[0-9a-f]{64}/i;
+
+/** Printed instead of an unknown-command / unknown-option parser error that quotes a 64-digit hex key. */
+const PARSER_ERROR_WITH_HEX_KEY =
+	"error: the command line has what may be a secret key (64 hex digits) where a command or option name belongs, so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
+
 /** Printed instead of a parser error that quotes a secret key. */
 const PARSER_ERROR_WITH_SECRET_KEY =
 	"error: the command line contains a secret key (nsec1…), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
@@ -98,9 +113,17 @@ export function buildProgram(): Command {
 	// (`unknown command '<arg>'`, `too many arguments …: <all args>`), so they never pass
 	// through redactSecrets. A secret key typed where a command or argument belongs must
 	// not come back: the message is replaced, not edited, so no part of it survives.
+	// A 64-digit hex key typed as a command or option name gets the same treatment.
 	// Set before any subcommand exists: subcommands copy it when created.
 	program.configureOutput({
-		outputError: (text, write) => write(holdsSecretKey(text) ? PARSER_ERROR_WITH_SECRET_KEY : text),
+		outputError: (text, write) =>
+			write(
+				holdsSecretKey(text)
+					? PARSER_ERROR_WITH_SECRET_KEY
+					: UNKNOWN_NAME_WITH_HEX_KEY.test(text)
+						? PARSER_ERROR_WITH_HEX_KEY
+						: text,
+			),
 	});
 
 	program
