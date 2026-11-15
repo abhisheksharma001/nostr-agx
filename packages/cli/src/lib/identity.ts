@@ -68,20 +68,25 @@ export function identityFromSecret(
 	};
 }
 
-/** Accept either an `nsec1…` or a bare 64-char hex secret. */
+/** Printed for every nsec that does not decode. Fixed text, never built from the
+ * input or from the decoder's own message: nostr-tools quotes its whole input in
+ * it ("Invalid checksum in nsec1…"), and the secret key must not be printed. */
+const NSEC_DOES_NOT_DECODE =
+	"Could not decode that nsec: it is not a valid secret key (a character is wrong or missing). It is not shown here.";
+
+/** Accept either an `nsec1…` (also in capitals, or behind `nostr:`) or a bare 64-char hex secret. */
 export function parseSecretInput(input: string): Uint8Array {
 	const trimmed = input.trim();
-	if (trimmed.startsWith("nsec1")) {
+	const unprefixed = trimmed.replace(/^nostr:/i, "");
+	if (/^nsec1/i.test(unprefixed)) {
 		try {
-			const decoded = nip19.decode(trimmed);
+			const decoded = nip19.decode(unprefixed);
 			if (decoded.type !== "nsec") {
 				throw new Error(`expected an nsec, got ${decoded.type}`);
 			}
 			return decoded.data as Uint8Array;
-		} catch (error) {
-			throw usageError(
-				`Could not decode that nsec: ${error instanceof Error ? error.message : String(error)}`,
-			);
+		} catch {
+			throw usageError(NSEC_DOES_NOT_DECODE);
 		}
 	}
 	if (/^[0-9a-f]{64}$/i.test(trimmed)) {
