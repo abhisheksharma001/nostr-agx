@@ -18,6 +18,7 @@ import {
 } from "./errors.js";
 import { notice } from "./output.js";
 import { configPath, writePrivateJson } from "./paths.js";
+import { isPastedSecretKey } from "./peer.js";
 import { runtime } from "./runtime.js";
 import {
 	isWellFormedApiKey,
@@ -173,9 +174,29 @@ function migrateLegacyKeys(
 	return config;
 }
 
+/**
+ * A profile name is printed back by almost every command and becomes a folder
+ * name under AGX_HOME, so a secret key pasted there by mistake must be refused
+ * before it is printed or written. `source` says where the name came from; the
+ * message never contains it.
+ */
+export function refuseSecretKeyAsProfileName(name: string, source: string): void {
+	if (isPastedSecretKey(name)) {
+		throw usageError(
+			`The profile name given in ${source} is a secret key (nsec1…), so it is not used and not shown here.`,
+			"Use a short name, for example:  agx -p work identity new",
+		);
+	}
+}
+
 /** Resolve the active profile name: flag, then env, then the stored default. */
 export function resolveProfileName(flag?: string): string {
-	return flag ?? process.env.AGX_PROFILE ?? loadConfig().currentProfile;
+	const typed = flag ?? process.env.AGX_PROFILE;
+	if (typed !== undefined) {
+		refuseSecretKeyAsProfileName(typed, flag !== undefined ? "-p/--profile" : "AGX_PROFILE");
+		return typed;
+	}
+	return loadConfig().currentProfile;
 }
 
 export function getProfile(name: string): Profile {
