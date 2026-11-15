@@ -66,7 +66,7 @@ describe("an encrypted secret key (ncryptsec1…) given where a peer belongs", (
 	])("%s: refuses it and prints none of it", async (_name, args) => {
 		const run = await agx(...args);
 		for (const out of [run.stdout, run.stderr]) {
-			expect(out).not.toContain(NCRYPTSEC);
+			expect(out.includes(NCRYPTSEC)).toBe(false);
 			expect(leakedPart(out, NCRYPTSEC)).toBeNull();
 		}
 		expect(run.code).toBe(EXIT.usage);
@@ -104,7 +104,7 @@ describe("an encrypted secret key (ncryptsec1…) on a command line the parser r
 	])("%s: says why and prints none of it", async (_name, args) => {
 		const run = await agx(...args);
 		for (const out of [run.stdout, run.stderr]) {
-			expect(out).not.toContain(NCRYPTSEC);
+			expect(out.includes(NCRYPTSEC)).toBe(false);
 			expect(leakedPart(out, NCRYPTSEC)).toBeNull();
 			expect(leakedPart(out, OTHER_NCRYPTSEC)).toBeNull();
 		}

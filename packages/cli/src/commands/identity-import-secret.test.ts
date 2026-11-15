@@ -22,6 +22,11 @@ const NSEC = nip19.nsecEncode(hexToBytes(incoming.secretKeyHex));
 const COULD_NOT_DECODE =
 	"Could not decode that nsec: it is not a valid secret key (a character is wrong or missing). It is not shown here.";
 
+/** What reaches stderr for an error: a blank line, a cross, the message. Colour codes are dropped (kleur adds them when FORCE_COLOR is set). */
+function plain(stderr: string): string {
+	return stderr.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
 /** `value` with the character at `index` swapped for another valid bech32 character. */
 function flip(value: string, index: number): string {
 	return `${value.slice(0, index)}${value[index] === "q" ? "p" : "q"}${value.slice(index + 1)}`;
@@ -33,11 +38,11 @@ function mixCase(value: string): string {
 	return `${value.slice(0, at)}${value[at].toUpperCase()}${value.slice(at + 1)}`;
 }
 
-/** The first 10-character stretch of the key's data part (not the constant `nsec1`) found in `shown`, in any case; null if none. */
-function leakedPart(shown: string, key: string): string | null {
+/** The first 10-character stretch of the key found in `shown`, in any case, starting `from` characters in (default: past the constant `nsec1`); null if none. */
+function leakedPart(shown: string, key: string, from = 5): string | null {
 	const text = shown.toLowerCase();
 	const secret = key.toLowerCase();
-	for (let i = 5; i + 10 <= secret.length; i++) {
+	for (let i = from; i + 10 <= secret.length; i++) {
 		const part = secret.slice(i, i + 10);
 		if (text.includes(part)) {
 			return part;
@@ -79,12 +84,12 @@ describe("a secret key that does not decode, given to identity import", () => {
 	it.each(BAD)("%s: says it could not be decoded and prints none of it", async (_name, value) => {
 		const run = await agx("identity", "import", "--force", value);
 		for (const out of [run.stdout, run.stderr]) {
-			expect(out).not.toContain(NSEC);
+			expect(out.includes(NSEC)).toBe(false);
 			expect(leakedPart(out, NSEC)).toBeNull();
 		}
 		expect(run.code).toBe(EXIT.usage);
 		expect(run.stdout).toBe("");
-		expect(run.stderr).toContain(COULD_NOT_DECODE);
+		expect(plain(run.stderr)).toBe(`\n✗ ${COULD_NOT_DECODE}\n`);
 	});
 
 	it.each(BAD)("%s: the same in --json mode", async (_name, value) => {
@@ -94,7 +99,7 @@ describe("a secret key that does not decode, given to identity import", () => {
 		}
 		expect(run.code).toBe(EXIT.usage);
 		expect(run.stdout).toBe("");
-		expect(run.stderr).toContain(COULD_NOT_DECODE);
+		expect(plain(run.stderr)).toBe(`\n✗ ${COULD_NOT_DECODE}\n`);
 	});
 
 	it.each(BAD)("%s: the same when piped in with --stdin", async (_name, value) => {
@@ -105,7 +110,7 @@ describe("a secret key that does not decode, given to identity import", () => {
 		}
 		expect(run.code).toBe(EXIT.usage);
 		expect(run.stdout).toBe("");
-		expect(run.stderr).toContain(COULD_NOT_DECODE);
+		expect(plain(run.stderr)).toBe(`\n✗ ${COULD_NOT_DECODE}\n`);
 	});
 
 	it("leaves the identity that was there as it was", async () => {
@@ -125,7 +130,7 @@ describe("a hex secret key that is not 64 characters, given to identity import",
 		expect(run.code).toBe(EXIT.usage);
 		expect(run.stderr).toContain("Expected an `nsec1…` key or a 64-character hex secret key.");
 		for (const out of [run.stdout, run.stderr]) {
-			expect(out.toLowerCase()).not.toContain(incoming.secretKeyHex.slice(2, 14));
+			expect(leakedPart(out, incoming.secretKeyHex, 0)).toBeNull();
 		}
 	});
 });
