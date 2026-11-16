@@ -194,6 +194,35 @@ describe("a task's messages handled in one poll, over the real receive path", ()
 		expect.soft(onMessage.mock.calls.map(([msg]) => msg.text)).toEqual([]);
 	}, 30_000);
 
+	it("keeps a working update that reaches a later poll than the result out of onMessage", async () => {
+		const { client, onMessage, bob } = await aliceWithRequest();
+		const onTaskStatus = vi.fn();
+		const result = client.request(bob, "long.task", {}, {
+			timeoutMs: 30_000,
+			onTaskStatus,
+		});
+		const taskId = await sentTaskId();
+		// The relay has the result and not yet the update sent just before it.
+		stored = [
+			await wrapFromBob(
+				{ t: "res", taskId, status: "completed", output: "done" },
+				taskId,
+				NOW,
+				NOW - 2000,
+			),
+		];
+		await client.pump();
+		expect(await result).toBe("done");
+
+		stored.push(
+			await wrapFromBob({ t: "res", taskId, status: "working", seq: 1 }, taskId, NOW, NOW - 1000),
+		);
+		await client.pump();
+
+		expect(onTaskStatus).not.toHaveBeenCalled();
+		expect(onMessage.mock.calls.map(([msg]) => msg.text)).toEqual([]);
+	}, 30_000);
+
 	it("shows a streamed working update before input-required, not after it", async () => {
 		const { client, bob } = await aliceWithRequest();
 		const stream = await client.streamRequest(bob, "long.task", {}, { timeoutMs: 30_000 });

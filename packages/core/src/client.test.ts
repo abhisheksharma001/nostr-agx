@@ -4514,3 +4514,133 @@ describe("AgxClient handles one poll's messages in the order they were sent", ()
 		});
 	});
 });
+
+describe("AgxClient drops a late working update for a request it has finished", () => {
+	const SENT = 1_700_000_000;
+
+	function pushFrom(from: string, envelope: TaskEnvelope): void {
+		bus.pushMessage(
+			ALICE,
+			{
+				from,
+				text: encodeTaskEnvelope(envelope),
+				contextId: envelope.taskId,
+				messageId: randomId(),
+				subject: null,
+				autoDepth: null,
+				contentType: TASK_CONTENT_TYPE,
+				sentAt: SENT,
+			},
+			SENT,
+		);
+	}
+
+	/** Alice with one request out to Bob, finished by a result in an earlier poll. */
+	async function finishedRequest(onMessage = vi.fn()) {
+		const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
+		const onTaskStatus = vi.fn();
+		const pending = alice.request(BOB, "long.task", {}, {
+			timeoutMs: 1_000,
+			onTaskStatus,
+		});
+		const { taskId } = outboundRequest();
+		pushFrom(BOB, { t: "res", taskId, status: "completed", output: "done" });
+		await alice.pump();
+		await expect(pending).resolves.toBe("done");
+		return { alice, onMessage, onTaskStatus, taskId };
+	}
+
+	it("drops a working update that reaches a later poll than the result", async () => {
+		const { alice, onMessage, onTaskStatus, taskId } = await finishedRequest();
+
+		pushFrom(BOB, { t: "res", taskId, status: "working", seq: 1, message: "late" });
+		const { dispatched } = await alice.pump();
+
+		expect(onMessage).not.toHaveBeenCalled();
+		expect(onTaskStatus).not.toHaveBeenCalled();
+		// Consumed, not left to come round again: the next poll finds nothing new.
+		expect(dispatched).toBe(1);
+		expect((await alice.pump()).dispatched).toBe(0);
+	});
+
+	it("drops it after the request failed, and after it timed out", async () => {
+		const onMessage = vi.fn();
+		const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
+		const failed = alice.request(BOB, "long.task", {}, { timeoutMs: 1_000 });
+		const failedId = outboundRequest().taskId;
+		pushFrom(BOB, { t: "res", taskId: failedId, status: "failed", error: "nope" });
+		await alice.pump();
+		await expect(failed).rejects.toThrow("nope");
+
+		const timedOut = alice.request(BOB, "long.task", {}, { timeoutMs: 5 });
+		const timedOutId = outboundRequest().taskId;
+		await expect(timedOut).rejects.toThrow(/timed out/);
+
+		pushFrom(BOB, { t: "res", taskId: failedId, status: "working", seq: 1 });
+		pushFrom(BOB, { t: "res", taskId: timedOutId, status: "working", seq: 1 });
+		await alice.pump();
+
+		expect(onMessage).not.toHaveBeenCalled();
+	});
+
+	it("still routes the late update of another peer to onMessage", async () => {
+		const { alice, onMessage, taskId } = await finishedRequest();
+
+		pushFrom("mallory", { t: "res", taskId, status: "working", seq: 1 });
+		await alice.pump();
+
+		expect(onMessage).toHaveBeenCalledTimes(1);
+		expect(onMessage.mock.calls[0][0].from).toBe("mallory");
+	});
+
+	it("still routes a late result or input request to onMessage", async () => {
+		const { alice, onMessage, taskId } = await finishedRequest();
+
+		pushFrom(BOB, { t: "res", taskId, status: "completed", output: "again" });
+		pushFrom(BOB, { t: "res", taskId, status: "failed", error: "again" });
+		pushFrom(BOB, {
+			t: "res",
+			taskId,
+			status: "input-required",
+			inputRequestId: "q1",
+			requirement: { prompt: "too late?" },
+		});
+		await alice.pump();
+
+		expect(onMessage).toHaveBeenCalledTimes(3);
+	});
+
+	it("still routes working traffic for a task it never requested to onMessage", async () => {
+		const { alice, onMessage } = await finishedRequest();
+
+		pushFrom(BOB, { t: "res", taskId: "never-asked", status: "working", seq: 1 });
+		await alice.pump();
+
+		expect(onMessage).toHaveBeenCalledTimes(1);
+	});
+
+	it("only remembers a bounded number of finished requests", async () => {
+		const onMessage = vi.fn();
+		const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
+		const requests = Array.from({ length: 2_000 }, () =>
+			alice.request(BOB, "long.task", {}, { timeoutMs: 1 }).catch(() => undefined),
+		);
+		await Promise.all(requests);
+		const taskIds = (bus.inbox.get(BOB) ?? [])
+			.map((message) => parseTaskEnvelope(message.text))
+			.filter((envelope): envelope is TaskRequestEnvelope => envelope?.t === "req")
+			.map((envelope) => envelope.taskId);
+		expect(taskIds).toHaveLength(2_000);
+
+		pushFrom(BOB, { t: "res", taskId: taskIds[0], status: "working", seq: 1 });
+		pushFrom(BOB, { t: "res", taskId: taskIds[1_999], status: "working", seq: 1 });
+		await alice.pump();
+
+		// The newest is remembered and dropped; the oldest was forgotten, so it
+		// is handled like any other task-labelled message.
+		expect(onMessage).toHaveBeenCalledTimes(1);
+		expect(parseTaskEnvelope(onMessage.mock.calls[0][0].text)).toMatchObject({
+			taskId: taskIds[0],
+		});
+	}, 30_000);
+});
