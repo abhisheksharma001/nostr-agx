@@ -598,7 +598,9 @@ describe("agx gateway: outbound", () => {
 			});
 			return { run: pendingRuns };
 		});
-		const pendingBody = JSON.stringify({ peer: reviewer.npub, capability: "invoice.unknown", timeoutSec: 1 });
+		// Long enough that the task cannot time out before the gateway stops, even on
+		// a busy machine: a 504 here would end the test with no gateway running.
+		const pendingBody = JSON.stringify({ peer: reviewer.npub, capability: "invoice.unknown", timeoutSec: 20 });
 		const pending = api("/v1/tasks", {
 			method: "POST",
 			headers: { "idempotency-key": "restart-pending" },
@@ -607,8 +609,14 @@ describe("agx gateway: outbound", () => {
 		pending.catch(() => undefined);
 		await waitForPeer(() => pendingRuns === 1, reviewer.client);
 		await gateway.close();
-		await expect(pending).rejects.toThrow();
+		const outcome = await pending.then(
+			(res) => `answered ${res.status}`,
+			() => "rejected",
+		);
+		// Restart before asserting: a failed assertion with the gateway stopped would
+		// fail every test after this one with "fetch failed".
 		gateway = await startGateway(gatewayOptions());
+		expect(outcome).toBe("rejected");
 		const unknown = await api("/v1/tasks", {
 			method: "POST",
 			headers: { "idempotency-key": "restart-pending" },
