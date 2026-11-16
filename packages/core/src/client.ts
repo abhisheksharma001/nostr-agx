@@ -254,10 +254,10 @@ function fitPublicMessage(message: string): string {
 
 /** Where a task message ranks among the messages sent in the same second:
  * `working` updates by `seq`, then an input request, then a result. Everything
- * else ranks 0 and, among itself, keeps the transport's order. Read only for messages labelled
- * as task traffic, like `dispatchMessage`, and used for ORDER alone: a lookalike
- * label or a made-up `seq` can move a message among the ones sent in the same
- * second, never decide whether or how it is handled. */
+ * else ranks 0 and, among itself, keeps the transport's order. Read only for
+ * messages labelled as task traffic, like `dispatchMessage`, and used for ORDER
+ * alone: a lookalike label or a made-up `seq` can move a message among the ones
+ * sent in the same second, never decide whether or how it is handled. */
 function taskStep(msg: AgxIncomingMessage): [rank: number, seq: number] {
 	if (msg.contentType !== TASK_CONTENT_TYPE) {
 		return [0, 0];
@@ -1250,10 +1250,10 @@ export class AgxClient {
 			// capability, an unmatched/late result or update (bar the late `working`
 			// update below), a malformed envelope — is deliberately NOT auto-replied
 			// to (a reply would let any peer coax a signed event out of this
-			// identity) and NOT silently dropped; it falls
-			// through to `onMessage` so the host's own trust flow triages it exactly
-			// like a plain message. This is what keeps a task-labelled message from
-			// bypassing a host that gates all inbound traffic in `onMessage`.
+			// identity) and NOT silently dropped; it falls through to `onMessage` so
+			// the host's own trust flow triages it exactly like a plain message. This
+			// is what keeps a task-labelled message from bypassing a host that gates
+			// all inbound traffic in `onMessage`.
 			const env = parseTaskEnvelope(msg.text);
 			if (env?.t === "req" && this.handlers.has(env.capability)) {
 				await this.handleTaskRequest(msg, env);
