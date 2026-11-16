@@ -1237,8 +1237,10 @@ export class AgxClient {
 	/** Stop polling and this client's live listener. In-flight `request()` callers
 	 * are rejected rather than left hanging. `preservePending` is for a planned
 	 * durable-request restart: waiting records stay and no task cancel is sent. It
-	 * returns only after a genuine result whose record is being removed has been
-	 * handed to its caller. */
+	 * first waits for a genuine result whose record is being removed: the result
+	 * is handed to its caller, or, if that removal fails, the caller is rejected
+	 * and the record stays. A request deadline that passes during that wait times
+	 * out as usual (its record is removed and a cancel is sent). */
 	async stop(opts?: { preservePending?: boolean }): Promise<void> {
 		this.running = false;
 		this.stopping = true;
