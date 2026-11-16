@@ -95,6 +95,112 @@ describe("AGX JSON Schema validation", () => {
 		expectInvalid({ type: "number", multipleOf: 1e-300 }, 1e300, /multipleOf/);
 	});
 
+	describe("multipleOf for whole numbers", () => {
+		const multipleOf = (step: number) => ({ type: "number", multipleOf: step });
+
+		it("still fails closed when the quotient of a fractional value overflows", () => {
+			// A whole value is decided exactly; a fractional one reaches the rounding test.
+			expect(1.5 / 1e-320).toBe(Number.POSITIVE_INFINITY);
+			expectInvalid(multipleOf(1e-320), 1.5, /multipleOf/);
+		});
+
+		/** The exact answer, from integer arithmetic. */
+		const isMultiple = (value: number, step: number) =>
+			BigInt(value) % BigInt(step) === 0n;
+
+		it("rejects a huge whole number that is not a multiple", () => {
+			// Past 2^53 every double is whole, so a rounding test passes anything.
+			expect(1e20 % 3).not.toBe(0);
+			expectInvalid(multipleOf(3), 1e20, /multipleOf/);
+			expectInvalid(multipleOf(3), -1e20, /multipleOf/);
+			expectInvalid(multipleOf(3), 2 ** 53 + 2, /multipleOf/);
+			expectInvalid(multipleOf(7), 1e300, /multipleOf/);
+		});
+
+		it("accepts a huge whole number that is a multiple", () => {
+			expectValid(multipleOf(3), 3 * 2 ** 60);
+			expectValid(multipleOf(4), 2 ** 60);
+			expectValid(multipleOf(4), -(2 ** 60));
+			expectValid(multipleOf(5), 1e20);
+			expectValid(multipleOf(1e10), 1e20);
+			expectValid(multipleOf(2 ** 60), 2 ** 61);
+			expectValid(multipleOf(3), 0);
+			expectValid(multipleOf(3), -0);
+		});
+
+		it("is exact at and around Number.MAX_SAFE_INTEGER", () => {
+			const safe = Number.MAX_SAFE_INTEGER; // 2^53 - 1 = 6361 * 69431 * 20394401
+			expect(isMultiple(safe, 6361)).toBe(true);
+			expectValid(multipleOf(6361), safe);
+			expectValid(multipleOf(6361), -safe);
+			expectInvalid(multipleOf(3), safe, /multipleOf/);
+			expectInvalid(multipleOf(3), -safe, /multipleOf/);
+			// 2^53 is the first value that is no longer a safe integer.
+			expectValid(multipleOf(2), safe + 1);
+			expectInvalid(multipleOf(3), safe + 1, /multipleOf/);
+			expectValid(multipleOf(2 ** 52), safe + 1);
+		});
+
+		it("is exact below 2^53 too, where the rounding test already passed everything", () => {
+			// 2e15 / 3 is about 6.7e14: past 2^49 the rounding test cannot reject.
+			expect(2e15 % 3).not.toBe(0);
+			expectInvalid(multipleOf(3), 2e15, /multipleOf/);
+			expectInvalid(multipleOf(3), -2e15, /multipleOf/);
+			expectValid(multipleOf(5), 2e15);
+			// A tiny quotient also hid a value that is not a multiple.
+			expectInvalid(multipleOf(1e16), 3, /multipleOf/);
+			expectValid(multipleOf(1e16), 0);
+			expectValid(multipleOf(1e16), 1e16);
+		});
+
+		it("agrees with integer arithmetic for whole numbers of every size", () => {
+			const values = [
+				1, 6, 7, 1e15, 2e15, 4e15, Number.MAX_SAFE_INTEGER, 2 ** 53,
+				2 ** 53 + 2, 3 * 2 ** 60, 2 ** 60, 1e20, 1e21, 1e300,
+			].flatMap((value) => [value, -value]);
+			const steps = [1, 2, 3, 4, 5, 7, 1e10, 3e16, 2 ** 60];
+			for (const value of values) {
+				for (const step of steps) {
+					const problem = validateAgxJsonPayload(multipleOf(step), value);
+					expect(
+						problem === null,
+						`${value} multipleOf ${step}`,
+					).toBe(isMultiple(value, step));
+				}
+			}
+		});
+
+		it("decides a huge whole number against a fractional step only when it is an exact multiple", () => {
+			// Beyond 2^53 a double has no fraction left for the rounding test to read.
+			expectValid(multipleOf(0.5), 1e20);
+			expectValid(multipleOf(0.25), -1e20);
+			expectInvalid(multipleOf(0.3), 1e20, /multipleOf/);
+			expectInvalid(multipleOf(0.3), -1e20, /multipleOf/);
+			// 0.1 is not exact in binary, so no huge value is provably a multiple.
+			expectInvalid(multipleOf(0.1), 1e20, /multipleOf/);
+			// The boundary: 2^53 is decided exactly, 2^53 - 1 keeps the rounding test.
+			expectInvalid(multipleOf(0.3), 2 ** 53, /multipleOf/);
+			expectValid(multipleOf(0.5), 2 ** 53);
+			expectValid(multipleOf(0.1), Number.MAX_SAFE_INTEGER);
+			expectValid(multipleOf(0.5), Number.MAX_SAFE_INTEGER);
+		});
+
+		it("keeps the rounding test for fractions and small numbers", () => {
+			expectValid(multipleOf(0.1), 0.1 + 0.2);
+			expectValid(multipleOf(0.1), 3);
+			expectValid(multipleOf(0.01), 1e13);
+			expectValid(multipleOf(0.5), 2.5);
+			expectInvalid(multipleOf(0.5), 2.6, /multipleOf/);
+			expectValid(multipleOf(3), 6);
+			expectValid(multipleOf(3), -6);
+			expectInvalid(multipleOf(3), 7, /multipleOf/);
+			expectInvalid(multipleOf(3), 1e15, /multipleOf/);
+			expectInvalid(multipleOf(3), 4.5, /multipleOf/);
+			// Float noise on a fractional value is still forgiven.
+			expectValid(multipleOf(3), 6.000000000000001);
+		});
+	});
+
 	it("compares const and enum values as JSON, independent of object key order", () => {
 		expectValid({ const: { a: 1, b: [true] } }, { b: [true], a: 1 });
 		expectValid({ enum: ["new", { a: 1 }] }, { a: 1 });
