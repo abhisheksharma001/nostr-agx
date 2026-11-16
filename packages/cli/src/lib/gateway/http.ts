@@ -84,6 +84,14 @@ export function mayHoldSecretKey(value: string): boolean {
 	return true;
 }
 
+/** What a gateway answer or log line says in place of a value that holds a secret key. */
+export const HIDDEN_VALUE = "(a value with a secret key, not shown)";
+
+/** A value as it may be quoted in an answer or a log line: never one that holds a secret key. */
+export function shown(value: string): string {
+	return mayHoldSecretKey(value) ? HIDDEN_VALUE : value;
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -108,7 +116,7 @@ export function integer(
 	}
 	const n = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : Number.NaN;
 	if (!Number.isInteger(n) || n < range.min || n > range.max) {
-		throw new ApiError(400, "invalid_request", `${field} must be a whole number from ${range.min} to ${range.max}, not ${JSON.stringify(value)}`);
+		throw new ApiError(400, "invalid_request", `${field} must be a whole number from ${range.min} to ${range.max}, not ${shown(JSON.stringify(value))}`);
 	}
 	return n;
 }

@@ -5,7 +5,7 @@ import { isIP } from "node:net";
 import { normalizePubkey } from "@nostr-agx/nostr";
 import { z } from "zod";
 import { gatewaySubscriptionsPath, writePrivateJson } from "../paths.js";
-import { mayHoldSecretKey } from "./http.js";
+import { mayHoldSecretKey, shown } from "./http.js";
 
 /**
  * Webhook subscriptions: where `agx gateway` delivers what arrives for this
@@ -205,7 +205,7 @@ export function parseSubscriptionInput(
 	try {
 		url = new URL(input.url);
 	} catch {
-		throw new SubscriptionError(`Invalid subscription: url is not a URL: ${input.url}`);
+		throw new SubscriptionError(`Invalid subscription: url is not a URL: ${shown(input.url)}`);
 	}
 	if (url.protocol !== "https:" && url.protocol !== "http:") {
 		throw new SubscriptionError("Invalid subscription: url must be http(s)");
@@ -217,6 +217,12 @@ export function parseSubscriptionInput(
 		: [];
 	if (serveTasks && capabilities.length === 0) {
 		throw new SubscriptionError("Name the capabilities this webhook serves, such as invoice.review");
+	}
+	// A capability goes onto the Agent Card, which anyone can read.
+	if (capabilities.some(mayHoldSecretKey)) {
+		throw new SubscriptionError(
+			"A capability must be a name such as invoice.review, not a secret key (nsec1…), which is not shown here",
+		);
 	}
 	// The client runs a handler for exactly the capability it was registered
 	// under, so `invoice.*` would be advertised and never served.

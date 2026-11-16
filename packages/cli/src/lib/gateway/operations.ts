@@ -62,6 +62,21 @@ function peerOf(value: unknown): string {
 	return hex;
 }
 
+/**
+ * A capability is a name such as `invoice.review`. It goes to the other agent
+ * inside the request and onto the Agent Card, so a pasted secret key is refused
+ * here, before anything is sent, and is never repeated.
+ */
+function refuseSecretCapability(capability: string): void {
+	if (mayHoldSecretKey(capability)) {
+		throw new ApiError(
+			400,
+			"invalid_request",
+			"The capability must be a name such as invoice.review, not a secret key (nsec1…), which is not shown here",
+		);
+	}
+}
+
 function messageOf(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -84,6 +99,7 @@ export function parseTaskRequest(input: unknown): TaskRequest {
 	if (!capability) {
 		throw new ApiError(400, "invalid_request", "Capability is empty");
 	}
+	refuseSecretCapability(capability);
 	if (capability.length > MAX_CAPABILITY_CHARS) {
 		throw new ApiError(400, "invalid_request", `Capability names can be at most ${MAX_CAPABILITY_CHARS} characters`);
 	}
@@ -276,6 +292,8 @@ export async function readCard(
 	query: URLSearchParams,
 ): Promise<Record<string, unknown>> {
 	const peer = peerOf(peerInput);
+	const capability = (query.get("capability") ?? "").trim();
+	refuseSecretCapability(capability);
 	const [{ card, reachable }, relays] = await Promise.all([
 		resolvePeerCardWithStatus(peer, deps.relays, deps.signer),
 		resolvePeerRelays(peer, deps.relays, deps.signer).catch(() => [] as string[]),
@@ -290,7 +308,6 @@ export async function readCard(
 	}
 	const nip05Verified =
 		card?.nip05 && query.get("verifyNip05") !== "false" ? await verifyNip05(card.nip05, peer) : null;
-	const capability = (query.get("capability") ?? "").trim();
 	return {
 		npub: toNpub(peer),
 		pubkey: peer,
