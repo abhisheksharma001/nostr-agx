@@ -37,6 +37,19 @@ describe("a __proto__ key in a skill schema", () => {
 		},
 	);
 
+	it.each([
+		["null", "null"],
+		["an array", "[]"],
+		["a string", '"x"'],
+		["a number", "5"],
+	])("leaves %s to the record check, not a thrown error", (_what, text) => {
+		// `Object.hasOwn(null)` throws; the check must not turn that into the
+		// generic "could not be parsed safely".
+		expect(parseAgxAgentSkill(skillFromCard(text))).toEqual({
+			problem: expect.stringMatching(/expected record/),
+		});
+	});
+
 	it("leaves the same schema without the key valid", () => {
 		const parsed = parseAgxAgentSkill(skillFromCard('{"type":"object"}'));
 		expect(parsed).toEqual({
