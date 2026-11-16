@@ -4382,6 +4382,25 @@ describe("AgxClient handles one poll's messages in the order they were sent", ()
 		expect(onMessage).not.toHaveBeenCalled();
 	});
 
+	it("ranks a failed result after the working updates too", async () => {
+		const onTaskStatus = vi.fn();
+		const alice = backdatingClient(ALICE);
+		const pending = alice.request(BOB, "long.task", {}, {
+			timeoutMs: 1_000,
+			onTaskStatus,
+		});
+		pending.catch(() => undefined);
+		const { taskId } = outboundRequest();
+		pushSent(ALICE, BOB, { t: "res", taskId, status: "failed", error: "nope" }, SENT - 3_000, SENT);
+		pushSent(ALICE, BOB, { t: "res", taskId, status: "working", seq: 2 }, SENT - 2_000, SENT);
+		pushSent(ALICE, BOB, { t: "res", taskId, status: "working", seq: 1 }, SENT - 1_000, SENT);
+
+		await alice.pump();
+
+		await expect(pending).rejects.toThrow("nope");
+		expect(onTaskStatus.mock.calls.map(([update]) => update.seq)).toEqual([1, 2]);
+	});
+
 	it("handles messages in the order they were sent, not the order they were stamped", async () => {
 		const onMessage = vi.fn();
 		const alice = backdatingClient(ALICE, onMessage);
