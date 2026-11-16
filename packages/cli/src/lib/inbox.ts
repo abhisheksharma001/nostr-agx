@@ -38,6 +38,8 @@ export interface InboxReport {
 	held: InboxHeld[];
 	receipts: InboxReceipt[];
 	truncated: boolean;
+	/** Present for `agx wait`; ordinary one-shot inbox output is unchanged. */
+	timedOut?: boolean;
 }
 
 export interface InboxSummary {
@@ -48,6 +50,8 @@ export interface InboxSummary {
 	unread: number;
 	held: number;
 	relays: { ok: number; unreachable: number };
+	/** Present for `agx wait`; ordinary one-shot inbox output is unchanged. */
+	timedOut?: boolean;
 }
 
 /** ISO time for a unix-seconds value, or `fallback` when the value is not a time `Date` can hold. */
@@ -132,14 +136,15 @@ export function createCollector(options: {
 		},
 		/**
 		 * A receipt counts only from the peer the message was sent to (anyone who knows an
-		 * event id could otherwise mark it delivered), or from an allowed sender.
+		 * event id could otherwise mark it delivered), or from an allowed sender. Returns
+		 * whether it counted, so a caller that prints receipts can print only those.
 		 */
-		onReceipt(receipt: AgxIncomingReceipt): void {
+		onReceipt(receipt: AgxIncomingReceipt): boolean {
 			const from = toDisplayNpub(receipt.from);
 			const ref = receipt.receipt.refEventId;
 			const matched = options.store.setDeliveryStatus(ref, receipt.receipt.status, from);
 			if (!matched && !options.allowed.has(receipt.from)) {
-				return;
+				return false;
 			}
 			receipts.push({
 				from,
@@ -147,6 +152,7 @@ export function createCollector(options: {
 				status: receipt.receipt.status,
 				at: isoFromSeconds(receipt.createdAt, now()),
 			});
+			return true;
 		},
 		/** Messages stored by this run, oldest first. */
 		get messages(): StoredMessage[] {
@@ -176,6 +182,7 @@ export function summarize(report: InboxReport, newCount: number, unreadCount: nu
 			ok: report.relays.filter((r) => r.status === "ok").length,
 			unreachable: report.relays.filter((r) => r.status === "unreachable").length,
 		},
+		...(report.timedOut === undefined ? {} : { timedOut: report.timedOut }),
 	};
 }
 
@@ -185,6 +192,9 @@ export function summaryLine(summary: InboxSummary): string {
 	const down = summary.relays.unreachable;
 	if (down > 0) {
 		parts.push(`${down} ${down === 1 ? "relay" : "relays"} unreachable`);
+	}
+	if (summary.timedOut === true) {
+		parts.push("timed out");
 	}
 	return parts.join(" · ");
 }

@@ -58,6 +58,7 @@ import {
 } from "./commands/gateway.js";
 import { threadCommand, threadsCommand } from "./commands/threads.js";
 import { uiCommand } from "./commands/ui.js";
+import { waitCommand } from "./commands/wait.js";
 import { whoamiCommand } from "./commands/whoami.js";
 import { AgxCliError, EXIT, HumanActionRequiredError } from "./lib/errors.js";
 import {
@@ -66,7 +67,7 @@ import {
 	setColor,
 	setJsonMode,
 } from "./lib/output.js";
-import { redactSecrets } from "./lib/secrets.js";
+import { holdsSecretKey, redactSecrets } from "./lib/secrets.js";
 import { AGX_CLI_VERSION } from "./lib/version.js";
 
 /**
@@ -76,6 +77,14 @@ import { AGX_CLI_VERSION } from "./lib/version.js";
  */
 const CATEGORY_HELP =
 	"category slug (repeatable): finance, sales, marketing, customer-support, hr, legal, operations, engineering, devops, data, research, productivity, communication, commerce, security";
+
+/** Printed instead of a parser error that quotes a secret key. */
+const PARSER_ERROR_WITH_SECRET_KEY =
+	"error: the command line contains a secret key (nsec1…), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
+
+/** Printed instead of ANY parser error of `identity import`: its argument can only be a secret, in any format (hex looks like a public key everywhere else). */
+const PARSER_ERROR_OF_IMPORT =
+	"error: `agx identity import` could not read its arguments, so they are not shown (they may hold a secret key). Usage: agx identity import [secret] [--stdin] [--force]; see `agx identity import --help`.\n";
 
 /**
  * Build a fresh `agx` program. A factory, not a module-level singleton,
@@ -88,6 +97,15 @@ export function buildProgram(): Command {
 	// Throw instead of calling process.exit, so runCli can return the exit code.
 	// Set before any subcommand exists: subcommands copy it when created.
 	program.exitOverride();
+
+	// The parser writes its own usage errors straight to stderr and quotes what was typed
+	// (`unknown command '<arg>'`, `too many arguments …: <all args>`), so they never pass
+	// through redactSecrets. A secret key typed where a command or argument belongs must
+	// not come back: the message is replaced, not edited, so no part of it survives.
+	// Set before any subcommand exists: subcommands copy it when created.
+	program.configureOutput({
+		outputError: (text, write) => write(holdsSecretKey(text) ? PARSER_ERROR_WITH_SECRET_KEY : text),
+	});
 
 	program
 		.name("agx")
@@ -227,6 +245,9 @@ export function buildProgram(): Command {
 		.description("import an nsec1… or 64-char hex secret key")
 		.option("--stdin", "read the secret from stdin")
 		.option("--force", "replace an existing identity")
+		.configureOutput({
+			outputError: (_text, write) => write(PARSER_ERROR_OF_IMPORT),
+		})
 		.action((secret, options) =>
 			identityImportCommand(secret, withGlobals(options)),
 		);
@@ -578,6 +599,14 @@ export function buildProgram(): Command {
 		.option("-v, --verbose", "log transport activity")
 		.action((options) => inboxCommand(withGlobals(options)));
 
+	program
+		.command("wait")
+		.description("wait for one inbox activity batch and exit: never replies, never runs tasks")
+		.option("--timeout <seconds>", "maximum wait, 1–3600 (default 600)")
+		.option("--summary", "counts only, no peer text (safe for a background notification)")
+		.option("-v, --verbose", "log transport activity")
+		.action((options) => waitCommand(withGlobals(options)));
+
 	const held = program
 		.command("held")
 		.description("decide on senders who are not on your allowlist");
@@ -682,6 +711,10 @@ export function buildProgram(): Command {
 		.option(
 			"--fix-perms",
 			"repair file permissions under ~/.agx, and remove an abandoned login lock",
+		)
+		.option(
+			"--local",
+			"check only what a local exchange needs (permissions, identity, relays, allowlist); skip the hosted index and login",
 		)
 		.action((options) => doctorCommand(withGlobals(options)));
 

@@ -55,6 +55,15 @@ export function setRuntimeForTests(patch: Partial<Runtime>): () => void {
 }
 
 /**
+ * The timeout signals `timeoutSignal` hands out, kept reachable for as long as
+ * the combined signal is. `AbortSignal.any` holds its sources only weakly, so on
+ * Node 20 (and early 22.x) a garbage collection can drop the timeout and the
+ * deadline never fires. Later Node versions pin it themselves (nodejs/node#57867);
+ * keeping our own reference costs nothing there.
+ */
+const timeoutSources = new WeakMap<AbortSignal, AbortSignal>();
+
+/**
  * A signal that fires on whichever comes first: `ms` elapsing or `signal`.
  * `AbortSignal.any` arrived in Node 20.3; `engines` allows 20.0, so fall back
  * to the timeout alone there.
@@ -69,5 +78,10 @@ export function timeoutSignal(ms: number, signal?: AbortSignal): AbortSignal {
 			any?: (signals: AbortSignal[]) => AbortSignal;
 		}
 	).any;
-	return any ? any([timeout, signal]) : timeout;
+	if (!any) {
+		return timeout;
+	}
+	const combined = any([timeout, signal]);
+	timeoutSources.set(combined, timeout);
+	return combined;
 }
