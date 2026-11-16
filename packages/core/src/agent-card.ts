@@ -35,7 +35,18 @@ const mediaTypeSchema = z
 	.min(1)
 	.max(AGX_AGENT_CARD_LIMITS.mediaTypeChars)
 	.regex(mediaTypePattern);
-const schemaDocumentSchema = z.record(z.string(), z.unknown());
+// A card read from JSON text has "__proto__" as an own key, and zod's record
+// parser skips it, so it would vanish from the schema without a trace. Check
+// for it first and make the schema invalid.
+const schemaDocumentSchema = z
+	.custom(
+		(value) =>
+			typeof value !== "object" ||
+			value === null ||
+			!Object.hasOwn(value, "__proto__"),
+		{ message: 'schema must not have a top-level "__proto__" key' },
+	)
+	.pipe(z.record(z.string(), z.unknown()));
 
 // Not strict: unknown fields are dropped, so a later card version stays
 // readable as typed.
