@@ -972,6 +972,19 @@ describe("AgxClient task request/response", () => {
 		).toThrow(/unsupported schema keyword/);
 	});
 
+	it("rejects a handler schema with a top-level __proto__ key at registration", () => {
+		const bob = new AgxClient({ transport: bus.transport(BOB) });
+		const inputSchema = JSON.parse('{"__proto__":{"type":"string"},"type":"object"}');
+		expect(Object.hasOwn(inputSchema, "__proto__")).toBe(true);
+		expect(() =>
+			bob.handle("invoice.review", () => null, {
+				description: "Review an invoice",
+				inputSchema,
+			}),
+		).toThrow(/AGX handler invoice\.review contract: .*__proto__/);
+		expect(bob.capabilities()).toEqual([]);
+	});
+
 	it.each([
 		["a wildcard ID", "invoice.*", { description: "Review an invoice" }],
 		[

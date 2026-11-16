@@ -437,6 +437,34 @@ describe("parseAgentCardMetadata", () => {
 		},
 	);
 
+	it("drops a skill whose schema has a top-level __proto__ key, as a card carries it", () => {
+		// Parsed from text, so `__proto__` is an own key, not the prototype.
+		const card = JSON.parse(
+			`{"skills":[{"id":"invoice.review","description":"Review an invoice",` +
+				`"inputSchema":{"__proto__":{"type":"string"},"type":"object"}}]}`,
+		);
+		expect(Object.hasOwn(card.skills[0].inputSchema, "__proto__")).toBe(true);
+		const parsed = parseAgentCardMetadata({
+			skills: [skill({ id: "kept" }), ...card.skills],
+		});
+		expect(codes(parsed)).toEqual(["invalid_typed_skill"]);
+		expect(parsed.warnings?.[0]?.message).toMatch(/invoice\.review.*__proto__/);
+		expect(parsed.skills?.map((kept) => kept.id)).toEqual(["kept"]);
+	});
+
+	it("keeps a skill whose properties name a __proto__ property", () => {
+		const card = JSON.parse(
+			`{"skills":[{"id":"invoice.review","description":"Review an invoice",` +
+				`"inputSchema":{"type":"object","properties":{"__proto__":{"type":"string"}}}}]}`,
+		);
+		const parsed = parseAgentCardMetadata(card);
+		expect(parsed.warnings).toBeUndefined();
+		const schema = parsed.skills?.[0]?.inputSchema as {
+			properties: Record<string, unknown>;
+		};
+		expect(Object.hasOwn(schema.properties, "__proto__")).toBe(true);
+	});
+
 	it.each([
 		{ type: [] },
 		{ type: ["string", "string"] },
