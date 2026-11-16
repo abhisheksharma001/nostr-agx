@@ -61,6 +61,8 @@ function send(path: string, options: { auth?: boolean; method?: string; body?: u
 			},
 		);
 		req.on("error", reject);
+		// A gateway that never answers (a request that threw inside its own error handler) fails this test, instead of holding the run until its time limit.
+		req.setTimeout(5_000, () => req.destroy(new Error("the gateway did not answer in 5 seconds")));
 		req.end(options.body === undefined ? undefined : JSON.stringify(options.body));
 	});
 }
