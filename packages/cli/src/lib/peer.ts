@@ -1,12 +1,11 @@
 import { normalizePubkey, toNpub } from "@nostr-agx/nostr";
 import { usageError } from "./errors.js";
-
-const PASTED_SECRET_KEY = /nsec1/i;
+import { holdsSecretKey } from "./secrets.js";
 
 /** True when a value looks like a pasted secret key, which must never be shown back to anyone.
- * Matching `nsec1` anywhere in the value, in any case, also covers a `nostr:` scheme and a typo. */
+ * Matching `nsec1` or `ncryptsec1` anywhere in the value, in any case, also covers a `nostr:` scheme and a typo. */
 export function isPastedSecretKey(input: string): boolean {
-	return PASTED_SECRET_KEY.test(input);
+	return holdsSecretKey(input);
 }
 
 /** Refuse a pasted secret key without showing it. Anything else passes. */

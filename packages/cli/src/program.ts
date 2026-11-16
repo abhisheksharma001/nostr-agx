@@ -82,6 +82,10 @@ const CATEGORY_HELP =
 const PARSER_ERROR_WITH_SECRET_KEY =
 	"error: the command line contains a secret key (nsec1…), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
 
+/** Printed instead of ANY parser error of `identity import`: its argument can only be a secret, in any format (hex looks like a public key everywhere else). */
+const PARSER_ERROR_OF_IMPORT =
+	"error: `agx identity import` could not read its arguments, so they are not shown (they may hold a secret key). Usage: agx identity import [secret] [--stdin] [--force]; see `agx identity import --help`.\n";
+
 /**
  * Build a fresh `agx` program. A factory, not a module-level singleton,
  * because commander keeps parsed option values on the instance: the tests drive
@@ -241,6 +245,9 @@ export function buildProgram(): Command {
 		.description("import an nsec1… or 64-char hex secret key")
 		.option("--stdin", "read the secret from stdin")
 		.option("--force", "replace an existing identity")
+		.configureOutput({
+			outputError: (_text, write) => write(PARSER_ERROR_OF_IMPORT),
+		})
 		.action((secret, options) =>
 			identityImportCommand(secret, withGlobals(options)),
 		);

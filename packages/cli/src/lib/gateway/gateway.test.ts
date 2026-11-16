@@ -137,6 +137,11 @@ async function pumping<T>(promise: Promise<T>, client: AgxClient): Promise<T> {
 	return watched;
 }
 
+/** What the slowest tests may wait for the relay, the gateway and a webhook in
+ * turn. The 20 s `waitFor` default and a 25 s request limit ran out when other
+ * work held the CPU: one request has to outlast a whole test script. */
+const SHARED_MACHINE_MS = 60_000;
+
 async function waitFor<T>(check: () => T | undefined | false, timeoutMs = 20_000): Promise<T> {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
@@ -682,7 +687,9 @@ describe("agx gateway: outbound", () => {
 			});
 			return { run: pendingRuns };
 		});
-		const pendingBody = JSON.stringify({ peer: reviewer.npub, capability: "invoice.unknown", timeoutSec: 1 });
+		// Long enough that the task cannot time out before the gateway stops, even on
+		// a busy machine: a 504 here would end the test with no gateway running.
+		const pendingBody = JSON.stringify({ peer: reviewer.npub, capability: "invoice.unknown", timeoutSec: 20 });
 		const pending = api("/v1/tasks", {
 			method: "POST",
 			headers: { "idempotency-key": "restart-pending" },
@@ -691,8 +698,14 @@ describe("agx gateway: outbound", () => {
 		pending.catch(() => undefined);
 		await waitForPeer(() => pendingRuns === 1, reviewer.client);
 		await gateway.close();
-		await expect(pending).rejects.toThrow();
+		const outcome = await pending.then(
+			(res) => `answered ${res.status}`,
+			() => "rejected",
+		);
+		// Restart before asserting: a failed assertion with the gateway stopped would
+		// fail every test after this one with "fetch failed".
 		gateway = await startGateway(gatewayOptions());
+		expect(outcome).toBe("rejected");
 		const unknown = await api("/v1/tasks", {
 			method: "POST",
 			headers: { "idempotency-key": "restart-pending" },
@@ -1005,17 +1018,17 @@ describe("agx gateway: inbound", () => {
 			allowedPeers: [requester.npub],
 			maxTaskAgeSec: 2,
 		});
-		const first = requester.client.request(gateway.npub, "invoice.queue", { n: 1 }, { timeoutMs: 25_000 });
-		await waitFor(() => busy.held.length === 1);
+		const first = requester.client.request(gateway.npub, "invoice.queue", { n: 1 }, { timeoutMs: SHARED_MACHINE_MS });
+		await waitFor(() => busy.held.length === 1, SHARED_MACHINE_MS);
 		// One task per webhook in these tests: the second waits its turn.
-		const second = requester.client.request(gateway.npub, "invoice.queue", { n: 2 }, { timeoutMs: 25_000 });
+		const second = requester.client.request(gateway.npub, "invoice.queue", { n: 2 }, { timeoutMs: SHARED_MACHINE_MS });
 		second.catch(() => undefined);
 		await new Promise((r) => setTimeout(r, 3500));
 		busy.answer(0, { n: 1 });
 		await expect(pumping(first, requester.client)).resolves.toEqual({ n: 1 });
 		await expect(pumping(second, requester.client)).rejects.toThrow("the workflow was busy for too long");
 		expect(busy.held).toHaveLength(1);
-	}, 30_000);
+	}, 120_000);
 
 	it("refuses tasks past a webhook's queue or the gateway's limit as busy, and keeps reading the inbox", async () => {
 		// One running and one waiting per webhook, three tasks in all.
@@ -1030,13 +1043,13 @@ describe("agx gateway: inbound", () => {
 			const fast = await webhook(() => ({ status: 200, body: { fast: true } }));
 			await subscribe({ url: fast.url, events: ["task"], capabilities: ["invoice.quick"], allowedPeers: [requester.npub] });
 			const ask = (capability: string, n: number) => {
-				const result = requester.client.request(gateway.npub, capability, { n }, { timeoutMs: 25_000 });
+				const result = requester.client.request(gateway.npub, capability, { n }, { timeoutMs: SHARED_MACHINE_MS });
 				result.catch(() => undefined);
 				return result;
 			};
 
 			const running = ask("invoice.pile", 1);
-			await waitFor(() => slow.held.length === 1);
+			await waitFor(() => slow.held.length === 1, SHARED_MACHINE_MS);
 			const waiting = ask("invoice.pile", 2);
 			await new Promise((r) => setTimeout(r, 1000));
 			// The slow webhook's queue is full: refused at once, not held.
@@ -1045,13 +1058,13 @@ describe("agx gateway: inbound", () => {
 			await expect(pumping(ask("invoice.quick", 4), requester.client)).resolves.toEqual({ fast: true });
 
 			const otherRunning = ask("invoice.other", 5);
-			await waitFor(() => other.held.length === 1);
+			await waitFor(() => other.held.length === 1, SHARED_MACHINE_MS);
 			// Three tasks in flight: the gateway refuses the next, wherever it goes.
 			await expect(pumping(ask("invoice.quick", 6), requester.client)).rejects.toThrow("the gateway is busy");
 
 			slow.answer(0, { n: 1 });
 			await expect(pumping(running, requester.client)).resolves.toEqual({ n: 1 });
-			await waitFor(() => slow.held.length === 2);
+			await waitFor(() => slow.held.length === 2, SHARED_MACHINE_MS);
 			slow.answer(1, { n: 2 });
 			await expect(pumping(waiting, requester.client)).resolves.toEqual({ n: 2 });
 			other.answer(0, { n: 5 });
@@ -1062,7 +1075,7 @@ describe("agx gateway: inbound", () => {
 			await gateway.close();
 			gateway = await startGateway(gatewayOptions());
 		}
-	}, 60_000);
+	}, 120_000);
 
 	it("answers `result too large` for a workflow answer it could never send on", async () => {
 		const requester = await peer();
