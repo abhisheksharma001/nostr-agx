@@ -176,7 +176,11 @@ not queued, and use no `seq`. A `working` update already being published when in
 before the `input-required`. The message is handler-supplied
 public text, never raw reasoning or internal error details. A transport failure or oversized message
 drops the update without failing the task. Unknown, late, and post-terminal updates receive no automatic
-reply and follow the plain-message trust path. The opt-in exists because a requester that predates
+reply and follow the plain-message trust path, with one exception: a `working` update that reaches the
+requester after its request has finished, from the peer the request was sent to, is dropped. A relay may
+serve it after the result, it is progress on the requester's own request, and nothing is left for a host
+to triage. The reference client remembers its last 1,024 requests to recognize one; for a request it has
+forgotten, the update follows the plain-message path. The opt-in exists because a requester that predates
 `working` cannot be relied on to treat an unrecognized update as a plain message: the reference
 `streamRequest()` in every release up to 0.6.0 reads it as `TaskNotFoundError` and drops its pending
 input. A requester that does not set `supportsWorking` never receives `working`; a responder that
@@ -236,7 +240,9 @@ correlated to one of its own pending requests. Any other task-labelled message (
 unmatched/late result, malformed envelope) **MUST NOT** be auto-replied to — emitting a signed reply
 to an unauthenticated peer turns the identity into a reflector — and **MUST** be delivered to the
 plain-message path instead, so a host that gates all inbound traffic there (peer registration, flood
-budget, block rules) triages it rather than being bypassed by a content-type label.
+budget, block rules) triages it rather than being bypassed by a content-type label. The one exception
+is a late `working` update for a request this agent made and has finished, from the peer the request
+was sent to (see "Task lifecycle"): it is dropped.
 
 ### Typed skills and extensions (Agent Card format 1.1.0)
 
