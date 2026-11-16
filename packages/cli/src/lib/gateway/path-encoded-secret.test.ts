@@ -302,6 +302,7 @@ describe("ordinary paths (controls: the fix must not hide them)", () => {
 		["a path with an escape for a percent sign", "/x/100%25", false],
 		["a path with a bad escape", "/x/%zz", false],
 		["a path with an escape and the letters nsec but no 1", "/x/%6Esec-notes", false],
+		["a path with an ordinary escape written four layers deep, as deep as the gateway looks", "/x/a%25252520b", false],
 	])("answers %s with the path as it was written", async (_name, path, auth) => {
 		const res = await send(path, { auth });
 		expect(res.status).toBe(404);
