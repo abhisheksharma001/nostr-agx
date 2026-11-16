@@ -125,7 +125,7 @@ describe("a secret key that does not decode, given to identity import", () => {
 	it("leaves the identity that was there as it was", async () => {
 		await agx("identity", "import", "--force", flip(NSEC, 30));
 		await agx("identity", "import", "--force", mixCase(NSEC));
-		expect(stored().secretKeyHex).toBe(mine.secretKeyHex);
+		expect(stored().secretKeyHex === mine.secretKeyHex).toBe(true);
 	});
 });
 
@@ -203,7 +203,7 @@ describe("a secret key that decodes but cannot be used, given to identity import
 		for (const [, value] of UNUSABLE) {
 			await agx("identity", "import", "--force", value);
 		}
-		expect(stored().secretKeyHex).toBe(mine.secretKeyHex);
+		expect(stored().secretKeyHex === mine.secretKeyHex).toBe(true);
 	});
 });
 
@@ -215,7 +215,7 @@ describe("the other failures of identity import keep their own messages", () => 
 			expect(run.stderr).toContain('Profile "default" already has an identity.');
 			expect(run.stderr).not.toContain("Could not use that secret key");
 		}
-		expect(stored().secretKeyHex).toBe(mine.secretKeyHex);
+		expect(stored().secretKeyHex === mine.secretKeyHex).toBe(true);
 	});
 
 	it("a profile directory that cannot be created is still reported as what it is", async () => {
@@ -263,7 +263,7 @@ describe("a valid secret key given to identity import", () => {
 		expect(run.stderr).toBe("");
 		expect(run.code).toBe(EXIT.ok);
 		expect(run.stdout).toContain(incoming.npub);
-		expect(stored().secretKeyHex).toBe(incoming.secretKeyHex);
+		expect(stored().secretKeyHex === incoming.secretKeyHex).toBe(true);
 		expect(stored().npub).toBe(incoming.npub);
 	});
 
@@ -271,7 +271,7 @@ describe("a valid secret key given to identity import", () => {
 		restoreStdin = setStdinForTests(`${NSEC.toUpperCase()}\n`);
 		const run = await agx("identity", "import", "--stdin", "--force");
 		expect(run.code).toBe(EXIT.ok);
-		expect(stored().secretKeyHex).toBe(incoming.secretKeyHex);
+		expect(stored().secretKeyHex === incoming.secretKeyHex).toBe(true);
 	});
 });
 
