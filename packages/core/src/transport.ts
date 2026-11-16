@@ -182,7 +182,9 @@ export interface AgxIncomingMessage extends ParsedExchangeMessage {
 	 * than the real send time by up to the transport's `pollLookbackSec`. */
 	createdAt: number;
 	/** When the sender says it sent this, if the transport carries that
-	 * separately from `createdAt`. Sender-declared; display only. */
+	 * separately from `createdAt`. Sender-declared and unverifiable. Shown to
+	 * people, and used to put one poll's messages in send order, but only between
+	 * `createdAt` and `createdAt + pollLookbackSec`. */
 	sentAt?: number;
 	/** The id of the transport envelope this arrived in, when it differs from
 	 * `eventId` (a Nostr gift wrap's id vs. its rumor's). What `isKnown` is asked

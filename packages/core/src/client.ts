@@ -249,6 +249,30 @@ function fitPublicMessage(message: string): string {
 	return message.slice(0, splitsPair ? MAX_RESULT_ERROR - 1 : MAX_RESULT_ERROR);
 }
 
+/** Where a task message ranks among the messages sent in the same second:
+ * `working` updates by `seq`, then an input request, then a result. Everything
+ * else ranks 0 and, among itself, keeps the transport's order. Read only for messages labelled
+ * as task traffic, like `dispatchMessage`, and used for ORDER alone: a lookalike
+ * label or a made-up `seq` can move a message among the ones sent in the same
+ * second, never decide whether or how it is handled. */
+function taskStep(msg: AgxIncomingMessage): [rank: number, seq: number] {
+	if (msg.contentType !== TASK_CONTENT_TYPE) {
+		return [0, 0];
+	}
+	const env = parseTaskEnvelope(msg.text);
+	if (env?.t !== "res") {
+		return [0, 0];
+	}
+	switch (env.status) {
+		case "working":
+			return [0, env.seq];
+		case "input-required":
+			return [1, 0];
+		default:
+			return [2, 0];
+	}
+}
+
 interface TransportLifecycle {
 	clients: Set<object>;
 	started: boolean;
@@ -818,6 +842,43 @@ export class AgxClient {
 		}
 	}
 
+	/** A poll's messages in the order their senders sent them.
+	 *
+	 * A transport that backdates (the Nostr one) stamps each message up to
+	 * `pollLookbackSec` before it was sent, at random, and hands a poll's messages
+	 * over oldest stamp first. So the order they arrive in says nothing about the
+	 * order they were sent in, and a task's `working` updates, its input request
+	 * and its result land scrambled: an update handled after a later one is
+	 * dropped as older, and one handled after the result has no request left to
+	 * belong to.
+	 *
+	 * The sender's `sentAt` is the only record of the real order, and it is the
+	 * sender's word. It is used only inside the window the backdate allows: never
+	 * earlier than the stamp, so no sender can move itself ahead of where its stamp
+	 * already puts it, and never later than the stamp plus `pollLookbackSec`. Within
+	 * one second (sends are stamped to the second, and an update is usually sent
+	 * just before the result) a task's messages rank by what they are, see
+	 * {@link taskStep}. The sort is stable, so ties keep the transport's order. */
+	private inSendOrder(messages: AgxIncomingMessage[]): AgxIncomingMessage[] {
+		const lookback = this.transport.pollLookbackSec ?? 0;
+		return messages
+			.map((msg) => {
+				const claimed = msg.sentAt ?? msg.createdAt;
+				const sent =
+					claimed > msg.createdAt
+						? Math.min(claimed, msg.createdAt + lookback)
+						: msg.createdAt;
+				return { msg, sent, step: taskStep(msg) };
+			})
+			.sort(
+				(a, b) =>
+					a.sent - b.sent ||
+					a.step[0] - b.step[0] ||
+					a.step[1] - b.step[1],
+			)
+			.map(({ msg }) => msg);
+	}
+
 	private async pumpOnce(): Promise<{
 		cursor: number;
 		dispatched: number;
@@ -918,7 +979,7 @@ export class AgxClient {
 		};
 		let dispatched = 0;
 		let anyFailed = false;
-		for (const msg of res.messages) {
+		for (const msg of this.inSendOrder(res.messages)) {
 			// `createdAt` is sender-declared: a future-dated event is skipped
 			// entirely without touching seen (the "seen only after dispatch"
 			// invariant is preserved); it is re-polled once it is no longer ahead.
