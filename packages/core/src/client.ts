@@ -2153,7 +2153,6 @@ export class AgxClient {
 	 * client never made. Bounded: past {@link MAX_REMEMBERED_REQUESTS} the oldest is
 	 * forgotten, and its late updates then reach `onMessage` as before. */
 	private rememberRequest(taskId: string, peer: string): void {
-		this.requestedPeers.delete(taskId);
 		this.requestedPeers.set(taskId, peer);
 		if (this.requestedPeers.size > MAX_REMEMBERED_REQUESTS) {
 			const oldest = this.requestedPeers.keys().next().value;
