@@ -404,14 +404,11 @@ function validatePayloadNode(
 		}
 		if (schema.multipleOf !== undefined) {
 			const step = schema.multipleOf as number;
-			// `%` on doubles is exact, so a whole number is checked with it. The
-			// rounding test below cannot reject anything once the quotient passes
-			// about 2^49, and past 2^53 every double is whole, even against a
-			// step with a fraction (decided only for exact binary multiples).
-			if (
-				Number.isInteger(value) &&
-				(Number.isInteger(step) || Math.abs(value) > Number.MAX_SAFE_INTEGER)
-			) {
+			// `%` on doubles is exact, so a whole number against a whole step is
+			// checked with it: the rounding test below cannot reject anything once
+			// the quotient passes about 2^49. A fractional step or value keeps the
+			// rounding test, which reads 0.3 as a multiple of 0.1.
+			if (Number.isInteger(value) && Number.isInteger(step)) {
 				if (value % step !== 0) {
 					return `${path}: not a multipleOf value`;
 				}
