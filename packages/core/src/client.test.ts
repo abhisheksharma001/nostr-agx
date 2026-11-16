@@ -4287,3 +4287,227 @@ describe("AgxClient request while its publish is slow", () => {
 		await expect(pending).rejects.toThrow(/timed out/);
 	});
 });
+
+describe("AgxClient handles one poll's messages in the order they were sent", () => {
+	// A backdating transport (the Nostr one) stamps each message up to
+	// `pollLookbackSec` before it was sent, at random, and hands a poll's messages
+	// over oldest stamp first. The stamp says nothing about the order they were
+	// sent in, so `pump()` puts them in send order before it dispatches any.
+	const LOOKBACK = 2 * 24 * 60 * 60;
+	const SENT = 1_700_000_000;
+
+	/** A client whose transport backdates, as the Nostr one does. */
+	function backdatingClient(
+		id: string,
+		onMessage: (msg: AgxIncomingMessage) => void | Promise<void> = vi.fn(),
+	): AgxClient {
+		return new AgxClient({
+			transport: { ...bus.transport(id), pollLookbackSec: LOOKBACK },
+			onMessage,
+		});
+	}
+
+	/** Put a task envelope in `to`'s inbox, stamped `stamped`, sent at `sentAt`. */
+	function pushSent(
+		to: string,
+		from: string,
+		envelope: TaskEnvelope,
+		stamped: number,
+		sentAt: number,
+	): void {
+		bus.pushMessage(
+			to,
+			{
+				from,
+				text: encodeTaskEnvelope(envelope),
+				contextId: envelope.taskId,
+				messageId: randomId(),
+				subject: null,
+				autoDepth: null,
+				contentType: TASK_CONTENT_TYPE,
+				sentAt,
+			},
+			stamped,
+		);
+	}
+
+	/** Put a plain message in `to`'s inbox, stamped `stamped`, sent at `sentAt`. */
+	function pushPlainSent(
+		to: string,
+		from: string,
+		text: string,
+		stamped: number,
+		sentAt: number,
+	): void {
+		bus.pushMessage(
+			to,
+			{
+				from,
+				text,
+				contextId: "chat",
+				messageId: randomId(),
+				subject: null,
+				autoDepth: null,
+				contentType: "application/a2a+json",
+				sentAt,
+			},
+			stamped,
+		);
+	}
+
+	const texts = (onMessage: ReturnType<typeof vi.fn>) =>
+		onMessage.mock.calls.map(([msg]) => (msg as AgxIncomingMessage).text);
+
+	it("hands a task's working updates over in seq order, however the wraps were stamped", async () => {
+		const onMessage = vi.fn();
+		const onTaskStatus = vi.fn();
+		const alice = backdatingClient(ALICE, onMessage);
+		const pending = alice.request(BOB, "long.task", {}, {
+			timeoutMs: 1_000,
+			onTaskStatus,
+		});
+		const { taskId } = outboundRequest();
+		const working = (seq: number): TaskEnvelope => ({ t: "res", taskId, status: "working", seq });
+		// The transport's order (oldest stamp first): seq 2, seq 1, the result,
+		// seq 3. All four were sent in the same second.
+		pushSent(ALICE, BOB, working(2), SENT - 4_000, SENT);
+		pushSent(ALICE, BOB, working(1), SENT - 3_000, SENT);
+		pushSent(ALICE, BOB, { t: "res", taskId, status: "completed", output: "done" }, SENT - 2_000, SENT);
+		pushSent(ALICE, BOB, working(3), SENT - 1_000, SENT);
+
+		await alice.pump();
+
+		expect(await pending).toBe("done");
+		expect(onTaskStatus.mock.calls.map(([update]) => update.seq)).toEqual([1, 2, 3]);
+		expect(onMessage).not.toHaveBeenCalled();
+	});
+
+	it("handles messages in the order they were sent, not the order they were stamped", async () => {
+		const onMessage = vi.fn();
+		const alice = backdatingClient(ALICE, onMessage);
+		pushPlainSent(ALICE, BOB, "sent second", SENT - 9_000, SENT + 20);
+		pushPlainSent(ALICE, BOB, "sent first", SENT - 1_000, SENT + 10);
+
+		await alice.pump();
+
+		expect(texts(onMessage)).toEqual(["sent first", "sent second"]);
+	});
+
+	it("puts input-required after the working updates it follows, and a result after both", async () => {
+		const alice = backdatingClient(ALICE);
+		const stream = await alice.streamRequest(BOB, "long.task", {}, { timeoutMs: 1_000 });
+		const { taskId } = outboundRequest();
+		const statuses: string[] = [];
+		stream.on("statusUpdate", (status) => statuses.push(status));
+		pushSent(ALICE, BOB, { t: "res", taskId, status: "completed", output: "done" }, SENT - 3_000, SENT);
+		pushSent(
+			ALICE,
+			BOB,
+			{
+				t: "res",
+				taskId,
+				status: "input-required",
+				inputRequestId: "q1",
+				requirement: { prompt: "which one?" },
+			},
+			SENT - 2_000,
+			SENT,
+		);
+		pushSent(ALICE, BOB, { t: "res", taskId, status: "working", seq: 1 }, SENT - 1_000, SENT);
+
+		await alice.pump();
+
+		expect(statuses).toEqual(["working", "input-required", "completed"]);
+		expect(await stream.result).toBe("done");
+	});
+
+	it("keeps another peer's update for the same task out of the order and the seq", async () => {
+		const onMessage = vi.fn();
+		const onTaskStatus = vi.fn();
+		const alice = backdatingClient(ALICE, onMessage);
+		const pending = alice.request(BOB, "long.task", {}, {
+			timeoutMs: 1_000,
+			onTaskStatus,
+		});
+		const { taskId } = outboundRequest();
+		const working = (seq: number): TaskEnvelope => ({ t: "res", taskId, status: "working", seq });
+		pushSent(ALICE, BOB, working(2), SENT - 4_000, SENT);
+		// Mallory knows the task id and claims a high seq in the same second.
+		pushSent(ALICE, "mallory", working(9), SENT - 3_500, SENT);
+		pushSent(ALICE, BOB, working(1), SENT - 3_000, SENT);
+		pushSent(ALICE, BOB, { t: "res", taskId, status: "completed", output: "done" }, SENT - 2_000, SENT);
+
+		await alice.pump();
+
+		expect(await pending).toBe("done");
+		expect(onTaskStatus.mock.calls.map(([update]) => update.seq)).toEqual([1, 2]);
+		expect(onMessage).not.toHaveBeenCalled();
+	});
+
+	it("does not rank a plain message by an envelope-looking text", async () => {
+		const onMessage = vi.fn();
+		const alice = backdatingClient(ALICE, onMessage);
+		// Neither task is ours, so both reach onMessage and show the order they ran in.
+		const lookalike = encodeTaskEnvelope({ t: "res", taskId: "x", status: "completed", output: 1 });
+		pushPlainSent(ALICE, BOB, lookalike, SENT - 2_000, SENT);
+		pushSent(ALICE, BOB, { t: "res", taskId: "y", status: "working", seq: 1 }, SENT - 1_000, SENT);
+
+		await alice.pump();
+
+		expect(texts(onMessage)[0]).toBe(lookalike);
+	});
+
+	describe("a sender's claimed send time", () => {
+		it("never moves a message ahead of where its stamp puts it", async () => {
+			const onMessage = vi.fn();
+			const alice = backdatingClient(ALICE, onMessage);
+			pushPlainSent(ALICE, BOB, "honest", SENT - 1_000, SENT);
+			// Stamped later, but claims to have been sent long ago.
+			pushPlainSent(ALICE, "mallory", "claims the past", SENT - 500, 0);
+
+			await alice.pump();
+
+			expect(texts(onMessage)).toEqual(["honest", "claims the past"]);
+		});
+
+		it("is capped at what the transport's backdate allows", async () => {
+			const onMessage = vi.fn();
+			const alice = backdatingClient(ALICE, onMessage);
+			// Stamped first, claims a time far beyond any backdate...
+			pushPlainSent(ALICE, "mallory", "claims the future", SENT - 1_000, SENT + 10 * LOOKBACK);
+			// ...so it still sorts at its stamp plus the longest backdate, ahead of this.
+			pushPlainSent(ALICE, BOB, "honest", SENT - 600, SENT - 1_000 + LOOKBACK + 400);
+
+			await alice.pump();
+
+			expect(texts(onMessage)).toEqual(["claims the future", "honest"]);
+		});
+
+		it.each([
+			["NaN", Number.NaN],
+			["-Infinity", Number.NEGATIVE_INFINITY],
+			["Infinity", Number.POSITIVE_INFINITY],
+		])("cannot scramble the order with %s", async (_label, claim) => {
+			const onMessage = vi.fn();
+			const alice = backdatingClient(ALICE, onMessage);
+			pushPlainSent(ALICE, BOB, "a", SENT - 3_000, SENT);
+			pushPlainSent(ALICE, "mallory", "b", SENT - 2_000, claim);
+			pushPlainSent(ALICE, BOB, "c", SENT - 1_000, SENT + LOOKBACK + 50_000);
+
+			await alice.pump();
+
+			expect(texts(onMessage)).toEqual(["a", "b", "c"]);
+		});
+
+		it("is ignored when the transport does not backdate", async () => {
+			const onMessage = vi.fn();
+			const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
+			pushPlainSent(ALICE, BOB, "stamped first", SENT, SENT + 50);
+			pushPlainSent(ALICE, BOB, "stamped second", SENT + 1, SENT + 10);
+
+			await alice.pump();
+
+			expect(texts(onMessage)).toEqual(["stamped first", "stamped second"]);
+		});
+	});
+});
