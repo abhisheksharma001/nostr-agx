@@ -4502,6 +4502,29 @@ describe("AgxClient handles one poll's messages in the order they were sent", ()
 			expect(texts(onMessage)).toEqual(expected);
 		});
 
+		it("counts a message that carries no send time at its stamp", async () => {
+			const onMessage = vi.fn();
+			const alice = backdatingClient(ALICE, onMessage);
+			bus.pushMessage(
+				ALICE,
+				{
+					from: BOB,
+					text: "no send time",
+					contextId: "chat",
+					messageId: randomId(),
+					subject: null,
+					autoDepth: null,
+					contentType: "application/a2a+json",
+				},
+				SENT - 3_000,
+			);
+			pushPlainSent(ALICE, BOB, "sent later", SENT - 2_000, SENT - 1_500);
+
+			await alice.pump();
+
+			expect(texts(onMessage)).toEqual(["no send time", "sent later"]);
+		});
+
 		it("is ignored when the transport does not backdate", async () => {
 			const onMessage = vi.fn();
 			const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
