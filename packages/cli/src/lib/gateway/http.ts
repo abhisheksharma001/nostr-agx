@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { isPastedSecretKey } from "../peer.js";
 
 /** An API failure: the status, a stable code a client can branch on, and a
  * message (and optional remedy) fit to show its user. */
@@ -54,6 +55,33 @@ export function sendError(res: ServerResponse, error: ApiError): void {
 			...(error.description ? { description: error.description } : {}),
 		},
 	});
+}
+
+/** How many layers of percent escapes {@link mayHoldSecretKey} looks through. */
+const MAX_ESCAPE_LAYERS = 4;
+
+/**
+ * Text that is a pasted secret key, or would be once its percent escapes are
+ * undone. A request path keeps an escape as it was written, so `%6Esec1…` holds
+ * no `nsec1` as it stands, yet quoting it repeats the key. An escape can itself
+ * be escaped (`%256E` is `%6E` is `n`): a few layers are looked through, and a
+ * value escaped deeper than any client writes counts too, as it cannot be told
+ * apart. `decodeURIComponent` throws on a bad escape (`%zz`), which must not
+ * stop an answer being built, so the escapes are undone here.
+ */
+export function mayHoldSecretKey(value: string): boolean {
+	let text = value;
+	for (let layer = 0; layer <= MAX_ESCAPE_LAYERS; layer++) {
+		if (isPastedSecretKey(text)) {
+			return true;
+		}
+		const undone = text.replace(/%([0-9a-f]{2})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+		if (undone === text) {
+			return false;
+		}
+		text = undone;
+	}
+	return true;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
