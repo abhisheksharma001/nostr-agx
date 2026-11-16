@@ -426,7 +426,7 @@ describe("AgxClient task request/response", () => {
 		expect(bus.inbox.get(BOB) ?? []).toHaveLength(0);
 	});
 
-	it("routes post-terminal working traffic to onMessage", async () => {
+	it("drops post-terminal working traffic from the responder instead of routing it to onMessage", async () => {
 		const onMessage = vi.fn();
 		const onTaskStatus = vi.fn();
 		const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
@@ -449,7 +449,7 @@ describe("AgxClient task request/response", () => {
 		await alice.pump();
 		expect(await pending).toBe("done");
 		expect(onTaskStatus).not.toHaveBeenCalled();
-		expect(onMessage).toHaveBeenCalledTimes(1);
+		expect(onMessage).not.toHaveBeenCalled();
 	});
 
 	it("does not extend the request deadline after a working update", async () => {
