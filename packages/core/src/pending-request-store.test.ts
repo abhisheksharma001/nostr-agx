@@ -705,7 +705,7 @@ describe("durable pending-request races", () => {
 		seed(store, { key: "local-1", taskId: "task-1", deadlineAt: null });
 		seed(store, { key: "local-2", taskId: "task-2", deadlineAt: null });
 		// A result still on its way in when the stop began reaches the client late.
-		let deliver: ((message: AgxIncomingMessage) => Promise<void>) | undefined;
+		let deliver: ((message: AgxIncomingMessage) => void | Promise<void>) | undefined;
 		const transport: AgxTransport = {
 			...bus.transport(),
 			onMessage: async (handler) => {
