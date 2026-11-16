@@ -5,7 +5,7 @@ import { isIP } from "node:net";
 import { normalizePubkey } from "@nostr-agx/nostr";
 import { z } from "zod";
 import { gatewaySubscriptionsPath, writePrivateJson } from "../paths.js";
-import { mayHoldSecretKey, shown } from "./http.js";
+import { mayHoldSecretKey } from "./http.js";
 
 /**
  * Webhook subscriptions: where `agx gateway` delivers what arrives for this
@@ -201,11 +201,22 @@ export function parseSubscriptionInput(
 		);
 	}
 	const input = parsed.data;
+	// Kept in the subscriptions file, shown back and logged: a key has no place in either.
+	if (mayHoldSecretKey(input.url)) {
+		throw new SubscriptionError(
+			"Invalid subscription: url holds a secret key (nsec1…), which is not shown here",
+		);
+	}
+	if (mayHoldSecretKey(input.label ?? "")) {
+		throw new SubscriptionError(
+			"Invalid subscription: label holds a secret key (nsec1…), which is not shown here",
+		);
+	}
 	let url: URL;
 	try {
 		url = new URL(input.url);
 	} catch {
-		throw new SubscriptionError(`Invalid subscription: url is not a URL: ${shown(input.url)}`);
+		throw new SubscriptionError(`Invalid subscription: url is not a URL: ${input.url}`);
 	}
 	if (url.protocol !== "https:" && url.protocol !== "http:") {
 		throw new SubscriptionError("Invalid subscription: url must be http(s)");

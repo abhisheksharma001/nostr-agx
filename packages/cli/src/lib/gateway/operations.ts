@@ -213,6 +213,13 @@ export async function sendMessage(deps: OperationDeps, input: unknown): Promise<
 		perPeerPerHour: integer(req.maxPerHour, "maxPerHour", DEFAULT_AUTO_REPLY_LIMITS.perPeerPerHour, { min: 1, max: 1_000_000 }),
 	};
 	const contextId = text(req.contextId).trim() || randomId();
+	if (mayHoldSecretKey(contextId)) {
+		throw new ApiError(
+			400,
+			"invalid_request",
+			"The conversation ID must be a short id, not a secret key (nsec1…), which is not shown here",
+		);
+	}
 	if (contextId.length > MAX_CONTEXT_ID) {
 		throw new ApiError(400, "invalid_request", `Conversation ID is longer than ${MAX_CONTEXT_ID} characters`);
 	}
