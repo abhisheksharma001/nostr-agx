@@ -331,6 +331,8 @@ export class AgxClient {
 	private readonly cancellationSends = new Set<Promise<void>>();
 	/** Durable-client request sends, from the first record write to the waiting write. */
 	private readonly requestSends = new Set<Promise<void>>();
+	/** Genuine results whose record is being removed, until the request is settled. */
+	private readonly resultRemovals = new Set<Promise<void>>();
 	private cursor: number;
 	private pollTimer?: ReturnType<typeof setTimeout>;
 	private transportRetained = false;
@@ -1225,7 +1227,9 @@ export class AgxClient {
 
 	/** Stop polling and this client's live listener. In-flight `request()` callers
 	 * are rejected rather than left hanging. `preservePending` is for a planned
-	 * durable-request restart: waiting records stay and no task cancel is sent. */
+	 * durable-request restart: waiting records stay and no task cancel is sent. It
+	 * returns only after a genuine result whose record is being removed has been
+	 * handed to its caller. */
 	async stop(opts?: { preservePending?: boolean }): Promise<void> {
 		this.running = false;
 		this.stopping = true;
@@ -1253,6 +1257,12 @@ export class AgxClient {
 		this.started = false;
 		this.unsubscribeTransportListeners();
 		this.receiptListeners.clear();
+		// A restart stop first lets a genuine result finish being collected: its
+		// record is already being removed, so rejecting its caller below would lose
+		// a result nothing can recover. A plain stop still rejects at once.
+		while (opts?.preservePending === true && this.resultRemovals.size > 0) {
+			await Promise.all([...this.resultRemovals]);
+		}
 		for (const [taskId, p] of this.pending) {
 			if (p.timer) {
 				clearTimeout(p.timer);
@@ -1840,6 +1850,14 @@ export class AgxClient {
 		if (p.durableKey && this.pendingRequests) {
 			// The genuine result is here: its deadline must not race the removal.
 			if (p.timer) clearTimeout(p.timer);
+			// A restart stop() waits for this removal and the settling after it: once
+			// the record is gone nothing can recover the result, so the caller has to
+			// get it from here. The wait ends in the same step that settles it below.
+			let removed!: () => void;
+			const removing = new Promise<void>((resolve) => {
+				removed = resolve;
+			});
+			this.resultRemovals.add(removing);
 			try {
 				await this.pendingRequests.remove(p.durableKey);
 			} catch (error) {
@@ -1847,8 +1865,11 @@ export class AgxClient {
 				// result must not settle locally while a restart could recover it again.
 				if (this.pending.get(env.taskId) === p) this.armDeadline(env.taskId, p);
 				throw error;
+			} finally {
+				this.resultRemovals.delete(removing);
+				removed();
 			}
-			// A stop() settled it while the record was being removed.
+			// A plain stop() settled it while the record was being removed.
 			if (this.pending.get(env.taskId) !== p) return;
 		}
 		p.onUpdate?.(env);
