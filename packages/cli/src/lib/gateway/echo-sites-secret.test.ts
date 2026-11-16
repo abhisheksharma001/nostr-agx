@@ -212,3 +212,69 @@ describe("ordinary values are still quoted and accepted", () => {
 		expect(res.status).toBe(201);
 	});
 });
+
+describe.each(KEYS)("a secret key ($kind) typed into a second field, a list, an address or an id", ({ key, prefix }) => {
+	describe.each(FORMS)("$name", (form) => {
+		it("is refused as the capability of a task request that checks the card first", async () => {
+			// The card check answers 404 for an agent without a card: the refusal must come before it,
+			// or the 422 text "does not advertise ..." would quote the capability.
+			const res = await send("/v1/tasks", {
+				method: "POST",
+				body: { peer: PEER, capability: form.of(key), checkCard: true, timeoutSec: 1 },
+			});
+			expectRefused(res, key, prefix);
+		});
+
+		it("is refused as the second capability of a webhook list that is put on the Agent Card", async () => {
+			const res = await send("/v1/subscriptions", {
+				method: "POST",
+				body: {
+					url: "http://127.0.0.1:9/hook",
+					events: ["task"],
+					capabilities: ["invoice.review", form.of(key)],
+					advertise: true,
+					acceptAll: true,
+				},
+			});
+			expectRefused(res, key, prefix);
+			const listed = await send("/v1/subscriptions");
+			expect(leaksKey(listed.body, key, prefix)).toBe(false);
+		});
+
+		it("is refused inside a webhook address that is otherwise a URL, so it is not kept or logged", async () => {
+			const res = await send("/v1/subscriptions", {
+				method: "POST",
+				body: { url: `http://127.0.0.1:9/hook?k=${form.of(key)}`, events: ["message"], acceptAll: true },
+			});
+			expectRefused(res, key, prefix);
+			expect((await send("/v1/subscriptions")).body).not.toContain("127.0.0.1:9/hook?k=");
+		});
+
+		it("is refused as a webhook label, so it is not kept or shown back", async () => {
+			const res = await send("/v1/subscriptions", {
+				method: "POST",
+				body: { url: "http://127.0.0.1:9/hook", events: ["message"], acceptAll: true, label: form.of(key) },
+			});
+			expectRefused(res, key, prefix);
+		});
+
+		it("is refused as a conversation id, which is sent and shown back", async () => {
+			const res = await send("/v1/messages", {
+				method: "POST",
+				body: { peer: PEER, text: "hello", contextId: form.of(key) },
+			});
+			expectRefused(res, key, prefix);
+		});
+	});
+});
+
+describe("an ordinary webhook address with a query, an ordinary label and an ordinary conversation id are still accepted", () => {
+	it("keeps a webhook address with a token in its query and a label", async () => {
+		const res = await send("/v1/subscriptions", {
+			method: "POST",
+			body: { url: "http://127.0.0.1:9/hook?token=abc123", events: ["message"], acceptAll: true, label: "invoices" },
+		});
+		expect(res.status).toBe(201);
+		expect(JSON.parse(res.body).label).toBe("invoices");
+	});
+});
