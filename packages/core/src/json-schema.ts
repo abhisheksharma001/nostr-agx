@@ -403,15 +403,29 @@ function validatePayloadNode(
 			return `${path}: not below exclusiveMaximum`;
 		}
 		if (schema.multipleOf !== undefined) {
-			const quotient = value / (schema.multipleOf as number);
-			const tolerance =
-				Number.EPSILON * Math.max(1, Math.abs(quotient)) * 4;
-			// An overflowing quotient would compare NaN > tolerance (false) and pass.
+			const step = schema.multipleOf as number;
+			// `%` on doubles is exact, so a whole number is checked with it. The
+			// rounding test below cannot reject anything once the quotient passes
+			// about 2^49, and past 2^53 every double is whole, even against a
+			// step with a fraction (decided only for exact binary multiples).
 			if (
-				!Number.isFinite(quotient) ||
-				Math.abs(quotient - Math.round(quotient)) > tolerance
+				Number.isInteger(value) &&
+				(Number.isInteger(step) || Math.abs(value) > Number.MAX_SAFE_INTEGER)
 			) {
-				return `${path}: not a multipleOf value`;
+				if (value % step !== 0) {
+					return `${path}: not a multipleOf value`;
+				}
+			} else {
+				const quotient = value / step;
+				const tolerance =
+					Number.EPSILON * Math.max(1, Math.abs(quotient)) * 4;
+				// An overflowing quotient would compare NaN > tolerance (false) and pass.
+				if (
+					!Number.isFinite(quotient) ||
+					Math.abs(quotient - Math.round(quotient)) > tolerance
+				) {
+					return `${path}: not a multipleOf value`;
+				}
 			}
 		}
 	}
