@@ -3,6 +3,7 @@ import { nip19 } from "nostr-tools";
 import { encrypt } from "nostr-tools/nip49";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Agx } from "../nodes/Agx/Agx.node";
+import { parseRelays } from "../nodes/shared/identity";
 import { numberOption } from "../nodes/shared/numbers";
 import { parseCapabilities, parsePeer, parsePeerList } from "../nodes/shared/peers";
 import { executeContext, newAgent, type RunningRelay, startTestRelay } from "./helpers";
@@ -35,6 +36,11 @@ function leaksKey(text: string, key: string, prefix: string): boolean {
 	return false;
 }
 
+/** `text`, or a note in its place when it repeats the key: a failing check must not print the key it is about. */
+function safe(text: string, key: string, prefix: string): string {
+	return leaksKey(text, key, prefix) ? "(repeats the key)" : text;
+}
+
 /** The message of what `run` throws, or "" when it does not throw. */
 function messageOf(run: () => unknown): string {
 	try {
@@ -62,25 +68,25 @@ describe.each(KEYS)("a secret key ($kind) typed into a field of the n8n nodes", 
 	describe.each(forms)("$name", ({ text }) => {
 		it("is not repeated when it is typed as an agent", () => {
 			const message = messageOf(() => parsePeer(text));
-			expect(message).toContain("not shown");
+			expect(safe(message, key, prefix)).toContain("not shown");
 			expect(leaksKey(message, key, prefix)).toBe(false);
 		});
 
 		it("is not repeated when it is typed in a list of agents", () => {
 			const message = messageOf(() => parsePeerList(`${toNpub(generateKeypair().publicKey)}, ${text}`));
-			expect(message).toContain("not shown");
+			expect(safe(message, key, prefix)).toContain("not shown");
 			expect(leaksKey(message, key, prefix)).toBe(false);
 		});
 
 		it("is not repeated when it is typed as a number", () => {
 			const message = messageOf(() => numberOption(text, "Timeout (Seconds)", 30, { min: 1, max: 60 }));
-			expect(message).toContain("Timeout (Seconds) must be a number");
+			expect(safe(message, key, prefix)).toContain("Timeout (Seconds) must be a number");
 			expect(leaksKey(message, key, prefix)).toBe(false);
 		});
 
 		it("is refused as a capability a workflow serves", () => {
 			const message = messageOf(() => parseCapabilities(`invoice.review, ${text}`));
-			expect(message).toContain("not shown");
+			expect(safe(message, key, prefix)).toContain("not shown");
 			expect(leaksKey(message, key, prefix)).toBe(false);
 		});
 
@@ -102,7 +108,37 @@ describe.each(KEYS)("a secret key ($kind) typed into a field of the n8n nodes", 
 				(e: unknown) => e,
 			);
 			const message = error instanceof Error ? error.message : "";
-			expect(message).toContain("not shown");
+			expect(safe(message, key, prefix)).toContain("not shown");
+			expect(leaksKey(message, key, prefix)).toBe(false);
+		});
+
+		it("is refused as the capability of a task request that checks the card first", async () => {
+			// The card check says "No Agent Card found" for an agent without one: the refusal must come
+			// before it, or the "does not advertise" text would quote the capability.
+			const n8nAgent = newAgent(relay);
+			const ctx = executeContext({
+				credentials: n8nAgent.credentials,
+				params: () => ({
+					resource: "task",
+					operation: "request",
+					peer: newAgent(relay).publicKey,
+					capability: text,
+					payload: "{}",
+					options: { timeout: 1, checkCard: true },
+				}),
+			});
+			const error = await new Agx().execute.call(ctx).then(
+				() => null,
+				(e: unknown) => e,
+			);
+			const message = error instanceof Error ? error.message : "";
+			expect(safe(message, key, prefix)).toContain("not shown");
+			expect(leaksKey(message, key, prefix)).toBe(false);
+		});
+
+		it("is not repeated when it is typed as a relay address", () => {
+			const message = messageOf(() => parseRelays(`wss://relay.example.com ${text}`));
+			expect(message).not.toBe("");
 			expect(leaksKey(message, key, prefix)).toBe(false);
 		});
 
@@ -122,7 +158,7 @@ describe.each(KEYS)("a secret key ($kind) typed into a field of the n8n nodes", 
 				(e: unknown) => e,
 			);
 			const message = error instanceof Error ? error.message : "";
-			expect(message).toContain("not shown");
+			expect(safe(message, key, prefix)).toContain("not shown");
 			expect(leaksKey(message, key, prefix)).toBe(false);
 		});
 	});
@@ -139,6 +175,10 @@ describe("ordinary values are still quoted and accepted", () => {
 
 	it("quotes a bad number as written", () => {
 		expect(messageOf(() => numberOption("soon", "Timeout (Seconds)", 30, { min: 1, max: 60 }))).toContain('"soon"');
+	});
+
+	it("quotes a bad relay address as written", () => {
+		expect(messageOf(() => parseRelays("relay.example.com"))).toContain('"relay.example.com"');
 	});
 
 	it("accepts ordinary capability names", () => {
