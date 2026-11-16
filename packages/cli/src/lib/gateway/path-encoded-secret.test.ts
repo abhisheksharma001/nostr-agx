@@ -40,7 +40,7 @@ interface Answer {
 }
 
 /** A request with the path exactly as given: `node:http` sends it unchanged, so an escape reaches the gateway as written. */
-function send(path: string, options: { auth?: boolean; method?: string } = {}): Promise<Answer> {
+function send(path: string, options: { auth?: boolean; method?: string; body?: unknown } = {}): Promise<Answer> {
 	return new Promise((resolve, reject) => {
 		const req = request(
 			{
@@ -49,7 +49,10 @@ function send(path: string, options: { auth?: boolean; method?: string } = {}): 
 				path,
 				method: options.method ?? "GET",
 				agent: false,
-				headers: options.auth === false ? {} : { authorization: `Bearer ${apiKey}` },
+				headers: {
+					...(options.auth === false ? {} : { authorization: `Bearer ${apiKey}` }),
+					...(options.body === undefined ? {} : { "content-type": "application/json" }),
+				},
 			},
 			(res) => {
 				const chunks: Buffer[] = [];
@@ -58,7 +61,7 @@ function send(path: string, options: { auth?: boolean; method?: string } = {}): 
 			},
 		);
 		req.on("error", reject);
-		req.end();
+		req.end(options.body === undefined ? undefined : JSON.stringify(options.body));
 	});
 }
 
@@ -254,13 +257,37 @@ describe.each(KEYS)("a secret key ($kind) in a request path", ({ key, prefix }) 
 		});
 	});
 
-	describe("as the agent in GET /v1/agents/:peer, written once as an escape (control: the route decodes it first)", () => {
-		it("answers 400 invalid_peer and does not repeat it", async () => {
+	describe("as the agent in GET /v1/agents/:peer", () => {
+		it("answers 400 invalid_peer and does not repeat it when written once as an escape (control: the route decodes it first)", async () => {
 			const res = await send(`/v1/agents/${escapedAt(key, 0)}`);
 			expect(res.status).toBe(400);
 			expect(res.body).toContain("invalid_peer");
 			expect(leaksKey(res.body, key, prefix)).toBe(false);
 			expect(leaksKey(lines.join("\n"), key, prefix)).toBe(false);
+		});
+
+		it.each([
+			["escaped twice", 2],
+			["escaped three times", 3],
+			["escaped twelve times", 12],
+		])("answers 400 invalid_peer and does not repeat it when the first letter is %s (the route decodes once, and what is left is still an escape)", async (_name, layers) => {
+			const res = await send(`/v1/agents/${escapedAt(key, 0, { layers })}`);
+			expect(res.status).toBe(400);
+			expect(res.body).toContain("invalid_peer");
+			expect(leaksKey(res.body, key, prefix)).toBe(false);
+			expect(leaksKey(lines.join("\n"), key, prefix)).toBe(false);
+		});
+	});
+
+	describe("as the agent in a request body, with a letter written as an escape", () => {
+		it.each([
+			["POST /v1/tasks", "/v1/tasks", { capability: "x.y" }],
+			["POST /v1/messages", "/v1/messages", { text: "hello" }],
+		])("%s answers 400 invalid_peer and does not repeat it", async (_route, path, rest) => {
+			const res = await send(path, { method: "POST", body: { peer: escapedAt(key, 0), ...rest } });
+			expect(res.status).toBe(400);
+			expect(res.body).toContain("invalid_peer");
+			expect(leaksKey(res.body, key, prefix)).toBe(false);
 		});
 	});
 });
