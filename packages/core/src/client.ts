@@ -206,6 +206,9 @@ const MAX_WORKING_MESSAGE_CHARS = 2000;
 const DEFAULT_MAX_PENDING_TASK_INPUTS = 32;
 const DEFAULT_MAX_INPUT_TIMEOUT_MS = 5 * 60_000;
 const MAX_QUEUED_TASK_RUNS = 100;
+/** How many requests' peers are remembered after the requests finish, to
+ * recognise a late `working` update (oldest forgotten first). */
+const MAX_REMEMBERED_REQUESTS = 1024;
 const INPUT_UNSUPPORTED_ERROR =
 	"AGX task requires input; this request does not support interactive input";
 const INPUT_CANCELLED_ERROR = "AGX task was canceled by its requester";
@@ -371,6 +374,8 @@ export class AgxClient {
 	>();
 	private readonly handlers = new Map<string, RegisteredTaskHandler>();
 	private readonly pending = new Map<string, Pending>();
+	/** The peer each recent request went to, kept after the request finishes. */
+	private readonly requestedPeers = new Map<string, string>();
 	private readonly pendingTaskInputs = new Map<string, PendingTaskInput>();
 	private readonly activeInboundTasks = new Map<string, { canceled: boolean }>();
 	private readonly cancellationSends = new Set<Promise<void>>();
@@ -706,6 +711,7 @@ export class AgxClient {
 			}
 			this.pending.set(taskId, pending);
 		});
+		this.rememberRequest(taskId, pending.peer);
 		// The timeout or a stop() can settle it while the publish below is still
 		// in flight, before the caller holds it: handled here, it is not an
 		// unhandled rejection (which would end the process). The caller still
@@ -1241,9 +1247,10 @@ export class AgxClient {
 			// actually service it: a request for a capability WE registered, a result
 			// or update correlated to a pending request of OURS, or an input
 			// correlated to a handler waiting for it. Anything else — an unknown
-			// capability, an unmatched/late result or update, a malformed envelope — is
-			// deliberately NOT auto-replied to (a reply would let any peer coax a
-			// signed event out of this identity) and NOT silently dropped; it falls
+			// capability, an unmatched/late result or update (bar the late `working`
+			// update below), a malformed envelope — is deliberately NOT auto-replied
+			// to (a reply would let any peer coax a signed event out of this
+			// identity) and NOT silently dropped; it falls
 			// through to `onMessage` so the host's own trust flow triages it exactly
 			// like a plain message. This is what keeps a task-labelled message from
 			// bypassing a host that gates all inbound traffic in `onMessage`.
@@ -1254,6 +1261,23 @@ export class AgxClient {
 			}
 			if (env?.t === "res" && this.pending.has(env.taskId)) {
 				await this.resolvePending(msg, env);
+				return;
+			}
+			// A `working` update that arrives after its request has finished (a
+			// relay served the result first) is progress on a request WE made, from
+			// the peer we asked: there is nothing left for it to update and nothing
+			// for a host to triage, so it is dropped here. Only that: a late result
+			// or input request, another peer's message and traffic for a task we
+			// never requested still fall through to `onMessage` below.
+			if (
+				env?.t === "res" &&
+				env.status === "working" &&
+				this.requestedPeers.get(env.taskId) === this.normalizeId(msg.from)
+			) {
+				this.log.debug?.("AGX: dropping a working update for a finished request", {
+					taskId: env.taskId,
+					seq: env.seq,
+				});
 				return;
 			}
 			if (env?.t === "input") {
@@ -2121,6 +2145,21 @@ export class AgxClient {
 		});
 		if (!sent.ok) {
 			throw new Error(`AGX task input could not be sent to ${to}`);
+		}
+	}
+
+	/** Remember that a request went to `peer`, so a `working` update that arrives
+	 * after the request has finished can be told from traffic for a task this
+	 * client never made. Bounded: past {@link MAX_REMEMBERED_REQUESTS} the oldest is
+	 * forgotten, and its late updates then reach `onMessage` as before. */
+	private rememberRequest(taskId: string, peer: string): void {
+		this.requestedPeers.delete(taskId);
+		this.requestedPeers.set(taskId, peer);
+		if (this.requestedPeers.size > MAX_REMEMBERED_REQUESTS) {
+			const oldest = this.requestedPeers.keys().next().value;
+			if (oldest !== undefined) {
+				this.requestedPeers.delete(oldest);
+			}
 		}
 	}
 
