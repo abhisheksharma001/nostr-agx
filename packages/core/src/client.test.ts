@@ -4661,6 +4661,76 @@ describe("AgxClient drops a late working update for a request it has finished", 
 		expect(onMessage).toHaveBeenCalledTimes(1);
 	});
 
+	it("recognises the asked peer by the transport's own form of its id", async () => {
+		// The transport maps every spelling of an identity to one canonical id, as
+		// the Nostr one does for npub and hex. A host may ask for a peer by any
+		// spelling; the sender of a late update is seen by yet another.
+		const canonical = (id: string) =>
+			id.toLowerCase() === "npub1bob" ? BOB : id.toLowerCase();
+		const base = bus.transport(ALICE);
+		const onMessage = vi.fn();
+		const onTaskStatus = vi.fn();
+		const alice = new AgxClient({
+			transport: {
+				...base,
+				normalizeIdentity: canonical,
+				publishMessage: (to, message) =>
+					base.publishMessage(canonical(to), message),
+			},
+			onMessage,
+		});
+		const pending = alice.request("npub1bob", "long.task", {}, {
+			timeoutMs: 1_000,
+			onTaskStatus,
+		});
+		const { taskId } = outboundRequest();
+		pushFrom(BOB, { t: "res", taskId, status: "completed", output: "done" });
+		await alice.pump();
+		await expect(pending).resolves.toBe("done");
+
+		pushFrom(BOB, { t: "res", taskId, status: "working", seq: 1 });
+		pushFrom("BOB", { t: "res", taskId, status: "working", seq: 2 });
+		await alice.pump();
+
+		expect(onMessage).not.toHaveBeenCalled();
+		expect(onTaskStatus).not.toHaveBeenCalled();
+	});
+
+	it("remembers exactly the last 1,024 requests, no more and no fewer", async () => {
+		// MAX_REMEMBERED_REQUESTS in client.ts, which is not exported.
+		const REMEMBERED = 1_024;
+		const onMessage = vi.fn();
+		const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
+		const ask = () =>
+			alice.request(BOB, "long.task", {}, { timeoutMs: 1 }).catch(() => undefined);
+		const taskIds = () =>
+			(bus.inbox.get(BOB) ?? [])
+				.map((message) => parseTaskEnvelope(message.text))
+				.filter((envelope): envelope is TaskRequestEnvelope => envelope?.t === "req")
+				.map((envelope) => envelope.taskId);
+
+		await Promise.all(Array.from({ length: REMEMBERED }, ask));
+		expect(taskIds()).toHaveLength(REMEMBERED);
+
+		// Exactly full: nothing has been forgotten, so the oldest is still recognised.
+		pushFrom(BOB, { t: "res", taskId: taskIds()[0], status: "working", seq: 1 });
+		await alice.pump();
+		expect(onMessage).not.toHaveBeenCalled();
+
+		// One more request forgets the oldest and only the oldest.
+		await ask();
+		const ids = taskIds();
+		expect(ids).toHaveLength(REMEMBERED + 1);
+		pushFrom(BOB, { t: "res", taskId: ids[0], status: "working", seq: 1 });
+		pushFrom(BOB, { t: "res", taskId: ids[1], status: "working", seq: 1 });
+		await alice.pump();
+
+		expect(onMessage).toHaveBeenCalledTimes(1);
+		expect(parseTaskEnvelope(onMessage.mock.calls[0][0].text)).toMatchObject({
+			taskId: ids[0],
+		});
+	}, 30_000);
+
 	it("only remembers a bounded number of finished requests", async () => {
 		const onMessage = vi.fn();
 		const alice = new AgxClient({ transport: bus.transport(ALICE), onMessage });
