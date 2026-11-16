@@ -292,6 +292,22 @@ describe.each(KEYS)("a secret key ($kind) in a request path", ({ key, prefix }) 
 			expect(leaksKey(res.body, key, prefix)).toBe(false);
 		});
 	});
+
+	describe("as an allowed agent in POST /v1/subscriptions, with a letter written as an escape", () => {
+		it.each([
+			["once", (k: string) => escapedAt(k, 0)],
+			["twice", (k: string) => escapedAt(k, 0, { layers: 2 })],
+			["in capitals", (k: string) => escapedAt(k, 0, { upper: true })],
+		])("answers 400 invalid_subscription and does not repeat it when the letter is escaped %s", async (_how, form) => {
+			const res = await send("/v1/subscriptions", {
+				method: "POST",
+				body: { url: "http://127.0.0.1:9/hook", events: ["message"], allowedPeers: [form(key)] },
+			});
+			expect(res.status).toBe(400);
+			expect(res.body).toContain("invalid_subscription");
+			expect(leaksKey(res.body, key, prefix)).toBe(false);
+		});
+	});
 });
 
 describe("ordinary paths (controls: the fix must not hide them)", () => {
@@ -303,6 +319,7 @@ describe("ordinary paths (controls: the fix must not hide them)", () => {
 		["a path with a bad escape", "/x/%zz", false],
 		["a path with an escape and the letters nsec but no 1", "/x/%6Esec-notes", false],
 		["a path with an ordinary escape written four layers deep, as deep as the gateway looks", "/x/a%25252520b", false],
+		["a path with six ordinary escapes side by side (each round of the decode must undo all of them)", "/x/a%20b%20c%20d%20e%20f%20g", false],
 	])("answers %s with the path as it was written", async (_name, path, auth) => {
 		const res = await send(path, { auth });
 		expect(res.status).toBe(404);
