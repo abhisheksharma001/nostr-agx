@@ -4458,11 +4458,12 @@ describe("AgxClient handles one poll's messages in the order they were sent", ()
 	});
 
 	describe("a sender's claimed send time", () => {
-		it("never moves a message ahead of where its stamp puts it", async () => {
+		it("is never counted as earlier than the message's own stamp", async () => {
 			const onMessage = vi.fn();
 			const alice = backdatingClient(ALICE, onMessage);
-			pushPlainSent(ALICE, BOB, "honest", SENT - 1_000, SENT);
-			// Stamped later, but claims to have been sent long ago.
+			// Really sent 100 s after it was stamped.
+			pushPlainSent(ALICE, BOB, "honest", SENT - 1_000, SENT - 900);
+			// Stamped later, and claims to have been sent long ago.
 			pushPlainSent(ALICE, "mallory", "claims the past", SENT - 500, 0);
 
 			await alice.pump();
@@ -4484,19 +4485,21 @@ describe("AgxClient handles one poll's messages in the order they were sent", ()
 		});
 
 		it.each([
-			["NaN", Number.NaN],
-			["-Infinity", Number.NEGATIVE_INFINITY],
-			["Infinity", Number.POSITIVE_INFINITY],
-		])("cannot scramble the order with %s", async (_label, claim) => {
+			// No time at all, and a time before the stamp: counted as the stamp.
+			["NaN", Number.NaN, ["b", "x", "y"]],
+			["-Infinity", Number.NEGATIVE_INFINITY, ["b", "x", "y"]],
+			// A time past the backdate: counted as the stamp plus the backdate.
+			["Infinity", Number.POSITIVE_INFINITY, ["x", "y", "b"]],
+		])("counts a claim of %s without scrambling the rest", async (_label, claim, expected) => {
 			const onMessage = vi.fn();
 			const alice = backdatingClient(ALICE, onMessage);
-			pushPlainSent(ALICE, BOB, "a", SENT - 3_000, SENT);
+			pushPlainSent(ALICE, BOB, "x", SENT - 3_000, SENT - 1_500);
 			pushPlainSent(ALICE, "mallory", "b", SENT - 2_000, claim);
-			pushPlainSent(ALICE, BOB, "c", SENT - 1_000, SENT + LOOKBACK + 50_000);
+			pushPlainSent(ALICE, BOB, "y", SENT - 1_000, SENT - 900);
 
 			await alice.pump();
 
-			expect(texts(onMessage)).toEqual(["a", "b", "c"]);
+			expect(texts(onMessage)).toEqual(expected);
 		});
 
 		it("is ignored when the transport does not backdate", async () => {
