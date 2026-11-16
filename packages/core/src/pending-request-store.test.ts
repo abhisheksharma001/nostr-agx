@@ -619,6 +619,239 @@ describe("durable pending-request races", () => {
 		await client.stop();
 	});
 
+	it("hands a genuine result to its caller when a restart stop lands while the result's record is being removed", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		const first = durableClient(bus, store);
+		await restore(first);
+		const original = first.request(BOB, "math.add", {}, { timeoutMs: 0 });
+		original.catch(() => undefined);
+		await waitFor(() => bus.requests(BOB).length === 1 && store.saves.length === 2);
+		const taskId = bus.requests(BOB)[0];
+		const removal = gate();
+		store.removeGate = removal.promise;
+		bus.result(ALICE, BOB, taskId);
+		const pumping = first.pump();
+		await settle();
+		const stopping = first.stop({ preservePending: true });
+		await settle();
+		removal.open();
+		await stopping;
+		await pumping;
+
+		await expect(original).resolves.toEqual({ ok: true });
+		expect(store.records.size).toBe(0);
+		expect(bus.requests(BOB)).toEqual([taskId]);
+		expect(cancels(bus)).toBe(0);
+		const second = durableClient(bus, store);
+		expect(await restore(second)).toEqual([]);
+		await second.stop();
+	});
+
+	it("holds a restart stop until the removal of a genuine result's record has finished", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		seed(store, { key: "local-1", taskId: "task-1", deadlineAt: null });
+		const client = durableClient(bus, store);
+		const [recovered] = await restore(client);
+		recovered.result.catch(() => undefined);
+		const removal = gate();
+		store.removeGate = removal.promise;
+		bus.result(ALICE, BOB, "task-1");
+		const pumping = client.pump();
+		await settle();
+		let stopped = false;
+		const stopping = client.stop({ preservePending: true }).then(() => {
+			stopped = true;
+		});
+		await settle();
+		expect(stopped).toBe(false);
+		removal.open();
+		await stopping;
+		await pumping;
+		expect(store.records.size).toBe(0);
+		await expect(recovered.result).resolves.toEqual({ ok: true });
+	});
+
+	it("hands a recovered request its result when two restart stops land during the removal", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		seed(store, { key: "local-1", taskId: "task-1", deadlineAt: null });
+		const client = durableClient(bus, store);
+		const [recovered] = await restore(client);
+		recovered.result.catch(() => undefined);
+		const removal = gate();
+		store.removeGate = removal.promise;
+		bus.result(ALICE, BOB, "task-1");
+		const pumping = client.pump();
+		await settle();
+		const stops = [
+			client.stop({ preservePending: true }),
+			client.stop({ preservePending: true }),
+		];
+		await settle();
+		removal.open();
+		await Promise.all(stops);
+		await pumping;
+
+		await expect(recovered.result).resolves.toEqual({ ok: true });
+		expect(store.records.size).toBe(0);
+		expect(cancels(bus)).toBe(0);
+	});
+
+	it("hands over a second genuine result that begins its removal while a restart stop is waiting", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		seed(store, { key: "local-1", taskId: "task-1", deadlineAt: null });
+		seed(store, { key: "local-2", taskId: "task-2", deadlineAt: null });
+		// A result still on its way in when the stop began reaches the client late.
+		let deliver: ((message: AgxIncomingMessage) => Promise<void>) | undefined;
+		const transport: AgxTransport = {
+			...bus.transport(),
+			onMessage: async (handler) => {
+				deliver = handler;
+				return () => undefined;
+			},
+		};
+		const client = new AgxClient({
+			transport,
+			pendingRequests: store,
+			startCursor: 0,
+		} as unknown as ConstructorParameters<typeof AgxClient>[0]) as RecoveringClient;
+		const [one, two] = await restore(client);
+		one.result.catch(() => undefined);
+		two.result.catch(() => undefined);
+		await client.start({ pollIntervalMs: 0, advertise: false });
+		bus.result(ALICE, BOB, "task-1");
+		bus.result(ALICE, BOB, "task-2");
+		const [oneResult, twoResult] = bus.inbox.get(ALICE) ?? [];
+
+		const firstRemoval = gate();
+		store.removeGate = firstRemoval.promise;
+		const delivering = deliver?.(oneResult);
+		await settle();
+		const stopping = client.stop({ preservePending: true });
+		await settle();
+		const secondRemoval = gate();
+		store.removeGate = secondRemoval.promise;
+		const deliveringLate = deliver?.(twoResult);
+		await settle();
+		firstRemoval.open();
+		await settle();
+		secondRemoval.open();
+		await Promise.all([stopping, delivering, deliveringLate]);
+
+		await expect(one.result).resolves.toEqual({ ok: true });
+		await expect(two.result).resolves.toEqual({ ok: true });
+		expect(store.records.size).toBe(0);
+	});
+
+	it("keeps the record and still reports the stop when the removal of a genuine result's record fails during a restart stop", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		seed(store, { key: "local-1", taskId: "task-1" });
+		const first = durableClient(bus, store);
+		const [recovered] = await restore(first);
+		recovered.result.catch(() => undefined);
+		const removal = gate();
+		store.removeGate = removal.promise;
+		store.failRemove = true;
+		bus.result(ALICE, BOB, "task-1");
+		const pumping = first.pump();
+		await settle();
+		const stopping = first.stop({ preservePending: true });
+		await settle();
+		removal.open();
+		await stopping;
+		expect((await pumping).complete).toBe(false);
+		await expect(recovered.result).rejects.toThrow("AGX client stopped");
+		expect(store.records.has("local-1")).toBe(true);
+
+		// The result was never handed over and its record is still there, so the
+		// next client collects it, once.
+		store.failRemove = false;
+		const second = durableClient(bus, store);
+		const [again] = await restore(second);
+		await second.pump();
+		await expect(again.result).resolves.toEqual({ ok: true });
+		expect(store.records.size).toBe(0);
+		expect(cancels(bus)).toBe(0);
+		await second.stop();
+	});
+
+	it("still rejects the caller, cancels and removes the record when a plain stop lands while the result's record is being removed", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		seed(store, { key: "local-1", taskId: "task-1", deadlineAt: null });
+		const client = durableClient(bus, store);
+		const [recovered] = await restore(client);
+		recovered.result.catch(() => undefined);
+		const removal = gate();
+		store.removeGate = removal.promise;
+		bus.result(ALICE, BOB, "task-1");
+		const pumping = client.pump();
+		await settle();
+		let stopped = false;
+		const stopping = client.stop().then(() => {
+			stopped = true;
+		});
+		await settle();
+		expect(stopped).toBe(true);
+		removal.open();
+		await stopping;
+		await pumping;
+
+		await expect(recovered.result).rejects.toThrow("AGX client stopped");
+		expect(store.records.size).toBe(0);
+		expect(cancels(bus)).toBe(1);
+	});
+
+	it("keeps the record when a restart stop lands before the result arrives", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		const first = durableClient(bus, store);
+		await restore(first);
+		const original = first.request(BOB, "math.add", {}, { timeoutMs: 0 });
+		original.catch(() => undefined);
+		await waitFor(() => bus.requests(BOB).length === 1 && store.saves.length === 2);
+		const taskId = bus.requests(BOB)[0];
+		await first.stop({ preservePending: true });
+		await expect(original).rejects.toThrow("AGX client stopped");
+		bus.result(ALICE, BOB, taskId);
+		await first.pump();
+		expect(store.records.has(taskId)).toBe(true);
+
+		const second = durableClient(bus, store);
+		const [recovered] = await restore(second);
+		await second.pump();
+		await expect(recovered.result).resolves.toEqual({ ok: true });
+		expect(bus.requests(BOB)).toEqual([taskId]);
+		expect(store.records.size).toBe(0);
+		await second.stop();
+	});
+
+	it("leaves nothing to recover when a restart stop lands after the result was handed over", async () => {
+		const bus = new MemoryTransport(ALICE);
+		const store = new MemoryPendingStore();
+		const first = durableClient(bus, store);
+		await restore(first);
+		const original = first.request(BOB, "math.add", {}, { timeoutMs: 0 });
+		original.catch(() => undefined);
+		await waitFor(() => bus.requests(BOB).length === 1 && store.saves.length === 2);
+		const taskId = bus.requests(BOB)[0];
+		bus.result(ALICE, BOB, taskId);
+		await first.pump();
+		await expect(original).resolves.toEqual({ ok: true });
+		await first.stop({ preservePending: true });
+		expect(store.records.size).toBe(0);
+		expect(cancels(bus)).toBe(0);
+
+		const second = durableClient(bus, store);
+		expect(await restore(second)).toEqual([]);
+		expect(bus.requests(BOB)).toEqual([taskId]);
+		await second.stop();
+	});
+
 	it("does not register restored requests on a client stopped during restore", async () => {
 		const bus = new MemoryTransport(ALICE);
 		const store = new MemoryPendingStore();
