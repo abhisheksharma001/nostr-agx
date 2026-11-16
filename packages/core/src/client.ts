@@ -167,7 +167,10 @@ interface PendingTaskInput {
 interface SendRequestOptions {
 	timeoutMs?: number;
 	taskId?: string;
-	/** Local storage key. Null disables persistence for this request. */
+	/** Local storage key. Null disables persistence for this request. Must be
+	 * unique per in-flight request: two concurrent requests with one key overwrite
+	 * each other's record, unless the host's store refuses the second write (as
+	 * the gateway's store does). */
 	storageKey?: string | null;
 	supportsInput?: boolean;
 	onUpdate?: (update: TaskResultEnvelope) => void;
@@ -439,6 +442,12 @@ export class AgxClient {
 	 * Send a task and return progress events plus its final `result` promise.
 	 * Live updates and final results use the pending-request dispatch path, so
 	 * polling-only transports work as well.
+	 *
+	 * `opts.storageKey` is the key of this request's record in the `pendingRequests`
+	 * store (default: the task ID; `null` keeps no record). It must be unique per
+	 * in-flight request: two concurrent requests with one key overwrite each
+	 * other's record, unless the host's store refuses the second write (as the
+	 * gateway's store does).
 	 */
 	async request<Output = unknown>(
 		peer: string,
