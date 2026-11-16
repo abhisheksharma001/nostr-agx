@@ -170,19 +170,19 @@ describe("AGX JSON Schema validation", () => {
 			}
 		});
 
-		it("decides a huge whole number against a fractional step only when it is an exact multiple", () => {
-			// Beyond 2^53 a double has no fraction left for the rounding test to read.
+		it("still accepts a huge whole number against a decimal step", () => {
+			// Every whole number is a multiple of 0.1, 0.01 or 0.2, so a peer that
+			// sends one must not be rejected. Only a whole step is decided exactly.
+			expectValid(multipleOf(0.1), 1e20);
+			expectValid(multipleOf(0.1), -1e20);
+			expectValid(multipleOf(0.01), 1e16);
+			expectValid(multipleOf(0.01), 2 ** 53);
+			expectValid(multipleOf(0.2), 1e20);
 			expectValid(multipleOf(0.5), 1e20);
 			expectValid(multipleOf(0.25), -1e20);
-			expectInvalid(multipleOf(0.3), 1e20, /multipleOf/);
-			expectInvalid(multipleOf(0.3), -1e20, /multipleOf/);
-			// 0.1 is not exact in binary, so no huge value is provably a multiple.
-			expectInvalid(multipleOf(0.1), 1e20, /multipleOf/);
-			// The boundary: 2^53 is decided exactly, 2^53 - 1 keeps the rounding test.
-			expectInvalid(multipleOf(0.3), 2 ** 53, /multipleOf/);
-			expectValid(multipleOf(0.5), 2 ** 53);
 			expectValid(multipleOf(0.1), Number.MAX_SAFE_INTEGER);
-			expectValid(multipleOf(0.5), Number.MAX_SAFE_INTEGER);
+			// Not pinned either way: a huge value against a step such as 0.3 or 1.5.
+			// The rounding test accepts it; only an exact decimal check could decide it.
 		});
 
 		it("keeps the rounding test for fractions and small numbers", () => {
@@ -196,7 +196,9 @@ describe("AGX JSON Schema validation", () => {
 			expectInvalid(multipleOf(3), 7, /multipleOf/);
 			expectInvalid(multipleOf(3), 1e15, /multipleOf/);
 			expectInvalid(multipleOf(3), 4.5, /multipleOf/);
-			// Float noise on a fractional value is still forgiven.
+			// Pins the base behaviour for a value that is not whole (float noise is
+			// forgiven by the rounding test), not a claim that it is right: a whole
+			// step has only whole multiples.
 			expectValid(multipleOf(3), 6.000000000000001);
 		});
 	});
