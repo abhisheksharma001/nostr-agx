@@ -22,6 +22,12 @@ import { localSigner } from "./signer";
 
 const HOT_PEER = getPublicKey(generateSecretKey());
 
+// Each test runs about 600 curve operations (a key pair and an ECDH for every
+// one-time key). That takes a couple of seconds of CPU, so vitest's 5 s default
+// leaves no room when other work shares the machine; 30 s matches the other
+// slow tests in this repo.
+const CPU_BOUND_TEST_MS = 30_000;
+
 beforeEach(() => {
 	derive.mockClear();
 });
@@ -42,7 +48,7 @@ describe("localSigner conversation-key cache", () => {
 			([pubkey]) => pubkey === HOT_PEER,
 		).length;
 		expect(hotDerivations).toBe(1);
-	});
+	}, CPU_BOUND_TEST_MS);
 
 	it("still bounds the cache: an idle key is eventually evicted and re-derived", async () => {
 		const signer = localSigner(generateSecretKey());
@@ -55,5 +61,5 @@ describe("localSigner conversation-key cache", () => {
 			([pubkey]) => pubkey === HOT_PEER,
 		).length;
 		expect(hotDerivations).toBe(2);
-	});
+	}, CPU_BOUND_TEST_MS);
 });

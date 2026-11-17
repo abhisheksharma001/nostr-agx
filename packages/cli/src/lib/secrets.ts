@@ -42,6 +42,16 @@ export function malformedApiKeyError(
 	);
 }
 
+/** A secret key always starts `nsec1`, and a password-protected one (NIP-49)
+ * `ncryptsec1`. Matched anywhere and in any case, so also behind `nostr:` or
+ * `--`, or with a typo in the rest of it. */
+const SECRET_KEY_IN_TEXT = /n(crypt)?sec1/i;
+
+/** True when `text` holds something that looks like a secret key (`nsec1…` or `ncryptsec1…`). */
+export function holdsSecretKey(text: string): boolean {
+	return SECRET_KEY_IN_TEXT.test(text);
+}
+
 /** Shorter values are not worth redacting (and would mangle ordinary text). */
 const MIN_REDACTED_LENGTH = 8;
 
