@@ -1462,7 +1462,24 @@ export class AgxClient {
 					}
 					onInputRequired();
 					try {
-						const input = await inputPromise;
+						let input: unknown;
+						try {
+							input = await inputPromise;
+						} catch (error) {
+							// The wait ended with no answer (it timed out, the requirement
+							// was not sent, or the client is stopping), and the handler is
+							// about to get an error it may carry on from. Not asked again
+							// when the requester canceled.
+							if (
+								!(error instanceof AgxTaskCanceled) &&
+								!active?.canceled &&
+								!(await this.stillAuthorized(msg, env))
+							) {
+								if (active) active.canceled = true;
+								throw new AgxTaskCanceled();
+							}
+							throw error;
+						}
 						await acquireSlot();
 						if (!(await this.stillAuthorized(msg, env))) {
 							// Ends like a cancel: even a handler that catches this error gets
