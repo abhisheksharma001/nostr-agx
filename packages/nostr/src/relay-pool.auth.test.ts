@@ -8,7 +8,7 @@ import {
 	pollInbox,
 	publishToRelays,
 } from "./relay-pool";
-import { localSigner } from "./signer";
+import { type AgxSigner, localSigner } from "./signer";
 import { configureWebSocket } from "./ws";
 
 // These tests use the REAL nostr-tools relay client against a small relay that
@@ -267,6 +267,46 @@ describe("listening on a relay that sends an AUTH challenge", () => {
 		}
 		await settle();
 
+		expect(unhandled.map(String)).toEqual([]);
+	});
+});
+
+describe("a signer that is slower than the relay", () => {
+	// A remote signer can take longer to sign the AUTH reply than the relay takes
+	// to answer the event. By then the connection is closed; nostr-tools sends the
+	// reply anyway, and the failed send is an unhandled rejection.
+	const SLOW_SIGNER_MS = 150;
+	const slowSigner = (): AgxSigner => {
+		const inner = signer();
+		return {
+			...inner,
+			signEvent: async (template) => {
+				await new Promise((resolve) => setTimeout(resolve, SLOW_SIGNER_MS));
+				return inner.signEvent(template);
+			},
+		};
+	};
+
+	it("does not send, or fail on, an AUTH reply it finishes signing after the connection is closed", async () => {
+		const relay = await startRelay({ authReply: "silent", eventReply: "accept" });
+		const res = await publishToRelays([relay.url], signedEvent(), slowSigner());
+		await new Promise((resolve) => setTimeout(resolve, SLOW_SIGNER_MS + SETTLE_MS));
+
+		expect(res).toMatchObject({ ok: true, accepted: 1, rejected: [] });
+		expect(relay.frames.some((f) => f[0] === "AUTH")).toBe(false);
+		expect(unhandled.map(String)).toEqual([]);
+	});
+
+	it("still sends the AUTH reply when the connection is still open", async () => {
+		const relay = await startRelay({ authReply: "accept" });
+		const subs = await listenEvents(slowSigner(), [relay.url], { pubkey: ME }, () => {});
+		await new Promise((resolve) => setTimeout(resolve, SLOW_SIGNER_MS + SETTLE_MS));
+		for (const sub of subs) {
+			sub.close();
+			sub.relay.close();
+		}
+
+		expect(relay.frames.some((f) => f[0] === "AUTH")).toBe(true);
 		expect(unhandled.map(String)).toEqual([]);
 	});
 });
