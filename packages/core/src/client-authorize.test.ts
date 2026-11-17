@@ -456,6 +456,133 @@ describe("AgxClient does not ask again about a task the requester canceled", () 
 	});
 });
 
+describe("AgxClient keeps its task limit when it turns a waiting task down", () => {
+	/** Handler body for tasks that should count towards the limit: how many run at
+	 * once is the check. */
+	function limitProbe() {
+		const hold = gate();
+		let running = 0;
+		let most = 0;
+		return {
+			hold,
+			most: () => most,
+			async run(): Promise<void> {
+				running += 1;
+				most = Math.max(most, running);
+				await hold.opened;
+				running -= 1;
+			},
+		};
+	}
+
+	it("runs two later tasks one at a time after a queued task was turned down", async () => {
+		const peer = wire();
+		const allowed = new Set([X, Z]);
+		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
+		const client = new AgxClient({ transport: peer.transport, authorize });
+		const ran: string[] = [];
+		const running = gate();
+		const probe = limitProbe();
+		client.handle("work", async (task) => {
+			ran.push(task.taskId);
+			if (task.taskId === "first") await running.opened;
+			if (task.taskId.startsWith("later")) await probe.run();
+			return "ok";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		const firstDelivery = peer.deliver(request(X, "first"));
+		await until(() => ran.length === 1, "the first handler to start");
+		const queuedDelivery = peer.deliver(request(X, "queued"));
+		await until(() => authorize.mock.calls.length === 2, "the queued request to be authorized");
+		allowed.delete(X);
+		running.open();
+		await Promise.all([firstDelivery, queuedDelivery]);
+		await client.tasksSettled();
+
+		void peer.deliver(request(Z, "later-1"));
+		await until(() => ran.includes("later-1"), "the first later task to start");
+		void peer.deliver(request(Z, "later-2"));
+		await until(() => authorize.mock.calls.length === 5, "the second later request to be authorized");
+		await pause(30);
+		expect(ran).toEqual(["first", "later-1"]);
+		probe.hold.open();
+		await client.tasksSettled();
+
+		expect(ran).toEqual(["first", "later-1", "later-2"]);
+		expect(probe.most()).toBe(1);
+		await client.stop();
+	});
+
+	it("runs two later tasks one at a time after a task waiting for input was turned down", async () => {
+		const peer = wire();
+		const allowed = new Set([X, Z]);
+		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
+		const client = new AgxClient({ transport: peer.transport, authorize });
+		const ran: string[] = [];
+		const probe = limitProbe();
+		client.handle("work", async (task, ctx) => {
+			ran.push(task.taskId);
+			if (task.taskId === "ask") await ctx.requestInput({ prompt: "Proceed?" });
+			if (task.taskId.startsWith("later")) await probe.run();
+			return "ok";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		const inputRequestId = peer.inputRequestId(X, "ask");
+		allowed.delete(X);
+		await peer.deliver(message(X, { t: "input", taskId: "ask", inputRequestId, input: "yes" }));
+		await client.tasksSettled();
+
+		void peer.deliver(request(Z, "later-1"));
+		await until(() => ran.includes("later-1"), "the first later task to start");
+		void peer.deliver(request(Z, "later-2"));
+		await until(() => authorize.mock.calls.length === 4, "the second later request to be authorized");
+		await pause(30);
+		expect(ran).toEqual(["ask", "later-1"]);
+		probe.hold.open();
+		await client.tasksSettled();
+
+		expect(ran).toEqual(["ask", "later-1", "later-2"]);
+		expect(probe.most()).toBe(1);
+		await client.stop();
+	});
+
+	it("asks again for a task that waited for input only once it has its slot back", async () => {
+		const peer = wire();
+		const allowed = new Set([X, Z]);
+		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
+		const client = new AgxClient({ transport: peer.transport, authorize });
+		const ran: string[] = [];
+		const continued: unknown[] = [];
+		const blocker = gate();
+		client.handle("work", async (task, ctx) => {
+			ran.push(task.taskId);
+			if (task.taskId === "ask") continued.push(await ctx.requestInput({ prompt: "Proceed?" }));
+			if (task.taskId === "blocker") await blocker.opened;
+			return "ok";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		const inputRequestId = peer.inputRequestId(X, "ask");
+		// Another task takes the slot the waiting task gave up.
+		void peer.deliver(request(Z, "blocker"));
+		await until(() => ran.includes("blocker"), "the blocking task to start");
+		// The answer arrives, but the slot is busy; the owner removes the peer meanwhile.
+		await peer.deliver(message(X, { t: "input", taskId: "ask", inputRequestId, input: "yes" }));
+		await pause(30);
+		allowed.delete(X);
+		blocker.open();
+		await client.tasksSettled();
+
+		expect(continued).toEqual([]);
+		expect(peer.resultsTo(X)).toEqual(["ask:input-required"]);
+		await client.stop();
+	});
+});
+
 describe("AgxClient keeps running tasks whose peer is still allowed", () => {
 	it("starts a queued task whose peer is still allowed", async () => {
 		const peer = wire();
