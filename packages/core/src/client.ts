@@ -1408,8 +1408,10 @@ export class AgxClient {
 		try {
 			// A task that waited for its turn is asked about again before it runs: the
 			// owner may have changed their mind since intake. One that started at
-			// once was authorized a moment ago, so it is not asked twice. This comes
-			// before the cancel check so a cancel that arrives meanwhile still counts.
+			// once was authorized a moment ago, so it is not asked twice. One the
+			// requester already canceled is not asked at all. The cancel check is
+			// repeated after the ask, so a cancel that arrives meanwhile still counts.
+			if (active?.canceled) return;
 			if (waited && !(await this.stillAuthorized(msg, env))) return;
 			if (active?.canceled) return;
 			const output = await handler(task, {
