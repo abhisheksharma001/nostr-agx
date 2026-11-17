@@ -424,6 +424,38 @@ describe("AgxClient asks authorize again when a waiting task would start or go o
 	});
 });
 
+describe("AgxClient does not ask again about a task the requester canceled", () => {
+	it("skips the second ask, and onMessage, for a queued task that was canceled before it started", async () => {
+		const peer = wire();
+		const authorize = vi.fn(async () => true);
+		const onMessage = vi.fn();
+		const client = new AgxClient({ transport: peer.transport, authorize, onMessage });
+		const ran: string[] = [];
+		const running = gate();
+		client.handle("work", async (task) => {
+			ran.push(task.taskId);
+			if (task.taskId === "first") await running.opened;
+			return "ok";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		const firstDelivery = peer.deliver(request(X, "first"));
+		await until(() => ran.length === 1, "the first handler to start");
+		const queuedDelivery = peer.deliver(request(X, "queued"));
+		await until(() => authorize.mock.calls.length === 2, "the queued request to be authorized");
+		await peer.deliver(message(X, { t: "cancel", taskId: "queued" }));
+		running.open();
+		await Promise.all([firstDelivery, queuedDelivery]);
+		await client.tasksSettled();
+
+		expect(ran).toEqual(["first"]);
+		expect(authorize).toHaveBeenCalledTimes(2);
+		expect(onMessage).not.toHaveBeenCalled();
+		expect(peer.resultsTo(X)).toEqual(["first:completed"]);
+		await client.stop();
+	});
+});
+
 describe("AgxClient keeps running tasks whose peer is still allowed", () => {
 	it("starts a queued task whose peer is still allowed", async () => {
 		const peer = wire();
