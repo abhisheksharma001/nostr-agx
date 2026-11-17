@@ -41,6 +41,7 @@ function message(from: string, envelope: TaskEnvelope): AgxIncomingMessage {
 		from,
 		eventId: id,
 		createdAt: Math.floor(Date.now() / 1000),
+		transportId: `wrap-${id}`,
 		text: encodeTaskEnvelope(envelope),
 		contextId: envelope.taskId,
 		messageId: `message-${id}`,
@@ -643,6 +644,104 @@ describe("AgxClient asks authorize again when an input wait ends without an answ
 		expect(peer.resultsTo(X)).toEqual(["ask:input-required"]);
 		expect(authorize).toHaveBeenCalledTimes(1);
 		expect(onMessage).not.toHaveBeenCalled();
+		await client.stop();
+	});
+});
+
+describe("AgxClient tells authorize when it is asking again", () => {
+	/** A host that keeps its own record of requests it has handled: it says yes to
+	 * a request once, and turns a repeat of the same request down. */
+	function recordKeeping(allowed: Set<string>) {
+		const handled = new Set<string | undefined>();
+		return vi.fn(
+			async ({ from, eventId, recheck }: { from: string; eventId?: string; recheck?: boolean }) => {
+				if (recheck) return allowed.has(from);
+				if (handled.has(eventId)) return false;
+				handled.add(eventId);
+				return allowed.has(from);
+			},
+		);
+	}
+
+	it("lets a task that waited for input finish when such a host says yes to the second ask", async () => {
+		const peer = wire();
+		const allowed = new Set([X]);
+		const authorize = recordKeeping(allowed);
+		const client = new AgxClient({ transport: peer.transport, authorize });
+		const continued: unknown[] = [];
+		client.handle("work", async (_task, ctx) => {
+			continued.push(await ctx.requestInput({ prompt: "Proceed?" }));
+			return "finished";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		const inputRequestId = peer.inputRequestId(X, "ask");
+		await peer.deliver(message(X, { t: "input", taskId: "ask", inputRequestId, input: "yes" }));
+		await client.tasksSettled();
+
+		expect(continued).toEqual(["yes"]);
+		expect(peer.resultsTo(X)).toEqual(["ask:input-required", "ask:completed"]);
+		expect(authorize.mock.calls[0][0]).not.toHaveProperty("recheck");
+		expect(authorize.mock.calls[1][0]).toMatchObject({ recheck: true });
+		await client.stop();
+	});
+
+	it("still ends the task when such a host says no to the second ask", async () => {
+		const peer = wire();
+		const allowed = new Set([X]);
+		const authorize = recordKeeping(allowed);
+		const client = new AgxClient({ transport: peer.transport, authorize });
+		const continued: unknown[] = [];
+		client.handle("work", async (_task, ctx) => {
+			continued.push(await ctx.requestInput({ prompt: "Proceed?" }));
+			return "finished";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		const inputRequestId = peer.inputRequestId(X, "ask");
+		allowed.delete(X);
+		await peer.deliver(message(X, { t: "input", taskId: "ask", inputRequestId, input: "yes" }));
+		await client.tasksSettled();
+
+		expect(continued).toEqual([]);
+		expect(peer.resultsTo(X)).toEqual(["ask:input-required"]);
+		await client.stop();
+	});
+
+	it("asks again with the context of the request, marked as a second ask, and logs a no", async () => {
+		const peer = wire();
+		const allowed = new Set([X]);
+		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
+		const info = vi.fn();
+		const client = new AgxClient({ transport: peer.transport, authorize, logger: { info } });
+		const running = gate();
+		client.handle("work", async (task) => {
+			if (task.taskId === "first") await running.opened;
+			return "ok";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		const firstDelivery = peer.deliver(request(X, "first"));
+		await until(() => authorize.mock.calls.length === 1, "the first request to be authorized");
+		const queued = request(X, "queued");
+		const queuedDelivery = peer.deliver(queued);
+		await until(() => authorize.mock.calls.length === 2, "the queued request to be authorized");
+		allowed.delete(X);
+		running.open();
+		await Promise.all([firstDelivery, queuedDelivery]);
+		await client.tasksSettled();
+
+		const context = { from: X, capability: "work", eventId: queued.eventId, transportId: queued.transportId };
+		expect(authorize).toHaveBeenCalledTimes(3);
+		expect(authorize.mock.calls[1][0]).toStrictEqual(context);
+		expect(authorize.mock.calls[2][0]).toStrictEqual({ ...context, recheck: true });
+		expect(info).toHaveBeenCalledWith("AGX: task rejected by authorize", {
+			from: X,
+			capability: "work",
+			taskId: "queued",
+		});
 		await client.stop();
 	});
 });
