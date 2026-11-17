@@ -85,6 +85,7 @@ describe("agx identity new, when another run creates the identity after the look
 		const run = await agx(...flags, "identity", "new");
 		expect(run.code).toBe(EXIT.config);
 		expect(plain(run.stderr)).toContain(ALREADY);
+		expect(plain(run.stderr)).toContain("agx identity new --profile second");
 		expect(run.stdout).toBe("");
 		expect(holdsHex(run.stdout + run.stderr)).toBe(false);
 		expect(stored().secretKeyHex === other.secretKeyHex).toBe(true);
@@ -115,6 +116,7 @@ describe("agx identity import, when another run creates the identity after the l
 	function assertRefused(run: { code: number; stdout: string; stderr: string }): void {
 		expect(run.code).toBe(EXIT.config);
 		expect(plain(run.stderr)).toContain(ALREADY);
+		expect(plain(run.stderr)).toContain("agx identity import <nsec> --profile imported");
 		expect(run.stdout).toBe("");
 		for (const out of [run.stdout, run.stderr]) {
 			expect(out.includes(incoming.secretKeyHex)).toBe(false);
@@ -140,6 +142,14 @@ describe("agx identity import, when another run creates the identity after the l
 	it("is refused in --json mode too", async () => {
 		putOtherInTheGap();
 		assertRefused(await agx("--json", "identity", "import", incoming.secretKeyHex));
+	});
+
+	it("gives the same advice as when the identity was there at the look", async () => {
+		putOtherInTheGap();
+		const late = await agx("identity", "import", incoming.secretKeyHex);
+		const early = await agx("identity", "import", incoming.secretKeyHex);
+		expect(late.code).toBe(early.code);
+		expect(plain(late.stderr)).toBe(plain(early.stderr));
 	});
 
 	it("with --force replaces it, as asked", async () => {
