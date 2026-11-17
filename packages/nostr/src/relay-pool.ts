@@ -146,6 +146,15 @@ function answerAuthChallenges(relay: Relay, signer: AgxSigner): void {
 		if (!verifyEvent(signed)) {
 			throw new Error("signer returned an invalid AUTH event");
 		}
+		if (!relay.connected) {
+			// A remote signer can take longer than the relay takes to answer the
+			// event, by which time withRelay has closed the connection. Handed
+			// back, the reply would be sent on a socket that is gone, and
+			// nostr-tools does not handle that failed send either. It has nowhere
+			// to go, so it is never handed back. Throwing instead would make the
+			// library print the error and its stack.
+			return new Promise<never>(() => {});
+		}
 		return signed;
 	};
 	const auth = relay.auth;
