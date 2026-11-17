@@ -583,6 +583,78 @@ describe("AgxClient keeps its task limit when it turns a waiting task down", () 
 	});
 });
 
+describe("AgxClient tells a handler why its input wait ended", () => {
+	/** Registers a handler that asks for input and records the message of the
+	 * error it gets, if any. */
+	function askingHandler(client: AgxClient, messages: string[]): void {
+		client.handle("work", async (_task, ctx) => {
+			try {
+				await ctx.requestInput({ prompt: "Proceed?" });
+			} catch (error) {
+				messages.push(error instanceof Error ? error.message : String(error));
+			}
+			return "finished";
+		});
+	}
+
+	it("says the task was turned down, not canceled by its requester, when the answer arrives for a peer no longer allowed", async () => {
+		const peer = wire();
+		const allowed = new Set([X]);
+		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
+		const client = new AgxClient({ transport: peer.transport, authorize });
+		const messages: string[] = [];
+		askingHandler(client, messages);
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		const inputRequestId = peer.inputRequestId(X, "ask");
+		allowed.delete(X);
+		await peer.deliver(message(X, { t: "input", taskId: "ask", inputRequestId, input: "yes" }));
+		await client.tasksSettled();
+
+		expect(messages).toHaveLength(1);
+		expect(messages[0]).not.toMatch(/requester/);
+		expect(messages[0]).toMatch(/authorize/);
+		await client.stop();
+	});
+
+	it("says the same when the wait times out for a peer no longer allowed", async () => {
+		const peer = wire();
+		const allowed = new Set([X]);
+		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
+		const client = new AgxClient({ transport: peer.transport, authorize, maxInputTimeoutMs: 30 });
+		const messages: string[] = [];
+		askingHandler(client, messages);
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		allowed.delete(X);
+		await client.tasksSettled();
+
+		expect(messages).toHaveLength(1);
+		expect(messages[0]).not.toMatch(/requester/);
+		expect(messages[0]).toMatch(/authorize/);
+		await client.stop();
+	});
+
+	it("still says the requester canceled when it did", async () => {
+		const peer = wire();
+		const authorize = vi.fn(async () => true);
+		const client = new AgxClient({ transport: peer.transport, authorize });
+		const messages: string[] = [];
+		askingHandler(client, messages);
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		await peer.deliver(message(X, { t: "cancel", taskId: "ask" }));
+		await client.tasksSettled();
+
+		expect(messages).toHaveLength(1);
+		expect(messages[0]).toMatch(/requester/);
+		await client.stop();
+	});
+});
+
 describe("AgxClient keeps running tasks whose peer is still allowed", () => {
 	it("starts a queued task whose peer is still allowed", async () => {
 		const peer = wire();
