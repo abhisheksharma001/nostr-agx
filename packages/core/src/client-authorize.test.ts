@@ -212,7 +212,7 @@ describe("AgxClient asks authorize again when a waiting task would start or go o
 		await client.stop();
 	});
 
-	it("gives the slot back when a queued task is turned down, so the next task runs", async () => {
+	it("gives the slot and the task id back when a queued task is turned down", async () => {
 		const peer = wire();
 		const allowed = new Set([X, Z]);
 		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
@@ -239,6 +239,12 @@ describe("AgxClient asks authorize again when a waiting task would start or go o
 		await until(() => ran.includes("later"), "a later task to get the slot");
 		await client.tasksSettled();
 		expect(ran).toEqual(["first", "later"]);
+
+		// The same task id from the same peer is taken afresh once it is allowed again.
+		allowed.add(X);
+		await peer.deliver(request(X, "queued"));
+		await client.tasksSettled();
+		expect(ran).toEqual(["first", "later", "queued"]);
 		await client.stop();
 	});
 
