@@ -58,10 +58,17 @@ export interface AgxAuthorizeContext {
 	from: string;
 	capability: string;
 	/** The request's replay key, as {@link Task.eventId} — for a host that keeps
-	 * its own record of handled tasks and can turn one down before its receipt. */
+	 * its own record of handled tasks and can turn one down before its receipt.
+	 * The same request can be asked about more than once (see
+	 * {@link AgxAuthorizeContext.recheck}): turn down a repeat only when `recheck`
+	 * is not set. */
 	eventId?: string;
 	/** The transport envelope's id, when it differs from `eventId`. */
 	transportId?: string;
+	/** Set (to `true`) only when the client asks again about a request it has
+	 * already said yes to, because its task waited. Absent when the request
+	 * arrives. */
+	recheck?: boolean;
 }
 
 export type AgxAuthorize = (
@@ -77,10 +84,21 @@ export interface AgxClientOptions {
 	 * can reach this agent, so authorization is DEFAULT-DENY: omitting this hook drops
 	 * every task request (and logs a one-time warning). Pass an `authorize` function
 	 * to gate per `{ from, capability }`, or the explicit sentinel `"accept-all"` to
-	 * accept every peer deliberately. A task that waits — in the queue, for a free
-	 * slot, or for its requester's input — is asked about again, with the same
-	 * context, just before its handler starts or goes on; a `false` (or a throw)
-	 * then ends it the same way: no reply, and the request goes to `onMessage`. */
+	 * accept every peer deliberately.
+	 *
+	 * The hook can be asked about the same request more than once. A task that
+	 * waited (in the queue for a free slot, or for its requester's input) is asked
+	 * about again, with the same context plus `recheck: true`, just before its
+	 * handler starts or goes on; and so is a task whose wait for input ended
+	 * without an answer, before its handler gets the error. Give the same answer
+	 * each time unless the owner has changed their mind, and keep no one-shot side
+	 * effects in the hook; a host that records handled requests can tell a second
+	 * ask by `recheck`. A task that starts at once is asked about once, and a
+	 * handler that is already running is not stopped.
+	 *
+	 * A `false` (or a throw) on the second ask ends the task the way it does at
+	 * intake: no reply, and the request goes to `onMessage`. Such a request may
+	 * already have had an `input-required` result sent for it. */
 	authorize?: AgxAuthorize | "accept-all";
 	logger?: AgxLogger;
 	/** Discovery metadata advertised on `start()`. */
@@ -1213,6 +1231,7 @@ export class AgxClient {
 						capability: env.capability,
 						eventId: msg.eventId,
 						transportId: msg.transportId,
+						recheck: true,
 					}),
 				);
 			} catch (error) {
