@@ -183,14 +183,16 @@ const MAX_QUEUED_TASK_RUNS = 100;
 const INPUT_UNSUPPORTED_ERROR =
 	"AGX task requires input; this request does not support interactive input";
 const INPUT_CANCELLED_ERROR = "AGX task was canceled by its requester";
+const INPUT_TURNED_DOWN_ERROR =
+	"AGX task was turned down: authorize no longer allows it";
 const STREAM_HANDLE_UPDATE = Symbol("stream update");
 const STREAM_HANDLE_ERROR = Symbol("stream error");
 
 class AgxTaskQueueFull extends Error {}
 
 class AgxTaskCanceled extends Error {
-	constructor() {
-		super(INPUT_CANCELLED_ERROR);
+	constructor(message = INPUT_CANCELLED_ERROR) {
+		super(message);
 	}
 }
 /** Default {@link AgxClientOptions.pollOverlapSec}. Exported for hosts that keep
@@ -1497,7 +1499,7 @@ export class AgxClient {
 								!(await this.stillAuthorized(msg, env))
 							) {
 								if (active) active.canceled = true;
-								throw new AgxTaskCanceled();
+								throw new AgxTaskCanceled(INPUT_TURNED_DOWN_ERROR);
 							}
 							throw error;
 						}
@@ -1506,7 +1508,7 @@ export class AgxClient {
 							// Ends like a cancel: even a handler that catches this error gets
 							// no result sent for it, and cannot ask for input again.
 							if (active) active.canceled = true;
-							throw new AgxTaskCanceled();
+							throw new AgxTaskCanceled(INPUT_TURNED_DOWN_ERROR);
 						}
 						if (active?.canceled) {
 							throw new AgxTaskCanceled();
