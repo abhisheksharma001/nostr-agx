@@ -1,0 +1,221 @@
+import { mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { hexToBytes } from "@nostr-agx/nostr";
+import { nip19 } from "nostr-tools";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { EXIT } from "../lib/errors.js";
+import { createIdentity, type IdentityFile, loadIdentityFile, saveIdentity } from "../lib/identity.js";
+import { identityPath } from "../lib/paths.js";
+import { setStdinForTests } from "../lib/stdin.js";
+import { agx, sandbox } from "../test/helpers.js";
+
+// `agx identity new` and `agx identity import` look first whether the profile
+// already has an identity, and only later write the file. Two runs for the same
+// profile at the same moment can both pass the look and both write. The file
+// must be created only if nothing is there when it is written: the run that
+// comes second is refused exactly as if it had looked a moment later, prints no
+// new key, and leaves the key that is there alone. `--force` still replaces.
+//
+// The moment between the look and the write is made to happen in-process: both
+// commands build the new identity between the two, so the stand-in below puts
+// another identity on disk just before that, as a second process would. No
+// check compares two keys with toBe: a failing assertion prints both sides, and
+// a secret key must not end up in a test log.
+
+const gap = vi.hoisted(() => ({ run: undefined as undefined | (() => void) }));
+
+vi.mock("../lib/identity.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../lib/identity.js")>();
+	const inTheGap =
+		<A extends unknown[], R>(build: (...args: A) => R) =>
+		(...args: A): R => {
+			const run = gap.run;
+			gap.run = undefined;
+			run?.();
+			return build(...args);
+		};
+	return {
+		...actual,
+		createIdentity: inTheGap(actual.createIdentity),
+		identityFromSecret: inTheGap(actual.identityFromSecret),
+	};
+});
+
+let box: ReturnType<typeof sandbox>;
+let restoreStdin: (() => void) | undefined;
+/** The identity the other process creates in the gap. */
+const other = createIdentity();
+/** The key being imported. */
+const incoming = createIdentity();
+const INCOMING_NSEC = nip19.nsecEncode(hexToBytes(incoming.secretKeyHex));
+const ALREADY = 'Profile "default" already has an identity.';
+
+beforeEach(() => {
+	box = sandbox();
+});
+
+afterEach(() => {
+	gap.run = undefined;
+	restoreStdin?.();
+	restoreStdin = undefined;
+	box.restore();
+});
+
+/** What reaches stderr for an error: colour codes dropped (kleur adds them when FORCE_COLOR is set). */
+function plain(text: string): string {
+	return text.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+const stored = (): IdentityFile => loadIdentityFile("default");
+const files = () => readdirSync(dirname(identityPath("default"))).sort();
+const mode = (path: string) => statSync(path).mode & 0o777;
+const putOtherInTheGap = () => {
+	gap.run = () => saveIdentity("default", other);
+};
+
+/** True when `text` holds any 64-character hex string: a secret key, or a public one. A refusal prints none. */
+const holdsHex = (text: string) => /[0-9a-f]{64}/i.test(text);
+
+describe("agx identity new, when another run creates the identity after the look", () => {
+	it.each([
+		["", [] as string[]],
+		[" in --json mode", ["--json"]],
+	])("is refused%s, prints no new key and leaves the identity that is there", async (_name, flags) => {
+		putOtherInTheGap();
+		const run = await agx(...flags, "identity", "new");
+		expect(run.code).toBe(EXIT.config);
+		expect(plain(run.stderr)).toContain(ALREADY);
+		expect(run.stdout).toBe("");
+		expect(holdsHex(run.stdout + run.stderr)).toBe(false);
+		expect(stored().secretKeyHex === other.secretKeyHex).toBe(true);
+		expect(files()).toEqual(["identity.json"]);
+		expect(mode(identityPath("default"))).toBe(0o600);
+	});
+
+	it("gives the same advice as when the identity was there at the look", async () => {
+		putOtherInTheGap();
+		const late = await agx("identity", "new");
+		const early = await agx("identity", "new");
+		expect(late.code).toBe(early.code);
+		expect(plain(late.stderr)).toBe(plain(early.stderr));
+	});
+
+	it("with --force replaces it, as asked", async () => {
+		putOtherInTheGap();
+		const run = await agx("--json", "identity", "new", "--force");
+		expect(run.code).toBe(EXIT.ok);
+		expect(stored().secretKeyHex === other.secretKeyHex).toBe(false);
+		expect(run.stdout).toContain(stored().publicKey);
+		expect(mode(identityPath("default"))).toBe(0o600);
+		expect(files()).toEqual(["identity.json"]);
+	});
+});
+
+describe("agx identity import, when another run creates the identity after the look", () => {
+	function assertRefused(run: { code: number; stdout: string; stderr: string }): void {
+		expect(run.code).toBe(EXIT.config);
+		expect(plain(run.stderr)).toContain(ALREADY);
+		expect(run.stdout).toBe("");
+		for (const out of [run.stdout, run.stderr]) {
+			expect(out.includes(incoming.secretKeyHex)).toBe(false);
+			expect(out.includes(INCOMING_NSEC)).toBe(false);
+			expect(out.includes(other.secretKeyHex)).toBe(false);
+		}
+		expect(stored().secretKeyHex === other.secretKeyHex).toBe(true);
+		expect(files()).toEqual(["identity.json"]);
+		expect(mode(identityPath("default"))).toBe(0o600);
+	}
+
+	it("is refused when the key is an argument, and prints no key", async () => {
+		putOtherInTheGap();
+		assertRefused(await agx("identity", "import", incoming.secretKeyHex));
+	});
+
+	it("is refused when the key is piped in, and prints no key", async () => {
+		restoreStdin = setStdinForTests(`${INCOMING_NSEC}\n`);
+		putOtherInTheGap();
+		assertRefused(await agx("identity", "import", "--stdin"));
+	});
+
+	it("is refused in --json mode too", async () => {
+		putOtherInTheGap();
+		assertRefused(await agx("--json", "identity", "import", incoming.secretKeyHex));
+	});
+
+	it("with --force replaces it, as asked", async () => {
+		putOtherInTheGap();
+		const run = await agx("identity", "import", "--force", incoming.secretKeyHex);
+		expect(run.code).toBe(EXIT.ok);
+		expect(stored().secretKeyHex === incoming.secretKeyHex).toBe(true);
+		expect(stored().source).toBe("imported");
+		expect(mode(identityPath("default"))).toBe(0o600);
+		expect(files()).toEqual(["identity.json"]);
+	});
+});
+
+describe("the ordinary cases of agx identity new and import keep working", () => {
+	it("identity new on a profile with none creates a private identity and prints its public address", async () => {
+		const run = await agx("--json", "identity", "new");
+		expect(run.code).toBe(EXIT.ok);
+		expect(run.stdout).toContain(stored().npub);
+		expect(stored().source).toBe("generated");
+		expect(mode(identityPath("default"))).toBe(0o600);
+		expect(mode(dirname(identityPath("default")))).toBe(0o700);
+		expect(files()).toEqual(["identity.json"]);
+	});
+
+	it("identity import on a profile with none stores the key it was given, privately", async () => {
+		const run = await agx("identity", "import", incoming.secretKeyHex);
+		expect(run.code).toBe(EXIT.ok);
+		expect(run.stdout).toContain(incoming.npub);
+		expect(stored().secretKeyHex === incoming.secretKeyHex).toBe(true);
+		expect(stored().source).toBe("imported");
+		expect(mode(identityPath("default"))).toBe(0o600);
+		expect(files()).toEqual(["identity.json"]);
+	});
+
+	it("a second identity new, one moment later, is refused and leaves the first", async () => {
+		expect((await agx("identity", "new")).code).toBe(EXIT.ok);
+		const first = stored();
+		const run = await agx("identity", "new");
+		expect(run.code).toBe(EXIT.config);
+		expect(plain(run.stderr)).toContain(ALREADY);
+		expect(run.stdout).toBe("");
+		expect(stored().secretKeyHex === first.secretKeyHex).toBe(true);
+		expect(files()).toEqual(["identity.json"]);
+	});
+
+	it("identity import into a profile that has an identity is refused up front, without reading the key", async () => {
+		saveIdentity("default", other);
+		const run = await agx("identity", "import", incoming.secretKeyHex);
+		expect(run.code).toBe(EXIT.config);
+		expect(plain(run.stderr)).toContain(ALREADY);
+		expect(stored().secretKeyHex === other.secretKeyHex).toBe(true);
+	});
+
+	it("identity new --force replaces an identity that is there, and the new file is private", async () => {
+		saveIdentity("default", other);
+		const run = await agx("identity", "new", "--force");
+		expect(run.code).toBe(EXIT.ok);
+		expect(stored().secretKeyHex === other.secretKeyHex).toBe(false);
+		expect(mode(identityPath("default"))).toBe(0o600);
+		expect(files()).toEqual(["identity.json"]);
+	});
+
+	it("identity import --force replaces an identity that is there", async () => {
+		saveIdentity("default", other);
+		const run = await agx("identity", "import", "--force", incoming.secretKeyHex);
+		expect(run.code).toBe(EXIT.ok);
+		expect(stored().secretKeyHex === incoming.secretKeyHex).toBe(true);
+		expect(files()).toEqual(["identity.json"]);
+	});
+
+	it("a profile folder that cannot be created is still reported as what it is, not as an identity that exists", async () => {
+		mkdirSync(join(box.home, "profiles"), { recursive: true });
+		writeFileSync(join(box.home, "profiles", "blocked"), "a file where the profile folder should be");
+		const run = await agx("identity", "new", "--profile", "blocked");
+		expect(run.code).toBe(EXIT.generic);
+		expect(run.stderr).toMatch(/EEXIST|ENOTDIR/);
+		expect(plain(run.stderr)).not.toContain("already has an identity");
+	});
+});
