@@ -3,6 +3,7 @@ import {
 	chmodSync,
 	closeSync,
 	fsyncSync,
+	linkSync,
 	mkdirSync,
 	openSync,
 	renameSync,
@@ -122,6 +123,21 @@ export interface PrivateWriteOptions {
 	 * with the machine, turns this off.
 	 */
 	sync?: boolean;
+	/**
+	 * Create the file only if nothing is there at the moment it is written
+	 * (default false: replace what is there). Throws `PrivateFileExistsError`
+	 * when something is. For a file whose old content must not be lost to a
+	 * writer that checked for it a moment too early, such as a secret key.
+	 */
+	exclusive?: boolean;
+}
+
+/** An exclusive write found the file already there. Holds the path, never the content. */
+export class PrivateFileExistsError extends Error {
+	constructor(readonly path: string) {
+		super(`${path} already exists.`);
+		this.name = "PrivateFileExistsError";
+	}
 }
 
 /**
@@ -134,7 +150,7 @@ export interface PrivateWriteOptions {
 export function writePrivateText(
 	path: string,
 	text: string,
-	{ sync = true }: PrivateWriteOptions = {},
+	{ sync = true, exclusive = false }: PrivateWriteOptions = {},
 ): void {
 	ensureDir(dirname(path));
 	const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
@@ -150,7 +166,21 @@ export function writePrivateText(
 				closeSync(fd);
 			}
 		}
-		renameSync(tmp, path);
+		if (exclusive) {
+			// link() creates `path` complete, with the temp file's content and mode, or
+			// fails with EEXIST when something is already there. rename() would replace it.
+			try {
+				linkSync(tmp, path);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+					throw new PrivateFileExistsError(path);
+				}
+				throw error;
+			}
+			unlinkSync(tmp);
+		} else {
+			renameSync(tmp, path);
+		}
 	} catch (error) {
 		rmSync(tmp, { force: true });
 		throw error;

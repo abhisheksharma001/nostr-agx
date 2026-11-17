@@ -9,6 +9,7 @@ import { AgxCliError, EXIT, usageError } from "../lib/errors.js";
 import {
 	createIdentity,
 	identityExists,
+	type IdentityFile,
 	identityFromSecret,
 	loadIdentity,
 	loadIdentityFile,
@@ -17,7 +18,7 @@ import {
 	toNsec,
 } from "../lib/identity.js";
 import { heading, info, json, kv, ok, say, warn } from "../lib/output.js";
-import { identityPath } from "../lib/paths.js";
+import { identityPath, PrivateFileExistsError } from "../lib/paths.js";
 import { toDisplayNpub, toHexPubkey } from "../lib/peer.js";
 import { signNonceEvent } from "../lib/proof.js";
 import { readStdin } from "../lib/stdin.js";
@@ -31,20 +32,47 @@ export interface IdentityOptions {
 	stdin?: boolean;
 }
 
+const NEW_REMEDIATION =
+	"A listing's address is immutable, so replacing a key orphans any listing bound to it. To make a second agent, use another profile:\n    agx identity new --profile second\n  To replace this one anyway:\n    agx identity new --force";
+
+const IMPORT_REMEDIATION =
+	"Import into a fresh profile:\n    agx identity import <nsec> --profile imported\n  Or overwrite:  agx identity import <nsec> --force";
+
+function alreadyHasIdentity(profileName: string, remediation: string): AgxCliError {
+	return new AgxCliError(`Profile "${profileName}" already has an identity.`, {
+		exitCode: EXIT.config,
+		remediation,
+	});
+}
+
+/**
+ * Save a new identity. Without --force the file is created only if nothing is
+ * there when it is written, so a second run for the same profile that got past
+ * the early check is refused the same way and the key that is there stays.
+ */
+function saveNewIdentity(
+	profileName: string,
+	identity: IdentityFile,
+	options: IdentityOptions,
+	remediation: string,
+): void {
+	try {
+		saveIdentity(profileName, identity, { replace: options.force });
+	} catch (error) {
+		if (error instanceof PrivateFileExistsError) {
+			throw alreadyHasIdentity(profileName, remediation);
+		}
+		throw error;
+	}
+}
+
 export function identityNewCommand(options: IdentityOptions): void {
 	const profileName = resolveProfileName(options.profile);
 	if (identityExists(profileName) && !options.force) {
-		throw new AgxCliError(
-			`Profile "${profileName}" already has an identity.`,
-			{
-				exitCode: EXIT.config,
-				remediation:
-					"A listing's address is immutable, so replacing a key orphans any listing bound to it. To make a second agent, use another profile:\n    agx identity new --profile second\n  To replace this one anyway:\n    agx identity new --force",
-			},
-		);
+		throw alreadyHasIdentity(profileName, NEW_REMEDIATION);
 	}
 	const identity = createIdentity("generated");
-	saveIdentity(profileName, identity);
+	saveNewIdentity(profileName, identity, options, NEW_REMEDIATION);
 
 	heading("identity created");
 	kv("profile", profileName);
@@ -81,14 +109,7 @@ export async function identityImportCommand(
 ): Promise<void> {
 	const profileName = resolveProfileName(options.profile);
 	if (identityExists(profileName) && !options.force) {
-		throw new AgxCliError(
-			`Profile "${profileName}" already has an identity.`,
-			{
-				exitCode: EXIT.config,
-				remediation:
-					"Import into a fresh profile:\n    agx identity import <nsec> --profile imported\n  Or overwrite:  agx identity import <nsec> --force",
-			},
-		);
+		throw alreadyHasIdentity(profileName, IMPORT_REMEDIATION);
 	}
 	let raw = secret;
 	if (options.stdin || !raw) {
@@ -101,7 +122,7 @@ export async function identityImportCommand(
 		);
 	}
 	const identity = identityFromSecret(parseSecretInput(raw), "imported");
-	saveIdentity(profileName, identity);
+	saveNewIdentity(profileName, identity, options, IMPORT_REMEDIATION);
 	ok(`Imported identity ${identity.npub} into profile "${profileName}".`);
 	json({ npub: identity.npub, pubkey: identity.publicKey });
 }
