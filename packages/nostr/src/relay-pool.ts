@@ -122,6 +122,37 @@ class RelayRefusedError extends Error {
 	}
 }
 
+/**
+ * Answer a relay's NIP-42 AUTH challenge by signing it with `signer`.
+ *
+ * nostr-tools handles a challenge with `this.auth(this.onauth).catch(...)`. The
+ * promise behind it is settled by the relay's reply to our AUTH event, so it is
+ * REJECTED when the relay answers no, after nostr-tools' publish timeout when it
+ * never answers ("auth timed out"), and when we close the connection ("relay
+ * connection closed by us" — which {@link withRelay} does the moment its work is
+ * done, usually before the relay has replied). That `.catch` re-throws all of
+ * these, and nothing can attach a handler to the re-throw, so Node ends the whole
+ * process: one relay's AUTH handling took down every send, poll and listener.
+ *
+ * `auth` is wrapped so the library's call gets a promise that cannot reject.
+ * Nothing here reads the outcome; whether the relay accepted us is learned from
+ * how it answers the REQ or the EVENT, as before.
+ */
+function answerAuthChallenges(relay: Relay, signer: AgxSigner): void {
+	// Verified before it is sent: a remote signer's answer is not trusted
+	// blindly, and verifyEvent is also what brands it a VerifiedEvent.
+	relay.onauth = async (evt) => {
+		const signed = await signer.signEvent(evt);
+		if (!verifyEvent(signed)) {
+			throw new Error("signer returned an invalid AUTH event");
+		}
+		return signed;
+	};
+	const auth = relay.auth;
+	relay.auth = (signAuthEvent) =>
+		auth.call(relay, signAuthEvent).catch(() => "");
+}
+
 async function withRelay<T>(
 	url: string,
 	fn: (relay: Relay) => Promise<T>,
@@ -139,15 +170,7 @@ async function withRelay<T>(
 		"relay connect",
 	);
 	if (signer) {
-		// Verified before it is sent: a remote signer's answer is not trusted
-		// blindly, and verifyEvent is also what brands it a VerifiedEvent.
-		relay.onauth = async (evt) => {
-			const signed = await signer.signEvent(evt);
-			if (!verifyEvent(signed)) {
-				throw new Error("signer returned an invalid AUTH event");
-			}
-			return signed;
-		};
+		answerAuthChallenges(relay, signer);
 	}
 	try {
 		return await fn(relay);
@@ -855,15 +878,7 @@ export async function listenEvents(
 				"relay connect",
 			);
 			if (signer) {
-				// Verified before it is sent: a remote signer's answer is not trusted
-				// blindly, and verifyEvent is also what brands it a VerifiedEvent.
-				relay.onauth = async (evt) => {
-					const signed = await signer.signEvent(evt);
-					if (!verifyEvent(signed)) {
-						throw new Error("signer returned an invalid AUTH event");
-					}
-					return signed;
-				};
+				answerAuthChallenges(relay, signer);
 			}
 
 			let sub: Subscription | null = null;
