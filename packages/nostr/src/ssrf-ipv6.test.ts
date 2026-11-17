@@ -103,6 +103,7 @@ describe("assertPublicUrl IPv4-mapped IPv6 addresses (DNS-resolved)", () => {
 			"::ffff:127.0.0.1",
 			"::ffff:192.168.1.1",
 			"::ffff:169.254.169.254",
+			"::ffff:192.0.0.1",
 			"::FFFF:10.0.0.1",
 		])("dotted form %s", async (address) => {
 			expect(await isPublic(address)).toBe(false);
@@ -111,6 +112,7 @@ describe("assertPublicUrl IPv4-mapped IPv6 addresses (DNS-resolved)", () => {
 		it.each([
 			["::ffff:7f00:1%eth0", "hex form"],
 			["::ffff:7f00:1%1", "hex form, numeric zone"],
+			["::ffff:7f00:1%a:b", "hex form, zone with a colon"],
 			["::ffff:127.0.0.1%eth0", "dotted form"],
 		])("%s carries a zone id (%s)", async (address) => {
 			expect(await isPublic(address)).toBe(false);
@@ -126,6 +128,7 @@ describe("assertPublicUrl IPv4-mapped IPv6 addresses (DNS-resolved)", () => {
 			["::FFFF:0808:0808", "8.8.8.8, capital letters and zero-padded"],
 			["::ffff:a8c0:101", "168.192.1.1, not 192.168.1.1"],
 			["::ffff:808:a00", "8.8.10.0, not 10.0.8.8"],
+			["::ffff:c000:101", "192.0.1.1, where the third byte decides"],
 			["::ffff:808:808%eth0", "8.8.8.8, with a zone id"],
 		])("%s (= %s)", async (address) => {
 			expect(await isPublic(address)).toBe(true);
