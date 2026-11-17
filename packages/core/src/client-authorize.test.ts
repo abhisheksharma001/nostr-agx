@@ -523,3 +523,126 @@ describe("AgxClient keeps running tasks whose peer is still allowed", () => {
 		expect(authorize).toHaveBeenCalledTimes(2);
 	});
 });
+
+describe("AgxClient asks authorize again when an input wait ends without an answer", () => {
+	it("ends the task silently when the wait times out, the handler catches the error, and the peer is no longer allowed", async () => {
+		const peer = wire();
+		const allowed = new Set([X, Z]);
+		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
+		const onMessage = vi.fn();
+		const client = new AgxClient({
+			transport: peer.transport,
+			authorize,
+			onMessage,
+			maxInputTimeoutMs: 30,
+		});
+		const ran: string[] = [];
+		client.handle("work", async (task, ctx) => {
+			ran.push(task.taskId);
+			if (task.taskId === "ask") {
+				try {
+					await ctx.requestInput({ prompt: "Proceed?" });
+				} catch {
+					// carries on with a default
+				}
+			}
+			return "finished anyway";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		const original = request(X, "ask", true);
+		await peer.deliver(original);
+		allowed.delete(X);
+		await client.tasksSettled();
+
+		expect(peer.resultsTo(X)).toEqual(["ask:input-required"]);
+		expect(onMessage).toHaveBeenCalledTimes(1);
+		expect(onMessage).toHaveBeenCalledWith(original);
+		expect(authorize).toHaveBeenCalledTimes(2);
+
+		// The slot is free for someone else, and the task id can be used again.
+		void peer.deliver(request(Z, "later"));
+		await until(() => ran.includes("later"), "a later task to get the slot");
+		await client.tasksSettled();
+		allowed.add(X);
+		await peer.deliver(request(X, "ask", true));
+		expect(peer.resultsTo(X).filter((r) => r === "ask:input-required")).toHaveLength(2);
+		await client.stop();
+	});
+
+	it("sends no failed result when the wait times out, the handler does not catch the error, and the peer is no longer allowed", async () => {
+		const peer = wire();
+		const allowed = new Set([X]);
+		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
+		const client = new AgxClient({ transport: peer.transport, authorize, maxInputTimeoutMs: 30 });
+		client.handle("work", async (_task, ctx) => {
+			await ctx.requestInput({ prompt: "Proceed?" });
+			return "finished";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		allowed.delete(X);
+		await client.tasksSettled();
+
+		expect(peer.resultsTo(X)).toEqual(["ask:input-required"]);
+		await client.stop();
+	});
+
+	it("sends no result when the client stops during the wait and the peer is no longer allowed", async () => {
+		const peer = wire();
+		const allowed = new Set([X]);
+		const authorize = vi.fn(async ({ from }: { from: string }) => allowed.has(from));
+		const client = new AgxClient({ transport: peer.transport, authorize });
+		client.handle("work", async (_task, ctx) => {
+			await ctx.requestInput({ prompt: "Proceed?" });
+			return "finished";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		allowed.delete(X);
+		await client.stop();
+		await client.tasksSettled();
+
+		expect(peer.resultsTo(X)).toEqual(["ask:input-required"]);
+	});
+
+	it("still reports a timed-out wait to a peer that is still allowed", async () => {
+		const peer = wire();
+		const authorize = vi.fn(async () => true);
+		const client = new AgxClient({ transport: peer.transport, authorize, maxInputTimeoutMs: 30 });
+		client.handle("work", async (_task, ctx) => {
+			await ctx.requestInput({ prompt: "Proceed?" });
+			return "finished";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		await client.tasksSettled();
+
+		expect(peer.resultsTo(X)).toEqual(["ask:input-required", "ask:failed"]);
+		await client.stop();
+	});
+
+	it("does not ask authorize again, or tell onMessage, when the requester cancels the wait", async () => {
+		const peer = wire();
+		const authorize = vi.fn(async () => true);
+		const onMessage = vi.fn();
+		const client = new AgxClient({ transport: peer.transport, authorize, onMessage });
+		client.handle("work", async (_task, ctx) => {
+			await ctx.requestInput({ prompt: "Proceed?" });
+			return "finished";
+		});
+		await client.start({ pollIntervalMs: 0, advertise: false });
+
+		await peer.deliver(request(X, "ask", true));
+		await peer.deliver(message(X, { t: "cancel", taskId: "ask" }));
+		await client.tasksSettled();
+
+		expect(peer.resultsTo(X)).toEqual(["ask:input-required"]);
+		expect(authorize).toHaveBeenCalledTimes(1);
+		expect(onMessage).not.toHaveBeenCalled();
+		await client.stop();
+	});
+});
