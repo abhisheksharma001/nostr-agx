@@ -95,6 +95,14 @@ function seedHeldText(): void {
 	store.flush();
 }
 
+/** An unread message in "earlier" and one in "fresh", for a queued mark-read. */
+function seedTwoUnreadThreads(): void {
+	const store = new MessageStore(dir, () => CLOCK);
+	store.addInbound(message());
+	store.addInbound(message({ id: "u1", contextId: "fresh", at: "2026-10-07T10:30:00.000Z" }));
+	store.flush();
+}
+
 /**
  * Open the store as a reader does. Right after the reader's `after`-th file operation
  * (counting from 0; -1 never) `between` runs. Returns the reader and how many file
@@ -242,5 +250,73 @@ describe("a reader that opens while the writer is in the middle of saving", () =
 		// Writing a temporary file, syncing it and renaming it takes several steps; a reader ran after each.
 		expect(readers).toBeGreaterThan(5);
 		expect([...sizesSeen].sort()).toEqual([3, 4]);
+	});
+});
+
+describe("a reader that overlaps the writer's save of a queued mark-read, ignore or block", () => {
+	/** A held decision is queued and the writer has taken it over; its save is still to come. */
+	function pendingDecision(after: number, action: "ignore" | "block"): { reader: MessageStore; operations: number } {
+		MessageStore.spool(dir, { kind: "decision", action, npub: MALLORY });
+		const writer = new MessageStore(dir, () => CLOCK, { claimSpool: true });
+		return openReader(after, () => writer.flush());
+	}
+
+	it("still shows a thread as read after a queued mark-read, wherever the save lands", () => {
+		forEveryLanding(
+			(after) => {
+				freshDir();
+				seedTwoUnreadThreads();
+				MessageStore.spool(dir, { kind: "read", contextId: "fresh" });
+				const writer = new MessageStore(dir, () => CLOCK, { claimSpool: true });
+				return openReader(after, () => writer.flush());
+			},
+			(reader, landing) => {
+				expect(reader.getThread("fresh").map((m) => m.readAt !== null), landing).toEqual([true]);
+				expect(reader.getThread("earlier").map((m) => m.readAt), landing).toEqual([null]);
+			},
+		);
+	});
+
+	it("still shows a held sender as ignored, and the text not released, wherever the save lands", () => {
+		forEveryLanding(
+			(after) => {
+				freshDir();
+				seedHeldText();
+				return pendingDecision(after, "ignore");
+			},
+			(reader, landing) => {
+				expect(reader.listHeld(), landing).toEqual([]);
+				expect(reader.listSenderDecisions(), landing).toEqual([{ npub: MALLORY, status: "ignored" }]);
+				expect(reader.getThread("fresh"), landing).toEqual([]);
+			},
+		);
+	});
+
+	it("still shows a held sender as blocked, and the text not released, wherever the save lands", () => {
+		forEveryLanding(
+			(after) => {
+				freshDir();
+				seedHeldText();
+				return pendingDecision(after, "block");
+			},
+			(reader, landing) => {
+				expect(reader.listHeld(), landing).toEqual([]);
+				expect(reader.heldStatus(MALLORY), landing).toBe("blocked");
+				expect(reader.getThread("fresh"), landing).toEqual([]);
+			},
+		);
+	});
+
+	it("still shows a block of a sender with nothing held, wherever the save lands", () => {
+		forEveryLanding(
+			(after) => {
+				freshDir();
+				seedHistory();
+				return pendingDecision(after, "block");
+			},
+			(reader, landing) => {
+				expect(reader.listSenderDecisions(), landing).toEqual([{ npub: MALLORY, status: "blocked" }]);
+			},
+		);
 	});
 });
