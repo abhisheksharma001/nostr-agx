@@ -183,7 +183,7 @@ describe("held senders", () => {
 
 	it("replaces bidirectional formatting controls in a held sender's text", () => {
 		const store = open();
-		expect(store.hold(MALLORY, msg({ id: "hb", text: "x‮y⁩z" }))).toBe("kept");
+		expect(store.hold(MALLORY, msg({ id: "hb", text: "x\u202ey\u2069z" }))).toBe("kept");
 		const [held] = store.listHeld();
 		expect(held?.messages.map((m) => m.text)).toEqual(["x�y�z"]);
 	});
