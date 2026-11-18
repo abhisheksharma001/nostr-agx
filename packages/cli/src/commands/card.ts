@@ -9,11 +9,16 @@ import {
 import kleur from "kleur";
 import { effectiveProfile, resolveProfileName } from "../lib/config.js";
 import { AgxCliError, EXIT } from "../lib/errors.js";
+import { neutralizeControls } from "../lib/inbound-lines.js";
 import {
-	neutralizeBodyControls,
-	neutralizeControls,
-} from "../lib/inbound-lines.js";
-import { heading, info, json, kv, say, warn } from "../lib/output.js";
+	escapeLineBreakers,
+	heading,
+	info,
+	json,
+	kv,
+	say,
+	warn,
+} from "../lib/output.js";
 import { toDisplayNpub, toHexPubkey } from "../lib/peer.js";
 
 /**
@@ -265,7 +270,9 @@ export async function cardCommand(
 	if (options.raw) {
 		say("");
 		heading("Raw event");
-		say(neutralizeBodyControls(JSON.stringify(cardEvent, null, 2)));
+		// The event is signed text: a character replaced here makes it a different
+		// event. Escaping keeps every character, and the block parses back to it.
+		say(escapeLineBreakers(JSON.stringify(cardEvent, null, 2)));
 	}
 
 	say("");
