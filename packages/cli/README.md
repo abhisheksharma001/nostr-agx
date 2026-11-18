@@ -254,12 +254,18 @@ runs: it picks up the allowlist and the decision on its next poll. A kept messag
 8,000 characters, all held text at 8 MiB (the oldest goes first) and 30 days.
 
 If the saved allowlist cannot be read while `serve` runs (an entry that is not an npub or
-hex pubkey, after a hand edit), `serve` authorises nobody until it reads cleanly again: task
-requests are denied (`--allow-all` still accepts them), every sender is held with their text
-kept, and `serve` says so once. What was held stays held after the list is repaired, until you
-run `agx held allow <npub>`.
-`agx wait` holds every sender the same way. `agx gateway` holds every sender instead of adding
-them to its history, while its tasks and webhooks still follow each subscription's own `allowedPeers`.
+hex pubkey, after a hand edit), `serve` authorises nobody until it reads cleanly again, and
+pauses: it asks the relays for nothing, so nothing is stored, held, marked as seen, answered or
+run, and it keeps its place in your inbox. It says so once, and says again when the list reads
+cleanly. Then it picks up where it stopped, and what arrived meanwhile is read once, as the
+repaired list decides: there is no `agx held allow` step. Mail waits on the relays for as long
+as they keep it. `serve --once` exits without polling. `--allow-all` opens tasks to everyone
+whatever the list says, so it keeps polling: tasks still run, and every sender is held with their
+text kept, until you run `agx held allow <npub>`.
+`agx wait` pauses the same way, still ends at `--timeout` with the usual result, and still
+refuses to start when the list cannot be read at the start. `agx gateway` holds every sender
+instead of adding them to its history, while its tasks and webhooks still follow each
+subscription's own `allowedPeers`.
 `agx doctor --local` names the bad entry by position.
 
 `--allowed-only` changes **printing only**. A held message is still counted and

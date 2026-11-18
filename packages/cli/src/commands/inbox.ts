@@ -3,7 +3,8 @@ import { effectiveProfile, resolveProfileName } from "../lib/config.js";
 import { AgxCliError, EXIT } from "../lib/errors.js";
 import { loadIdentity } from "../lib/identity.js";
 import {
-	ALLOWLIST_UNREADABLE,
+	ALLOWLIST_PAUSED,
+	ALLOWLIST_RESUMED,
 	createCollector,
 	heldList,
 	INBOX_SCHEMA,
@@ -94,22 +95,26 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 
 	try {
 		const allowed = new Set(profile.allow.map((entry) => toHexPubkey(entry, "allowlist entry")));
-		let warnedAllowlist = false;
+		// True while the list cannot be read: nobody is authorised, so the loop polls nothing.
+		let paused = false;
 		function refreshAllowed(): void {
 			let current: string[];
 			try {
 				current = effectiveProfile(profileName).allow.map((entry) => toHexPubkey(entry, "allowlist entry"));
 			} catch {
-				// Nobody is authorised until it reads cleanly: what arrives meanwhile is held. On
+				// Nobody is authorised until it reads cleanly: mail waits on the relays meanwhile. On
 				// stderr, so `--json` output stays whole and the warning is not lost with it.
 				allowed.clear();
-				if (!warnedAllowlist) {
-					warnedAllowlist = true;
-					notice(ALLOWLIST_UNREADABLE);
+				if (!paused) {
+					paused = true;
+					notice(ALLOWLIST_PAUSED);
 				}
 				return;
 			}
-			warnedAllowlist = false;
+			if (paused) {
+				paused = false;
+				notice(ALLOWLIST_RESUMED);
+			}
 			allowed.clear();
 			for (const entry of current) {
 				allowed.add(entry);
@@ -169,37 +174,45 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 					}
 					store.absorbSpool();
 					refreshAllowed();
-					try {
-						const outcome = await pumpWithin(client, remaining, control.signal);
-						if (outcome.interrupted) {
-							interrupted = true;
-							break;
-						}
-						if (outcome.result === null) {
+					if (paused) {
+						// Nothing is fetched, so nothing is stored, held or marked seen, and the cursor stays:
+						// the first poll after the list reads again starts where the last one ended. What
+						// other commands queued is still applied. The relays are still probed below, so the
+						// result and exit code are those of a quiet wait.
+						store.flush();
+					} else {
+						try {
+							const outcome = await pumpWithin(client, remaining, control.signal);
+							if (outcome.interrupted) {
+								interrupted = true;
+								break;
+							}
+							if (outcome.result === null) {
+								truncated = true;
+								timedOut = true;
+								break;
+							}
+							if (outcome.result.complete) {
+								everRelayAnswered = true;
+								cursor = outcome.result.cursor;
+								truncated = false;
+							} else {
+								truncated = true;
+							}
+						} catch (error) {
+							if (control.signal?.aborted) {
+								interrupted = true;
+								break;
+							}
 							truncated = true;
-							timedOut = true;
-							break;
+							warn(`poll failed: ${error instanceof Error ? error.message : String(error)}`);
 						}
-						if (outcome.result.complete) {
-							everRelayAnswered = true;
-							cursor = outcome.result.cursor;
-							truncated = false;
-						} else {
-							truncated = true;
-						}
-					} catch (error) {
-						if (control.signal?.aborted) {
-							interrupted = true;
-							break;
-						}
-						truncated = true;
-						warn(`poll failed: ${error instanceof Error ? error.message : String(error)}`);
-					}
 
-					seen.holdFor(cursor);
-					store.flush();
-					seen.flush();
-					updateState(profileName, { cursor, lastPumpAt: new Date().toISOString() });
+						seen.holdFor(cursor);
+						store.flush();
+						seen.flush();
+						updateState(profileName, { cursor, lastPumpAt: new Date().toISOString() });
+					}
 					relays = await probe();
 					everRelayAnswered ||= relays.some((relay) => relay.status === "ok");
 					const unread = store.listMessages({ direction: "in", unreadOnly: true }).length;
@@ -238,7 +251,8 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 			}
 			store.flush();
 			seen.flush();
-			updateState(profileName, { cursor, lastPumpAt: new Date().toISOString() });
+			// A wait that ends paused has not polled since the list broke.
+			updateState(profileName, { cursor, ...(paused ? {} : { lastPumpAt: new Date().toISOString() }) });
 		}
 		if (!control.activity) {
 			relays = await probe();
