@@ -121,13 +121,31 @@ function resolveListingId(
 }
 
 /**
+ * A value from the index's answer, as text for one line of output. The answer is
+ * JSON, so a field the types call a string, a number or a flag can arrive as
+ * something else, and printing it must not stop the command. Text has its
+ * control characters replaced; null and a missing value print as nothing (a
+ * dash on a line with a label); a number or a flag prints as it is; an object
+ * or a list prints as a fixed note, never its content.
+ */
+export function indexText(value: unknown): string {
+	if (typeof value === "string") {
+		return neutralizeControls(value);
+	}
+	if (typeof value === "number" || typeof value === "boolean") {
+		return String(value);
+	}
+	return value === null || value === undefined ? "" : "[not text]";
+}
+
+/**
  * `handle` is null in every public projection until the NIP-05 claim is verified
  * — an unverified handle is withheld on purpose, so rendering a blank there is
  * correct rather than a missing field.
  */
 function renderHandle(listing: PublicListing): string {
 	if (listing.handle) {
-		const handle = neutralizeControls(listing.handle);
+		const handle = indexText(listing.handle);
 		return listing.verified ? handle : `${handle} (unverified)`;
 	}
 	return "—";
@@ -216,11 +234,11 @@ export async function listingCreateCommand(
 		});
 	}
 
-	ok(`Created listing ${neutralizeControls(listing.id)}`);
-	kv("slug", neutralizeControls(listing.slug));
-	kv("source", neutralizeControls(listing.source));
-	kv("status", neutralizeControls(listing.status));
-	kv("visibility", neutralizeControls(listing.visibility));
+	ok(`Created listing ${indexText(listing.id)}`);
+	kv("slug", indexText(listing.slug));
+	kv("source", indexText(listing.source));
+	kv("status", indexText(listing.status));
+	kv("visibility", indexText(listing.visibility));
 	kv(
 		"capabilities",
 		neutralizeControls(listing.capabilities.join(", ")) || "—",
@@ -231,7 +249,7 @@ export async function listingCreateCommand(
 	}
 	say("");
 	info(
-		`Listings are born as drafts. Publish it with:  agx listing publish ${neutralizeControls(listing.id)}`,
+		`Listings are born as drafts. Publish it with:  agx listing publish ${indexText(listing.id)}`,
 	);
 	if (listing.capabilities.length === 0) {
 		warn(
@@ -296,13 +314,13 @@ export async function listingListCommand(
 	} catch (error) {
 		throw toCliError(error, "searchListings", creds.baseUrl);
 	}
-	heading(`listings owned by "${creds.orgSlug}"`);
+	heading(`listings owned by "${indexText(creds.orgSlug)}"`);
 	table(
 		result.listings.map((l) => [
-			neutralizeControls(l.id),
-			neutralizeControls(l.slug),
-			neutralizeControls(l.status),
-			neutralizeControls(l.visibility),
+			indexText(l.id),
+			indexText(l.slug),
+			indexText(l.status),
+			indexText(l.visibility),
 			neutralizeControls(l.capabilities.join(",")),
 		]),
 		["ID", "SLUG", "STATUS", "VISIBILITY", "CAPABILITIES"],
@@ -326,19 +344,19 @@ export async function listingGetCommand(
 		throw toCliError(error, "getListing", creds.baseUrl);
 	}
 	const l = result.listing;
-	heading(neutralizeControls(l.displayName));
-	kv("id", neutralizeControls(l.id));
-	kv("slug", neutralizeControls(l.slug));
-	kv("npub", neutralizeControls(l.npub));
+	heading(indexText(l.displayName));
+	kv("id", indexText(l.id));
+	kv("slug", indexText(l.slug));
+	kv("npub", indexText(l.npub));
 	kv("handle", renderHandle(l));
 	kv("verified", l.verified ? "yes" : "no");
-	kv("status", neutralizeControls(l.status));
-	kv("visibility", neutralizeControls(l.visibility));
+	kv("status", indexText(l.status));
+	kv("visibility", indexText(l.visibility));
 	kv("capabilities", neutralizeControls(l.capabilities.join(", ")) || "—");
-	kv("summary", neutralizeControls(l.summary ?? ""));
+	kv("summary", indexText(l.summary));
 	if (l.status === "listed" && l.visibility !== "public") {
 		warn(
-			`Listed, but visibility is "${neutralizeControls(l.visibility)}" — directory search returns public entries only, so nobody else can find it.`,
+			`Listed, but visibility is "${indexText(l.visibility)}" — directory search returns public entries only, so nobody else can find it.`,
 		);
 	}
 	json(result);
@@ -393,8 +411,8 @@ export async function listingPublishCommand(
 		throw cli;
 	}
 
-	ok(`Listing is now "${neutralizeControls(result.listing.status)}".`);
-	kv("visibility", neutralizeControls(result.listing.visibility));
+	ok(`Listing is now "${indexText(result.listing.status)}".`);
+	kv("visibility", indexText(result.listing.visibility));
 	kv(
 		"capabilities",
 		neutralizeControls(result.listing.capabilities.join(", ")) || "—",
@@ -424,7 +442,7 @@ export async function listingPublishCommand(
 	}
 	if (result.listing.visibility !== "public") {
 		warn(
-			`Visibility is "${neutralizeControls(result.listing.visibility)}" — a directory search returns only public + listed entries, so other organizations still cannot find it.`,
+			`Visibility is "${indexText(result.listing.visibility)}" — a directory search returns only public + listed entries, so other organizations still cannot find it.`,
 		);
 		say(kleur.dim("  agx listing set-visibility public"));
 	}
@@ -504,7 +522,7 @@ export async function listingSetVisibilityCommand(
 	} catch (error) {
 		throw toCliError(error, "updateListing", creds.baseUrl);
 	}
-	ok(`Visibility is now "${neutralizeControls(result.visibility)}".`);
+	ok(`Visibility is now "${indexText(result.visibility)}".`);
 	reportRetraction(result.cardRetractionRequested);
 	json(result);
 }
@@ -524,7 +542,7 @@ export async function listingDelistCommand(
 	} catch (error) {
 		throw toCliError(error, "delistListing", creds.baseUrl);
 	}
-	ok(`Listing is now "${neutralizeControls(result.listing.status)}".`);
+	ok(`Listing is now "${indexText(result.listing.status)}".`);
 	reportRetraction(result.cardRetractionRequested);
 	json(result);
 }
@@ -587,12 +605,12 @@ export async function listingSetPolicyCommand(
 		throw toCliError(error, "updateListing", creds.baseUrl);
 	}
 	ok("Auto-allow policy updated.");
-	kv("autoAllowContact", String(result.autoAllowContact));
+	kv("autoAllowContact", indexText(result.autoAllowContact));
 	kv(
 		"capabilities",
 		neutralizeControls((result.autoAllowCapabilities ?? []).join(", ")) || "—",
 	);
-	kv("dailyCap", result.autoAllowDailyCap ?? null);
+	kv("dailyCap", indexText(result.autoAllowDailyCap));
 	if (
 		result.autoAllowContact &&
 		(result.autoAllowCapabilities ?? []).length === 0
@@ -619,8 +637,8 @@ function reportRetraction(requested: boolean | undefined): void {
 
 export function renderListingRows(listings: PublicListing[]): string[][] {
 	return listings.map((l) => [
-		neutralizeControls(l.displayName),
-		neutralizeControls(shortNpub(l.npub)),
+		indexText(l.displayName),
+		indexText(shortNpub(l.npub)),
 		renderHandle(l),
 		l.verified ? "yes" : "—",
 		neutralizeControls(l.capabilities.join(",")),
