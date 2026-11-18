@@ -15,7 +15,7 @@ import { agx, sandbox } from "../test/helpers.js";
 /** A reason with a colour code and a window-title sequence ended by a bell. */
 const ESCAPE_REASON = "blocked: \u001b[31mred\u001b]0;title\u0007";
 /** The same reason as it should be printed: each control character replaced by U+FFFD. */
-const PRINTED_REASON = "blocked: �[31mred�]0;title�";
+const PRINTED_REASON = "blocked: \uFFFD[31mred\uFFFD]0;title\uFFFD";
 const PLAIN_REASON = "blocked: rate-limited, try again later";
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
@@ -25,6 +25,7 @@ let box: ReturnType<typeof sandbox>;
 let receiver: IdentityFile;
 let ally: IdentityFile;
 let relay: HandRelay | null = null;
+const otherRelays: HandRelay[] = [];
 
 beforeAll(() => {
 	kleur.enabled = false;
@@ -40,6 +41,7 @@ beforeEach(() => {
 afterEach(async () => {
 	await relay?.close();
 	relay = null;
+	await Promise.all(otherRelays.splice(0).map((other) => other.close()));
 	box.restore();
 });
 
@@ -132,6 +134,37 @@ describe("agx serve, when the relay refuses its reply", () => {
 		expect(replyFailedLines(run.stdout)).toHaveLength(1);
 		expect(run.stdout).not.toMatch(CONTROL_CHARACTER);
 		expect(run.stdout).not.toMatch(/^RECV forged/m);
+	});
+
+	it.each([
+		["a C1 control (CSI)", "blocked: \u009b[2Jcleared", "blocked: \uFFFD[2Jcleared"],
+		["a line separator", "blocked: first\u2028RECV forged", "blocked: first\uFFFDRECV forged"],
+	])("replaces %s in a refusal reason", async (_name, reason, printed) => {
+		(await startRelayHoldingOneMessage()).refuseWith(reason);
+
+		const run = await agx("serve", "--once", "--no-tasks");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(replyFailedLines(run.stdout)).toEqual([`REPLY failed: ${relay?.url}: ${printed}`]);
+		expect(run.stdout).not.toMatch(CONTROL_CHARACTER);
+		expect(run.stdout).not.toMatch(/^RECV forged/m);
+	});
+
+	it("prints the reason of every relay that refuses, each with control characters replaced", async () => {
+		const first = await startRelayHoldingOneMessage();
+		first.refuseWith("blocked: first \u001b[31mred");
+		const second = await startHandRelay();
+		otherRelays.push(second);
+		second.refuseWith("blocked: second \u001b]0;title\u0007");
+		updateProfile("default", { relays: [first.url, second.url], allow: [ally.publicKey] });
+
+		const run = await agx("serve", "--once", "--no-tasks");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(replyFailedLines(run.stdout)).toEqual([
+			`REPLY failed: ${first.url}: blocked: first \uFFFD[31mred; ${second.url}: blocked: second \uFFFD]0;title\uFFFD`,
+		]);
+		expect(run.stdout).not.toMatch(CONTROL_CHARACTER);
 	});
 
 	it("prints a plain-text refusal reason unchanged", async () => {

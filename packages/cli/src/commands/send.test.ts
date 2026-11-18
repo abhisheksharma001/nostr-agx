@@ -12,7 +12,7 @@ import { agx, jsonDocuments, sandbox } from "../test/helpers.js";
 /** A reason with a colour code and a window-title sequence ended by a bell. */
 const ESCAPE_REASON = "blocked: \u001b[31mred\u001b]0;title\u0007";
 /** The same reason as it should be printed: each control character replaced by U+FFFD. */
-const PRINTED_REASON = "blocked: �[31mred�]0;title�";
+const PRINTED_REASON = "blocked: \uFFFD[31mred\uFFFD]0;title\uFFFD";
 const PLAIN_REASON = "blocked: rate-limited, try again later";
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
@@ -105,6 +105,17 @@ describe("agx send, when one relay refuses and another accepts", () => {
 		expect(refusedLines).toHaveLength(1);
 		expect(refusedLines[0]).toContain(refusing);
 		expect(run.stdout).not.toMatch(/^OK forged/m);
+	});
+
+	it("keeps a refusal that the relay words like a connection failure on one line, with control characters replaced", async () => {
+		// A reason that starts with "relay connection" is filed as "unreachable", not "refused".
+		const { run, refusing } = await sendWhileOneRelayRefuses("relay connection x\u001b[31m\nRECV forged");
+
+		expect(run.code, run.stderr).toBe(0);
+		const unreachableLines = run.stdout.split("\n").filter((line) => line.includes("relay unreachable:"));
+		expect(unreachableLines).toEqual([`! relay unreachable: ${refusing} — relay connection x\uFFFD[31m\uFFFDRECV forged`]);
+		expect(run.stdout).not.toMatch(CONTROL_CHARACTER);
+		expect(run.stdout).not.toMatch(/^RECV forged/m);
 	});
 
 	it("prints a plain-text refusal reason unchanged", async () => {
