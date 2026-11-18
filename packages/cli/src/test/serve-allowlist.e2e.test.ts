@@ -146,7 +146,8 @@ describe.skipIf(!existsSync(AGX))("serve while its saved allowlist breaks and is
 
 		setAllowlist([JUNK]);
 		await until(() => times(serve.output(), WARNING) === 2, 15_000);
-		await polls();
+		// Paused: no poll finishes while the list cannot be read, so there is none to wait for here.
+		// That the warning is not repeated across paused loops is checked in serve-pause.e2e.test.ts.
 
 		serve.child.kill("SIGINT");
 		const run = await serve.done;

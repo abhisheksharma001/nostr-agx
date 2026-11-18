@@ -260,46 +260,46 @@ describe("agx serve while the saved allowlist changes under it", () => {
 });
 
 describe("agx serve when the saved allowlist can no longer be read", () => {
-	it("holds a message from a peer the list no longer names", async () => {
+	it("takes no message from a peer the list no longer names, and holds nothing", async () => {
 		await sendMessage(ally, "from a peer just denied");
 
 		const out = await serveOnceEditing([JUNK], "--allowed-only");
 
-		expect(out).toMatch(/HOLD\s+from .*not on the allowlist/);
+		expect(out).not.toMatch(/HOLD/);
 		expect(out).not.toContain("from a peer just denied");
 		expect(inboxTexts()).toEqual([]);
-		expect(heldFrom(ally)?.messages.map((m) => m.text)).toEqual(["from a peer just denied"]);
+		expect(heldFrom(ally)).toBeUndefined();
 	});
 
-	it("holds a message from a peer the list still names: a list that cannot be read authorises nobody", async () => {
+	it("takes no message from a peer the list still names either: a list that cannot be read authorises nobody", async () => {
 		await sendMessage(ally, "from a listed peer");
 
 		const out = await serveOnceEditing([ally.publicKey, JUNK], "--allowed-only");
 
-		expect(out).toMatch(/HOLD\s+from .*not on the allowlist/);
+		expect(out).not.toMatch(/HOLD/);
 		expect(inboxTexts()).toEqual([]);
-		expect(heldFrom(ally)?.messages.map((m) => m.text)).toEqual(["from a listed peer"]);
+		expect(heldFrom(ally)).toBeUndefined();
 	});
 
-	it("denies a task request, and does not run it", async () => {
+	it("does not answer a task request, and does not run it", async () => {
 		const stop = await sendPingRequest(ally);
 
 		const out = await serveOnceEditing([JUNK]);
 		await stop();
 
-		expect(out).toMatch(/DENY\s+task agx\.ping/);
+		expect(out).not.toMatch(/DENY\s+task agx\.ping/);
 		expect(out).not.toMatch(/ALLOW\s+task/);
 		expect(out).not.toMatch(/TASK\s+agx\.ping/);
 	});
 
-	it("also holds a peer given with --allow for this session", async () => {
+	it("takes no message from a peer given with --allow for this session either", async () => {
 		await sendMessage(stranger, "from a session peer");
 
 		const out = await serveOnceEditing([JUNK], "--allowed-only", "--allow", stranger.npub);
 
-		expect(out).toMatch(/HOLD\s+from .*not on the allowlist/);
+		expect(out).not.toMatch(/HOLD/);
 		expect(inboxTexts()).toEqual([]);
-		expect(heldFrom(stranger)?.messages.map((m) => m.text)).toEqual(["from a session peer"]);
+		expect(heldFrom(stranger)).toBeUndefined();
 	});
 
 	it("says that nobody is authorised, without printing the entry", async () => {
@@ -310,10 +310,10 @@ describe("agx serve when the saved allowlist can no longer be read", () => {
 		expect(out).not.toContain(JUNK);
 	});
 
-	it("says how to release what was held: it stays held until the peer is allowed", async () => {
+	it("does not point at `agx held allow`: nothing was held, so there is nothing to release", async () => {
 		const out = await serveOnceEditing([JUNK]);
 
-		expect(out).toContain("agx held allow <npub>");
+		expect(out).not.toContain("held allow");
 		expect(out).not.toContain(JUNK);
 	});
 
@@ -326,16 +326,16 @@ describe("agx serve when the saved allowlist can no longer be read", () => {
 		}
 	});
 
-	it("keeps what it held, so the peer can be allowed afterwards and the message read", async () => {
+	it("leaves the message on the relay, so it is read once the list is repaired, with no release step", async () => {
 		await sendMessage(ally, "sent while the list was broken");
 		await serveOnceEditing([JUNK], "--allowed-only");
 		expect(inboxTexts()).toEqual([]);
 
 		updateProfile("default", { allow: [ally.publicKey] });
 		expect(getProfile("default").allow).toEqual([ally.publicKey]);
-		const release = await agx("held", "allow", ally.npub);
+		const again = await agx("serve", "--once", "--no-reply", "--no-tasks");
 
-		expect(release.code, release.stderr).toBe(0);
+		expect(again.code, again.stderr).toBe(0);
 		expect(inboxTexts()).toEqual(["sent while the list was broken"]);
 		expect(heldFrom(ally)).toBeUndefined();
 	});
@@ -347,7 +347,7 @@ describe("agx serve when config.json itself is damaged", () => {
 	it.each([
 		["empty", "''"],
 		["cut off", "text.slice(0, 60)"],
-	])("holds a listed peer while the file is %s, and reads the repaired file afterwards", async (_how, left) => {
+	])("takes nothing while the file is %s, and reads what waited once the file is repaired", async (_how, left) => {
 		const good = readFileSync(configPath(), "utf8");
 		await sendMessage(ally, "sent while the file was damaged");
 		const stop = await sendPingRequest(ally);
@@ -356,17 +356,19 @@ describe("agx serve when config.json itself is damaged", () => {
 		await stop();
 
 		expect(run.code, run.stderr).toBe(0);
-		expect(run.stdout).toMatch(/DENY\s+task agx\.ping/);
-		expect(run.stdout).toMatch(/HOLD\s+from .*not on the allowlist/);
+		expect(run.stdout).not.toMatch(/DENY\s+task agx\.ping/);
+		expect(run.stdout).not.toMatch(/HOLD/);
 		expect(run.stdout).toContain("nobody is authorised");
 		expect(inboxTexts()).toEqual([]);
-		expect(heldFrom(ally)?.messages.map((m) => m.text)).toContain("sent while the file was damaged");
+		expect(heldFrom(ally)).toBeUndefined();
 
 		writeFileSync(configPath(), good);
 		await sendMessage(ally, "sent after the repair");
-		const again = await agx("serve", "--once", "--no-reply", "--no-tasks");
+		const again = await agx("serve", "--once", "--no-reply");
 
 		expect(again.code, again.stderr).toBe(0);
-		expect(inboxTexts()).toEqual(["sent after the repair"]);
+		// The task request that waited is accepted now, and both messages are read, none twice.
+		expect(again.stdout).toMatch(/ALLOW\s+task agx\.ping/);
+		expect(inboxTexts().sort()).toEqual(["sent after the repair", "sent while the file was damaged"]);
 	});
 });
