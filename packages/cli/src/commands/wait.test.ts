@@ -15,6 +15,8 @@ import { agx, capture, jsonDocuments, sandbox } from "../test/helpers.js";
 import { waitCommand } from "./wait.js";
 
 const HELD_SECRET = "held sender text must never reach summary output";
+/** Not a key: what a hand edit gone wrong leaves in the list. Distinctive, so a test can see whether it is printed. */
+const JUNK = "pasted-entry-MARKER-7f3a";
 
 let box: ReturnType<typeof sandbox>;
 let relay: RunningRelay;
@@ -193,6 +195,53 @@ describe("agx wait", () => {
 		expect(summary(run)).toMatchObject({ new: 0, held: 1, timedOut: false });
 		expect(run.stdout).not.toContain(HELD_SECRET);
 		expect(run.stdout).not.toContain(pair.sender);
+	});
+
+	it("holds a sender when the allowlist can no longer be read, and says so without printing the entry", async () => {
+		const pair = await allowedPair();
+		const waiting = startWait({ profile: "receiver", timeout: "10", summary: true });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		// A hand edit gone wrong: the sender is off the list and one entry is not a key.
+		updateProfile("receiver", { allow: [JUNK] });
+		// Past the next read of the list (the loop looks again every second), so the message
+		// cannot be fetched by a poll that began before the edit.
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+		await publish("sender", pair.receiver, HELD_SECRET);
+
+		const run = await waiting.done;
+		expect(run.code).toBe(EXIT.ok);
+		expect(summary(run)).toMatchObject({ new: 0, held: 1, timedOut: false });
+		expect(run.stdout).not.toContain(HELD_SECRET);
+		expect(run.stderr).toContain("The allowlist cannot be read");
+		expect(run.stderr).toContain("nobody is authorised");
+		expect(`${run.stdout}${run.stderr}`).not.toContain(JUNK);
+		expect(new MessageStore(profileDir("receiver")).listMessages()).toEqual([]);
+	}, 20_000);
+
+	it("also holds a sender the unreadable list still names", async () => {
+		const pair = await allowedPair();
+		const waiting = startWait({ profile: "receiver", timeout: "10", summary: true });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		updateProfile("receiver", { allow: [toHexPubkey(pair.sender, "test sender"), JUNK] });
+		await new Promise((resolve) => setTimeout(resolve, 1500));
+		await publish("sender", pair.receiver, HELD_SECRET);
+
+		const run = await waiting.done;
+		expect(summary(run)).toMatchObject({ new: 0, held: 1, timedOut: false });
+		expect(new MessageStore(profileDir("receiver")).listMessages()).toEqual([]);
+	}, 20_000);
+
+	it("stops before pulling anything when the allowlist cannot be read at the start", async () => {
+		const pair = await allowedPair();
+		updateProfile("receiver", { allow: [JUNK] });
+		await publish("sender", pair.receiver, HELD_SECRET);
+
+		const run = await agx("--profile", "receiver", "inbox", "--wait", "1");
+
+		expect(run.code).toBe(EXIT.usage);
+		expect(run.stderr).toContain("is not a valid allowlist entry");
+		expect(new MessageStore(profileDir("receiver")).listMessages()).toEqual([]);
+		expect(new MessageStore(profileDir("receiver")).listHeld()).toEqual([]);
 	});
 
 	it("returns an empty successful result after a quiet healthy timeout", async () => {
