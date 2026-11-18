@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AgxClient, DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
 import { hexToBytes, localSigner, NostrTransport } from "@nostr-agx/nostr";
@@ -8,7 +8,7 @@ import WebSocket from "ws";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { getProfile, updateProfile } from "../lib/config.js";
 import { createIdentity, type IdentityFile, saveIdentity } from "../lib/identity.js";
-import { profileDir } from "../lib/paths.js";
+import { configPath, profileDir } from "../lib/paths.js";
 import { MessageStore } from "../lib/store/message-store.js";
 import { type RunningRelay, startRelay } from "../relay/server.js";
 import { agx, sandbox } from "../test/helpers.js";
@@ -189,6 +189,25 @@ function allowlistEditedAtLoad(allow: string[]): string {
 	return path;
 }
 
+/**
+ * A `--handler` module that damages config.json itself when serve loads it: `left` is a JS
+ * expression for what is left of the saved text (`text`). Same moment as `allowlistEditedAtLoad`.
+ */
+function configDamagedAtLoad(left: string): string {
+	const path = join(box.home, "damage-config.mjs");
+	writeFileSync(
+		path,
+		[
+			'import { readFileSync, writeFileSync } from "node:fs";',
+			"const file = `${process.env.AGX_HOME}/config.json`;",
+			'const text = readFileSync(file, "utf8");',
+			`writeFileSync(file, ${left});`,
+			"export default {};",
+		].join("\n"),
+	);
+	return path;
+}
+
 /** One poll of a serve whose saved allowlist becomes `allow` right before it. */
 async function serveOnceEditing(allow: string[], ...flags: string[]) {
 	const run = await agx("serve", "--once", "--no-reply", "--handler", allowlistEditedAtLoad(allow), ...flags);
@@ -291,6 +310,13 @@ describe("agx serve when the saved allowlist can no longer be read", () => {
 		expect(out).not.toContain(JUNK);
 	});
 
+	it("says how to release what was held: it stays held until the peer is allowed", async () => {
+		const out = await serveOnceEditing([JUNK]);
+
+		expect(out).toContain("agx held allow <npub>");
+		expect(out).not.toContain(JUNK);
+	});
+
 	it("never prints a secret key left in the list", async () => {
 		const out = await serveOnceEditing([NSEC]);
 
@@ -312,5 +338,35 @@ describe("agx serve when the saved allowlist can no longer be read", () => {
 		expect(release.code, release.stderr).toBe(0);
 		expect(inboxTexts()).toEqual(["sent while the list was broken"]);
 		expect(heldFrom(ally)).toBeUndefined();
+	});
+});
+
+describe("agx serve when config.json itself is damaged", () => {
+	// A hand edit that leaves the file empty, or cut off in the middle, is not a bad entry: the
+	// whole file stops reading. The peer the list named a moment ago must not stay authorised.
+	it.each([
+		["empty", "''"],
+		["cut off", "text.slice(0, 60)"],
+	])("holds a listed peer while the file is %s, and reads the repaired file afterwards", async (_how, left) => {
+		const good = readFileSync(configPath(), "utf8");
+		await sendMessage(ally, "sent while the file was damaged");
+		const stop = await sendPingRequest(ally);
+
+		const run = await agx("serve", "--once", "--no-reply", "--allowed-only", "--handler", configDamagedAtLoad(left));
+		await stop();
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(run.stdout).toMatch(/DENY\s+task agx\.ping/);
+		expect(run.stdout).toMatch(/HOLD\s+from .*not on the allowlist/);
+		expect(run.stdout).toContain("nobody is authorised");
+		expect(inboxTexts()).toEqual([]);
+		expect(heldFrom(ally)?.messages.map((m) => m.text)).toContain("sent while the file was damaged");
+
+		writeFileSync(configPath(), good);
+		await sendMessage(ally, "sent after the repair");
+		const again = await agx("serve", "--once", "--no-reply", "--no-tasks");
+
+		expect(again.code, again.stderr).toBe(0);
+		expect(inboxTexts()).toEqual(["sent after the repair"]);
 	});
 });

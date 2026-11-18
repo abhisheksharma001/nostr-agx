@@ -6,6 +6,7 @@ import { type RunningRelay, startRelay } from "../../relay/server.js";
 import { agx, sandbox } from "../../test/helpers.js";
 import { resolveProfileName, updateProfile } from "../config.js";
 import { profileDir } from "../paths.js";
+import { loadState } from "../state.js";
 import { MessageStore } from "../store/message-store.js";
 import { type RunningGateway, startGateway } from "./gateway.js";
 
@@ -17,9 +18,7 @@ import { type RunningGateway, startGateway } from "./gateway.js";
 
 /** Not a key: what a hand edit gone wrong leaves in the list. Distinctive, so a test can see whether it is printed. */
 const JUNK = "pasted-entry-MARKER-7f3a";
-/** The gateway reads the list again every poll; this is a few polls. */
 const POLL_MS = 100;
-const SETTLE_MS = 500;
 
 let box: ReturnType<typeof sandbox>;
 let relay: RunningRelay;
@@ -63,6 +62,28 @@ const heldTexts = (sender: Sender) => stored().listHeld().find((h) => h.npub ===
 const warnings = () => logged.filter((line) => line.includes("The allowlist cannot be read"));
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Waits until the gateway has finished `n` more polls. A poll reads the allowlist first and writes
+ * `lastPumpAt` last. So after two polls, one that began after an edit made just before the call has
+ * read the edit: no fixed pause, so no guess about how slow the machine is.
+ */
+async function polls(n = 2): Promise<void> {
+	const deadline = Date.now() + 30_000;
+	let last = loadState(profile).lastPumpAt;
+	let done = 0;
+	while (done < n) {
+		if (Date.now() > deadline) {
+			throw new Error("the gateway did not finish a poll in time");
+		}
+		await pause(25);
+		const now = loadState(profile).lastPumpAt;
+		if (now !== last) {
+			last = now;
+			done += 1;
+		}
+	}
+}
+
 async function waitFor<T>(check: () => T | undefined | false, timeoutMs = 20_000): Promise<T> {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
@@ -99,7 +120,7 @@ describe("agx gateway and the saved allowlist", () => {
 	it("keeps the history of a peer the list names, when the list reads cleanly", async () => {
 		const peer = newSender();
 		updateProfile(profile, { allow: [peer.publicKey] });
-		await pause(SETTLE_MS);
+		await polls();
 
 		await sendTo(peer, "from a listed peer");
 
@@ -112,7 +133,7 @@ describe("agx gateway and the saved allowlist", () => {
 		const listed = newSender();
 		const stranger = newSender();
 		updateProfile(profile, { allow: [listed.publicKey] });
-		await pause(SETTLE_MS);
+		await polls();
 
 		await sendTo(stranger, "from a stranger");
 
@@ -124,9 +145,9 @@ describe("agx gateway and the saved allowlist", () => {
 	it("holds a peer denied while it runs, when the list that replaces it reads cleanly", async () => {
 		const peer = newSender();
 		updateProfile(profile, { allow: [peer.publicKey] });
-		await pause(SETTLE_MS);
+		await polls();
 		expect((await agx("identity", "deny", peer.npub)).code).toBe(0);
-		await pause(SETTLE_MS);
+		await polls();
 
 		await sendTo(peer, "from a peer just denied");
 
@@ -139,15 +160,15 @@ describe("agx gateway and the saved allowlist", () => {
 	it("holds a peer denied while the list cannot be read, and says so once without printing the entry", async () => {
 		const peer = newSender();
 		updateProfile(profile, { allow: [peer.publicKey] });
-		await pause(SETTLE_MS);
+		await polls();
 		// The hand edit, then the denial: the file now holds only the entry that is not a key.
 		updateProfile(profile, { allow: [peer.publicKey, JUNK] });
 		expect((await agx("identity", "deny", peer.npub)).code).toBe(0);
-		await pause(SETTLE_MS);
+		await polls();
 
 		await sendTo(peer, "from a peer denied under a broken list");
 		await waitFor(sorted(peer, "from a peer denied under a broken list"));
-		await pause(SETTLE_MS);
+		await polls();
 
 		expect(inboxTexts()).not.toContain("from a peer denied under a broken list");
 		expect(heldTexts(peer)).toEqual(["from a peer denied under a broken list"]);
@@ -159,9 +180,9 @@ describe("agx gateway and the saved allowlist", () => {
 	it("holds a peer the unreadable list still names", async () => {
 		const peer = newSender();
 		updateProfile(profile, { allow: [peer.publicKey] });
-		await pause(SETTLE_MS);
+		await polls();
 		updateProfile(profile, { allow: [peer.publicKey, JUNK] });
-		await pause(SETTLE_MS);
+		await polls();
 
 		await sendTo(peer, "from a listed peer under a broken list");
 
@@ -170,13 +191,25 @@ describe("agx gateway and the saved allowlist", () => {
 		expect(heldTexts(peer)).toEqual(["from a listed peer under a broken list"]);
 	}, 30_000);
 
+	it("says how to release what was held: it stays held until the peer is allowed", async () => {
+		updateProfile(profile, { allow: [] });
+		await polls();
+		const before = warnings().length;
+		updateProfile(profile, { allow: [JUNK] });
+		await polls();
+
+		expect(warnings()).toHaveLength(before + 1);
+		expect(warnings().at(-1)).toContain("agx held allow <npub>");
+		expect(logged.join("\n")).not.toContain(JUNK);
+	}, 30_000);
+
 	it("allows the list's peers again as soon as it reads cleanly", async () => {
 		const peer = newSender();
 		updateProfile(profile, { allow: [peer.publicKey, JUNK] });
-		await pause(SETTLE_MS);
+		await polls();
 
 		updateProfile(profile, { allow: [peer.publicKey] });
-		await pause(SETTLE_MS);
+		await polls();
 		await sendTo(peer, "after the list was fixed");
 
 		await waitFor(sorted(peer, "after the list was fixed"));
@@ -186,14 +219,14 @@ describe("agx gateway and the saved allowlist", () => {
 
 	it("says so again when the list breaks again after it was fixed", async () => {
 		updateProfile(profile, { allow: [JUNK] });
-		await pause(SETTLE_MS);
+		await polls();
 		const first = warnings().length;
 		expect(first).toBeGreaterThan(0);
 
 		updateProfile(profile, { allow: [] });
-		await pause(SETTLE_MS);
+		await polls();
 		updateProfile(profile, { allow: [JUNK] });
-		await pause(SETTLE_MS);
+		await polls();
 
 		expect(warnings()).toHaveLength(first + 1);
 	}, 30_000);
@@ -201,9 +234,9 @@ describe("agx gateway and the saved allowlist", () => {
 	it("keeps what it held, so the peer can be allowed afterwards and the message read", async () => {
 		const peer = newSender();
 		updateProfile(profile, { allow: [peer.publicKey] });
-		await pause(SETTLE_MS);
+		await polls();
 		updateProfile(profile, { allow: [JUNK] });
-		await pause(SETTLE_MS);
+		await polls();
 		await sendTo(peer, "sent while the list was broken");
 		await waitFor(sorted(peer, "sent while the list was broken"));
 		expect(inboxTexts()).not.toContain("sent while the list was broken");
