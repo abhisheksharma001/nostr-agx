@@ -12,9 +12,9 @@ import { type RelayOptions, type RunningRelay, startRelay } from "../relay/serve
 
 /**
  * The BUILT CLI (`dist/agx.js`) as a real `agx serve` process, left running while its saved
- * allowlist breaks, stays broken for several polls, is repaired, and breaks again. A running serve
- * cannot be stopped from inside a unit test (its Ctrl-C handler exits the process), so this one
- * needs the real thing.
+ * allowlist breaks, stays broken for several polls, is repaired, and breaks again; then a serve that is
+ * started while the list cannot be read. A running serve cannot be stopped from inside a unit test
+ * (its Ctrl-C handler exits the process), so this one needs the real thing.
  *
  *   pnpm build && E2E=1 pnpm --filter @nostr-agx/cli exec vitest run src/test/serve-pause.e2e.test.ts
  *
@@ -268,5 +268,32 @@ describe.skipIf(!existsSync(AGX))("serve while its saved allowlist cannot be rea
 		expect(last.code, last.stderr).toBe(0);
 		expect(times(last.stdout, WARNING)).toBe(0);
 		expect([...inbound()].sort()).toEqual(["m1 while healthy", "m2 while paused", "m3 while paused", "m4 sent as it stops"]);
+
+		// A serve started while the list cannot be read is paused from its first loop, and picks up
+		// from the place the last run saved once the list reads again.
+		setAllowlist([JUNK]);
+		const restarted = start("--profile", PROFILE, "serve", "--no-reply", "--no-tasks", "--poll-interval", "200");
+		await until(() => times(restarted.output(), WARNING) === 1, 15_000);
+		await oneMoreLoop();
+		const third = { polls: inboxPolls().length, ...state(), seen: seenCount() };
+		await sendTo(shown.npub, ally, "m5 sent to a serve that started paused");
+		await oneMoreLoop();
+		await oneMoreLoop();
+
+		expect.soft(inboxPolls()).toHaveLength(third.polls);
+		expect.soft(state().cursor).toBe(third.cursor);
+		expect.soft(seenCount()).toBe(third.seen);
+		expect.soft(inbound()).not.toContain("m5 sent to a serve that started paused");
+
+		setAllowlist([ally.publicKey]);
+		await until(() => inbound().includes("m5 sent to a serve that started paused"), 15_000);
+		restarted.child.kill("SIGINT");
+		const end = await restarted.done;
+
+		expect.soft(end.code, end.stderr).toBe(0);
+		expect.soft(times(end.stdout, WARNING)).toBe(1);
+		expect.soft(times(end.stdout, RESUMED)).toBe(1);
+		expect.soft(inboxPolls()[third.polls]?.[0]?.since).toBe(third.cursor - LOOKBACK_SEC);
+		expect.soft(`${end.stdout}${end.stderr}`).not.toContain(JUNK);
 	}, 240_000);
 });

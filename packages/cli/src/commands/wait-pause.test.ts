@@ -201,6 +201,8 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 		expect.soft(summary(run)).toMatchObject({ schema: INBOX_SUMMARY_SCHEMA, new: 0, held: 0, timedOut: true });
 		expect.soft(inboxPolls()).toHaveLength(0);
 		expect.soft(times(run.stderr, WARNING)).toBe(1);
+		// It ended the normal way, but it has not polled: the write at the end records no poll.
+		expect.soft(loadState("receiver").lastPumpAt).toBeNull();
 	});
 
 	it("stores nothing, holds nothing and marks nothing as seen", async () => {
@@ -382,6 +384,7 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 		expect.soft(times(run.stderr, WARNING)).toBe(1);
 		expect.soft(run.stderr).toContain(PAUSED);
 		expect.soft(loadState("receiver").cursor).toBe(STALE_CURSOR);
+		expect.soft(loadState("receiver").lastPumpAt).toBeNull();
 	});
 
 	it("resumes from the cursor it had when it was paused from the first turn", async () => {

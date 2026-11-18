@@ -425,4 +425,16 @@ describe("agx serve --allow-all while the saved allowlist cannot be read", () =>
 		expect(inboxTexts()).toEqual([]);
 		expect(heldFrom(stranger)?.messages.map((m) => m.text)).toContain("from a stranger");
 	});
+
+	it("still holds a message from a peer the unreadable list names: it authorises nobody either", async () => {
+		// The saved list names the ally when serve starts; the edit that breaks it comes after.
+		await sendMessage(ally, "from a listed peer");
+
+		const out = await serveOnceEditing([ally.publicKey, JUNK], "--allow-all", "--allowed-only");
+
+		expect(inboxPolls().length).toBeGreaterThan(0);
+		expect(out).not.toContain(PAUSED);
+		expect(inboxTexts()).toEqual([]);
+		expect(heldFrom(ally)?.messages.map((m) => m.text)).toEqual(["from a listed peer"]);
+	});
 });
