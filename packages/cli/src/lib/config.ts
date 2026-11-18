@@ -111,10 +111,10 @@ const KNOWN_PROFILE_KEYS: ReadonlySet<string> = new Set(
 	Object.keys(profileSchema.shape),
 );
 
-/** `value` if it is a plain JSON object, else null (an array, null, a number...). */
+/** `value` if it is a JSON object, else null (an array, a string, a number...). */
 function asObject(value: unknown): Record<string, unknown> | null {
-	return typeof value === "object" && value !== null && !Array.isArray(value)
-		? (value as Record<string, unknown>)
+	return typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown> | null)
 		: null;
 }
 
