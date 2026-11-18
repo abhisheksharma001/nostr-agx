@@ -8,9 +8,11 @@ import { createIdentity } from "../lib/identity.js";
 import { agx, sandbox } from "../test/helpers.js";
 
 // `agx identity allow --list` prints the saved allowlist. An entry that is not a valid peer key (an
-// npub or a 64-character hex pubkey) can only get there by editing config.json by hand: `identity
-// allow` refuses it. It may be a secret key pasted into the wrong place, so the listing must never
-// print its text, in the readable output or in `--json`. It names the entry by its place instead.
+// npub or a 64-character hex pubkey) is nearly always there because config.json was edited by hand:
+// `identity allow` refuses such a value, with one known gap (an npub that carries 20 bytes, for
+// example, is accepted and stored as 40 hex characters; see open issue #55). It may be a secret key
+// pasted into the wrong place, so the listing must never print its text, in the readable output or
+// in `--json`. It names the entry by its place instead.
 
 kleur.enabled = false;
 
@@ -69,6 +71,18 @@ const HEADING = '\nallowlist (profile "default")\n';
 const entryLine = (position: number) => `  ! entry #${position} is not a valid peer key and is not shown\n`;
 const HINT = '  To fix this, edit "allow" in config.json (agx config path shows where it is).\n';
 const npubLines = (npubs: string[]) => npubs.map((npub) => `  ${npub}\n`).join("");
+/** The colour codes that kleur writes when colour is on. */
+const COLOUR_CODES = new RegExp(`${ESC}\\[[0-9;]*m`, "g");
+
+/** Run `fn` with colour on, as it is on a terminal, and put colour back off afterwards. */
+async function withColour<T>(fn: () => Promise<T>): Promise<T> {
+	kleur.enabled = true;
+	try {
+		return await fn();
+	} finally {
+		kleur.enabled = false;
+	}
+}
 
 beforeEach(() => {
 	box = sandbox();
@@ -94,6 +108,7 @@ describe("agx identity allow --list: an entry that is not a valid peer key", () 
 		["an npub that carries 20 bytes", NPUB_20_BYTES, NPUB_20_BYTES],
 		["an npub that carries 33 bytes", NPUB_33_BYTES, NPUB_33_BYTES],
 		["an npub that carries 64 bytes", NPUB_64_BYTES, NPUB_64_BYTES],
+		["an npub written in capitals", c.npub.toUpperCase(), c.npub.toUpperCase()],
 		["an empty string", "", null],
 		["a string of spaces", "   ", null],
 	];
@@ -106,9 +121,8 @@ describe("agx identity allow --list: an entry that is not a valid peer key", () 
 		if (secret !== null) {
 			expect(leaked(run.stdout, secret)).toBeNull();
 		}
-		expect(run.stdout).toContain(entryLine(2));
-		expect(run.stdout).toContain(a.npub);
-		expect(run.stdout).toContain(b.npub);
+		// The whole output, so that even a few characters of the entry would show up here.
+		expect(run.stdout).toBe(HEADING + npubLines([a.npub]) + entryLine(2) + npubLines([b.npub]) + HINT);
 	});
 
 	it.each(kinds)("%s is not printed in --json", async (_name, entry, secret) => {
@@ -165,6 +179,43 @@ describe("agx identity allow --list: an entry that is not a valid peer key", () 
 		const json = await agx("identity", "allow", "--list", "--json");
 		expect(json.code).toBe(0);
 		expect(JSON.parse(json.stdout)).toEqual({ allow: [], invalidPositions: [1, 2] });
+	});
+
+	it("hides the entry of a list that holds just that one entry", async () => {
+		writeAllow([FAKE_NSEC]);
+		const human = await agx("identity", "allow", "--list");
+		expect(human.code).toBe(0);
+		expect(human.stderr).toBe("");
+		expect(human.stdout).toBe(HEADING + entryLine(1) + HINT);
+		const json = await agx("identity", "allow", "--list", "--json");
+		expect(json.code).toBe(0);
+		expect(json.stderr).toBe("");
+		expect(leaked(json.stdout, FAKE_NSEC)).toBeNull();
+		expect(JSON.parse(json.stdout)).toEqual({ allow: [], invalidPositions: [1] });
+	});
+
+	it("names two equal bad entries by their own places and keeps a repeated valid entry", async () => {
+		writeAllow([a.publicKey, a.publicKey, FAKE_NSEC, FAKE_NSEC, b.publicKey, FAKE_NSEC]);
+		const human = await agx("identity", "allow", "--list");
+		expect(human.code).toBe(0);
+		expect(human.stderr).toBe("");
+		expect(human.stdout).toBe(
+			HEADING + npubLines([a.npub, a.npub]) + entryLine(3) + entryLine(4) + npubLines([b.npub]) + entryLine(6) + HINT,
+		);
+		const json = await agx("identity", "allow", "--list", "--json");
+		expect(JSON.parse(json.stdout)).toEqual({ allow: [a.npub, a.npub, b.npub], invalidPositions: [3, 4, 6] });
+	});
+
+	it("hides the entry in the same way when colour is on, as it is on a terminal", async () => {
+		writeAllow([a.publicKey, FAKE_NSEC, b.publicKey]);
+		const run = await withColour(() => agx("identity", "allow", "--list"));
+		expect(run.code).toBe(0);
+		expect(run.stderr).toBe("");
+		expect(run.stdout).toContain(ESC);
+		expect(leaked(run.stdout, FAKE_NSEC)).toBeNull();
+		expect(run.stdout.replace(COLOUR_CODES, "")).toBe(
+			HEADING + npubLines([a.npub]) + entryLine(2) + npubLines([b.npub]) + HINT,
+		);
 	});
 });
 
