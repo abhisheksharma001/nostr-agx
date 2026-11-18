@@ -53,8 +53,8 @@ export function agxHome(): string {
 	// ~/.agx: a script that meant a private folder should not land on the real one.
 	if (home.trim() === "") {
 		throw configError(
-			"AGX_HOME is set but empty (or only spaces), so agx has no folder to keep your identity and keys in.",
-			"Set it to a folder, for example:\n    export AGX_HOME=$HOME/.agx\n  or unset it to use ~/.agx:\n    unset AGX_HOME",
+			"AGX_HOME is set but empty (or only whitespace), so agx has no folder to keep your identity and keys in.",
+			"Set it to a folder, for example:\n    export AGX_HOME=/path/to/a/folder\n  or unset it to use ~/.agx:\n    unset AGX_HOME",
 		);
 	}
 	return home;

@@ -22,7 +22,7 @@ import {
 } from "./paths.js";
 
 // AGX_HOME names the one folder that holds config.json, credentials.json and
-// every identity. Set but empty (or only spaces) it names no folder, and
+// every identity. Set but empty (or only whitespace) it names no folder, and
 // joining "config.json" onto it gives a path in whatever folder agx was started
 // from. That must stop with a plain message instead, and never fall back to
 // ~/.agx either: a script that meant a private folder should not land on the
