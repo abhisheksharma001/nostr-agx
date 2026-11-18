@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { toNpub } from "@nostr-agx/nostr";
 import kleur from "kleur";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { EXIT } from "../lib/errors.js";
@@ -36,6 +37,14 @@ const NOT_A_KEY = "garbage-entry-FAKEJUNK";
 const OTHER_SCRIPT = "ключ-🔑-FAKE";
 /** A real npub with its last character changed, so the checksum no longer holds. */
 const MISTYPED_NPUB = `${d.npub.slice(0, -1)}${d.npub.endsWith("q") ? "p" : "q"}`;
+/** An npub that carries `length` bytes of made-up text instead of a public key. */
+const npubWithBytes = (length: number) =>
+	toNpub(Buffer.from("fakepayload".repeat(8)).subarray(0, length).toString("hex"));
+const NPUB_NO_BYTES = toNpub("");
+const NPUB_NO_BYTES_PADDED = `  ${NPUB_NO_BYTES}${LINE_SEPARATOR}\t`;
+const NPUB_20_BYTES = npubWithBytes(20);
+const NPUB_33_BYTES = npubWithBytes(33);
+const NPUB_64_BYTES = npubWithBytes(64);
 
 /** Write config.json by hand, the way a person editing it would, with `allow` as given. */
 function writeAllow(allow: unknown[]): void {
@@ -80,6 +89,11 @@ describe("agx identity allow --list: an entry that is not a valid peer key", () 
 		["a word that is not a key", NOT_A_KEY, NOT_A_KEY],
 		["text in another script with an emoji", OTHER_SCRIPT, OTHER_SCRIPT],
 		["an npub with a wrong checksum", MISTYPED_NPUB, MISTYPED_NPUB],
+		["an npub that carries no bytes", NPUB_NO_BYTES, NPUB_NO_BYTES],
+		["an npub that carries no bytes, with a line separator and a tab around it", NPUB_NO_BYTES_PADDED, NPUB_NO_BYTES_PADDED],
+		["an npub that carries 20 bytes", NPUB_20_BYTES, NPUB_20_BYTES],
+		["an npub that carries 33 bytes", NPUB_33_BYTES, NPUB_33_BYTES],
+		["an npub that carries 64 bytes", NPUB_64_BYTES, NPUB_64_BYTES],
 		["an empty string", "", null],
 		["a string of spaces", "   ", null],
 	];
@@ -131,14 +145,14 @@ describe("agx identity allow --list: an entry that is not a valid peer key", () 
 	});
 
 	it("gives a script that reads allow from --json only valid npubs", async () => {
-		writeAllow([FAKE_NSEC, a.publicKey, NOT_A_KEY, b.npub, WITH_CONTROLS, "", HEX_ONE_SHORT]);
+		writeAllow([FAKE_NSEC, a.publicKey, NOT_A_KEY, b.npub, WITH_CONTROLS, "", HEX_ONE_SHORT, NPUB_20_BYTES, NPUB_NO_BYTES]);
 		const run = await agx("identity", "allow", "--list", "--json");
 		const doc = JSON.parse(run.stdout) as { allow: string[]; invalidPositions: number[] };
 		expect(doc.allow).toEqual([a.npub, b.npub]);
 		for (const entry of doc.allow) {
 			expect(entry).toMatch(/^npub1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$/);
 		}
-		expect(doc.invalidPositions).toEqual([1, 3, 5, 6, 7]);
+		expect(doc.invalidPositions).toEqual([1, 3, 5, 6, 7, 8, 9]);
 	});
 
 	it("counts a list of only bad entries as a list with entries, not as an empty one", async () => {
