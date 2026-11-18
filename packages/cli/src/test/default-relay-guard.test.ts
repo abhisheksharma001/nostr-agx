@@ -69,6 +69,7 @@ const WAYS: Array<[string, (port: number) => Promise<string>]> = [
 
 describe("refuseConnections", () => {
 	it.each(WAYS)("%s to a guarded port: refused like a closed port, never reaches the listener", async (_way, dial) => {
+		const before = guarded.seen();
 		const guard = refuseConnections([guarded.port]);
 		try {
 			expect(await dial(guarded.port)).toBe("ECONNREFUSED");
@@ -76,7 +77,7 @@ describe("refuseConnections", () => {
 		} finally {
 			guard.restore();
 		}
-		expect(guarded.seen()).toBe(0);
+		expect(guarded.seen()).toBe(before);
 	});
 
 	it("names what was refused once, then is quiet again", async () => {
