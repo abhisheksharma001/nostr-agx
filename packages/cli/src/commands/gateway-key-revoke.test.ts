@@ -43,7 +43,7 @@ const TYPED: Array<[string, string, string]> = [
 	["a line feed", "a\nb", "a�b"],
 	["a carriage return", "a\rb", "a�b"],
 	["a one-character control sequence introducer (U+009B)", "a\u009b31mb", "a�31mb"],
-	["a line separator (U+2028)", "a b", "a�b"],
+	["a line separator (U+2028)", "a\u2028b", "a�b"],
 	["a second error line", "x.\n✗ Disk full", "x.�✗ Disk full"],
 ];
 

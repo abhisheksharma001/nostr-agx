@@ -51,8 +51,8 @@ const TYPED: Array<[string, string, string]> = [
 	["a delete character", "a\u007fb", "a�b"],
 	["a one-character control sequence introducer (U+009B)", "a\u009b31mb", "a�31mb"],
 	["a next-line character (U+0085)", "a\u0085b", "a�b"],
-	["a line separator (U+2028)", "a b", "a�b"],
-	["a paragraph separator (U+2029)", "a b", "a�b"],
+	["a line separator (U+2028)", "a\u2028b", "a�b"],
+	["a paragraph separator (U+2029)", "a\u2029b", "a�b"],
 	["a second error line", 'x".\n✗ Disk full', 'x".�✗ Disk full'],
 ];
 
