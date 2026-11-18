@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import kleur from "kleur";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -33,6 +33,7 @@ const VERY_LONG = `FAKELONG${"x".repeat(5000)}`;
 const HEX_ONE_SHORT = "0123456789abcdef".repeat(4).slice(0, 63);
 const HEX_WITH_PREFIX = `0x${"fedcba9876543210".repeat(4)}`;
 const NOT_A_KEY = "garbage-entry-FAKEJUNK";
+const OTHER_SCRIPT = "ключ-🔑-FAKE";
 /** A real npub with its last character changed, so the checksum no longer holds. */
 const MISTYPED_NPUB = `${d.npub.slice(0, -1)}${d.npub.endsWith("q") ? "p" : "q"}`;
 
@@ -77,6 +78,7 @@ describe("agx identity allow --list: an entry that is not a valid peer key", () 
 		["a 64-character hex key with one character missing", HEX_ONE_SHORT, HEX_ONE_SHORT],
 		["hex with a 0x prefix", HEX_WITH_PREFIX, HEX_WITH_PREFIX],
 		["a word that is not a key", NOT_A_KEY, NOT_A_KEY],
+		["text in another script with an emoji", OTHER_SCRIPT, OTHER_SCRIPT],
 		["an npub with a wrong checksum", MISTYPED_NPUB, MISTYPED_NPUB],
 		["an empty string", "", null],
 		["a string of spaces", "   ", null],
@@ -171,6 +173,14 @@ describe("agx identity allow --list: output that must not change", () => {
 		expect(human.stdout).toBe(HEADING + npubLines([a.npub, b.npub]));
 		const json = await agx("identity", "allow", "--list", "--json");
 		expect(json.stdout).toBe(`{\n  "allow": [\n    "${a.npub}",\n    "${b.npub}"\n  ]\n}\n`);
+	});
+
+	it("leaves config.json exactly as it was, bad entries included", async () => {
+		writeAllow([FAKE_NSEC, a.publicKey, NOT_A_KEY]);
+		const before = readFileSync(join(box.home, "config.json"), "utf8");
+		await agx("identity", "allow", "--list");
+		await agx("identity", "allow", "--list", "--json");
+		expect(readFileSync(join(box.home, "config.json"), "utf8")).toBe(before);
 	});
 
 	it("still warns that an empty list refuses every task request", async () => {
