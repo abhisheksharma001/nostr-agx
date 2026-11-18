@@ -23,8 +23,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const CHILDREN = 6;
 const ROUNDS = 3;
-/** Big enough that a file that is created first and filled afterwards can be caught half full. */
-const SIZE = 1_000_000;
+/** Big enough that a file that is created first and filled afterwards is half full for a few milliseconds. */
+const SIZE = 8_000_000;
 
 let work: string;
 
@@ -131,26 +131,31 @@ describe("several processes calling the exclusive write on one target at once", 
 				const target = join(folder, "secret.json");
 				const children = Array.from({ length: CHILDREN }, (_, index) => start(index, target, gate));
 
-				// While they run, look at the target as often as possible: absent, or one whole candidate.
+				// While they run, look at the target as often as possible: absent, or the whole size, and now and
+				// then (a full read is slow) one whole candidate. A file that was created first and filled afterwards
+				// shows up as too small.
 				const seen = { reads: 0, wrong: 0 };
-				const look = () => {
-					let data: Buffer;
+				const look = (whole: boolean) => {
 					try {
-						data = readFileSync(target);
+						if (statSync(target).size !== SIZE + 1) {
+							seen.wrong++;
+							return;
+						}
+						seen.reads++;
+						if (whole && !candidates.has(hash(readFileSync(target)))) {
+							seen.wrong++;
+						}
 					} catch {
-						return;
-					}
-					seen.reads++;
-					if (!candidates.has(hash(data))) {
-						seen.wrong++;
+						// not there yet
 					}
 				};
+				let looks = 0;
 				while (!children.every((child) => child.finished())) {
-					look();
+					look(++looks % 20 === 0);
 					await new Promise((resolve) => setImmediate(resolve));
 				}
 				const results = await Promise.all(children.map((child) => child.done));
-				look();
+				look(true);
 
 				expect(results.map((r) => r.stderr).join("")).toBe("");
 				expect(results.map((r) => r.code)).toEqual(Array(CHILDREN).fill(0));
