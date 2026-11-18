@@ -220,6 +220,19 @@ describe("saveConfig when the file on disk is not what was read", () => {
 		expect(saved.profiles.alpha.futureAlpha).toBe("keep-alpha");
 	});
 
+	it("unknown profile keys go to the profile of the same name, not the one in the same position", () => {
+		writeConfig({
+			version: 1,
+			currentProfile: "alpha",
+			profiles: { alpha: { futureAlpha: "a" }, beta: { futureBeta: "b" } },
+		});
+		saveConfig(configSchema.parse({ profiles: { beta: { relays: ["ws://127.0.0.1:9"] } } }));
+		const { profiles } = readConfig();
+		expect(Object.keys(profiles)).toEqual(["beta"]);
+		expect(profiles.beta.futureBeta).toBe("b");
+		expect(profiles.beta).not.toHaveProperty("futureAlpha");
+	});
+
 	it("a file that is an array adds no keys of its own (no 0, 1, ...)", () => {
 		writeRaw('["a","b"]');
 		saveConfig(known(["ws://127.0.0.1:9"]));
