@@ -415,6 +415,30 @@ describe("agx card, with ordinary text", () => {
 	});
 });
 
+// At a terminal the labels and the dash are dimmed. The dash that stands for an empty list is plain
+// text, the one that stands for no handle or no version is dimmed, and both stay as they were.
+describe("agx card, with colour on", () => {
+	it("prints the dash for an empty list as plain text and the dash for no handle and no version dimmed", async () => {
+		const { npub } = await publishCard({ v: 1, capabilities: [], relays: [], payloadTypes: [], encryption: [] });
+		const colourWas = kleur.enabled;
+		kleur.enabled = true;
+		try {
+			const run = await agx("card", npub);
+
+			expect(run.code, run.stderr).toBe(0);
+			const lines = run.stdout.split("\n");
+			for (const label of ["capabilities", "relays", "payload types", "encryption"]) {
+				expect(lines, label).toContain(`  ${kleur.dim(label.padEnd(16))} —`);
+			}
+			for (const label of ["nip05 (claimed)", "card version"]) {
+				expect(lines, label).toContain(`  ${kleur.dim(label.padEnd(16))} ${kleur.dim("—")}`);
+			}
+		} finally {
+			kleur.enabled = colourWas;
+		}
+	});
+});
+
 // The verdict words are coloured at a terminal. Only the card's own text is cleaned, so the colour
 // codes around the words must come through untouched.
 describe("agx card --verify, with colour on", () => {
