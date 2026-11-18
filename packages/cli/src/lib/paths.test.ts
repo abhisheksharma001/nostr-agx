@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { agx, sandbox } from "../test/helpers.js";
+import { relayMetaPath } from "../relay/cert.js";
 import { AgxCliError, EXIT } from "./errors.js";
 import {
 	agxHome,
@@ -83,6 +84,11 @@ describe("agxHome", () => {
 		expect(identityPath("p")).toBe(join(box.home, "profiles", "p", "identity.json"));
 	});
 
+	it("does not trim an AGX_HOME that has text in it", () => {
+		process.env.AGX_HOME = " sp ";
+		expect(agxHome()).toBe(" sp ");
+	});
+
 	it("keeps a relative AGX_HOME relative", () => {
 		process.env.AGX_HOME = "relative-home";
 		expect(agxHome()).toBe("relative-home");
@@ -98,6 +104,14 @@ describe("agxHome", () => {
 		expect(error.remediation).toMatch(/unset AGX_HOME/);
 	});
 
+	it("says whitespace, and does not suggest the real ~/.agx folder as the example", () => {
+		process.env.AGX_HOME = "\t";
+		const error = thrown(() => agxHome());
+		expect(error.message).toContain("(or only whitespace)");
+		expect(error.remediation).toContain("export AGX_HOME=/path/to/a/folder");
+		expect(error.remediation).not.toContain("export AGX_HOME=$HOME/.agx");
+	});
+
 	it.each([
 		["configPath", () => configPath()],
 		["credentialsPath", () => credentialsPath()],
@@ -111,6 +125,7 @@ describe("agxHome", () => {
 		["gatewayKeysPath", () => gatewayKeysPath("p")],
 		["gatewaySubscriptionsPath", () => gatewaySubscriptionsPath("p")],
 		["gatewayTaskOperationsPath", () => gatewayTaskOperationsPath("p")],
+		["relayMetaPath (the relay folder)", () => relayMetaPath()],
 	])("%s gives no path while AGX_HOME is empty", (_name, path) => {
 		process.env.AGX_HOME = "";
 		expect(thrown(path).exitCode).toBe(EXIT.config);
