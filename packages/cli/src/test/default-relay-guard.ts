@@ -33,10 +33,10 @@ function targetOf(args: unknown[]): { host: string; port: number } | null {
 		const { host, port } = first as { host?: string; port?: number | string };
 		return { host: host ?? "localhost", port: Number(port) };
 	}
-	if (typeof first === "number" || (typeof first === "string" && /^\d+$/.test(first))) {
+	if (typeof first === "number") {
 		return {
 			host: typeof args[1] === "string" ? args[1] : "localhost",
-			port: Number(first),
+			port: first,
 		};
 	}
 	return null;
