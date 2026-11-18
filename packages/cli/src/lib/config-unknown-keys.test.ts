@@ -234,6 +234,11 @@ describe("saveConfig when the file on disk is not what was read", () => {
 		}
 	});
 
+	it("with no config.json yet, the save creates it as before", () => {
+		saveConfig(known(["ws://127.0.0.1:9"]));
+		expect(text()).toBe(expected(["ws://127.0.0.1:9"]));
+	});
+
 	it("a file that is not JSON is written over as before, with no error from reading it", () => {
 		writeRaw("{ not json");
 		saveConfig(known(["ws://127.0.0.1:9"]));
