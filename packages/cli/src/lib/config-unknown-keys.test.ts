@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "nod
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { agx, sandbox } from "../test/helpers.js";
-import { configSchema, getProfile, saveConfig, updateProfile } from "./config.js";
+import { configSchema, getProfile, profileSchema, saveConfig, updateProfile } from "./config.js";
 import { AgxCliError, EXIT } from "./errors.js";
 
 /**
@@ -111,15 +111,9 @@ describe("saving config keeps the keys this version does not know", () => {
 		expect(text()).toBe(first);
 
 		const saved = readConfig();
-		expect(Object.keys(saved)).toEqual(["version", "currentProfile", "profiles", "futureTopLevel"]);
+		expect(Object.keys(saved)).toEqual([...Object.keys(configSchema.shape), "futureTopLevel"]);
 		expect(Object.keys(saved.profiles.alpha)).toEqual([
-			"apiBaseUrl",
-			"apiKey",
-			"orgSlug",
-			"relays",
-			"org",
-			"nip05",
-			"allow",
+			...Object.keys(profileSchema.shape),
 			"futureAlpha",
 			"nick",
 		]);
@@ -155,15 +149,7 @@ describe("saving config, what must not change", () => {
 			'{"currentProfile":"alpha","profiles":{"alpha":{"orgSlug":"acme","relays":["ws://127.0.0.1:9"]},"beta":{}},"version":1}',
 		);
 		updateProfile("alpha", { nip05: "bot@acme.com" });
-		const defaults = {
-			apiBaseUrl: "https://app.ellaworks.ai",
-			apiKey: null,
-			orgSlug: null,
-			relays: ["ws://127.0.0.1:7447"],
-			org: null,
-			nip05: null,
-			allow: [],
-		};
+		const defaults = profileSchema.parse({});
 		expect(text()).toBe(
 			`${JSON.stringify(
 				{
