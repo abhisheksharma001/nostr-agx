@@ -98,10 +98,20 @@ export function loadConfig(): AgxConfig {
  * written from `config`.
  */
 export function saveConfig(config: AgxConfig): void {
-	writePrivateJson(
-		configPath(),
-		withUnknownKeys(migrateLegacyKeys(config, storedConfig())),
-	);
+	const next = withUnknownKeys(migrateLegacyKeys(config, storedConfig()));
+	try {
+		writePrivateJson(configPath(), next);
+	} catch (error) {
+		// JSON.stringify runs out of stack on a value nested thousands of levels
+		// deep, before anything is written: the file is as it was.
+		if (error instanceof RangeError) {
+			throw configError(
+				`${configPath()} holds a value that is nested too deeply, or is too large, to write back, so config was not saved.`,
+				`Flatten or remove that value by hand in ${configPath()}, then re-run.`,
+			);
+		}
+		throw error;
+	}
 }
 
 const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set(
