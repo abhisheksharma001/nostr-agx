@@ -1,11 +1,11 @@
-import { mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { hexToBytes } from "@nostr-agx/nostr";
 import { nip19 } from "nostr-tools";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EXIT } from "../lib/errors.js";
 import { createIdentity, type IdentityFile, loadIdentityFile, saveIdentity } from "../lib/identity.js";
-import { identityPath } from "../lib/paths.js";
+import { ensureDir, identityPath, profileDir } from "../lib/paths.js";
 import { setStdinForTests } from "../lib/stdin.js";
 import { agx, sandbox } from "../test/helpers.js";
 
@@ -22,13 +22,20 @@ import { agx, sandbox } from "../test/helpers.js";
 // check compares two keys with toBe: a failing assertion prints both sides, and
 // a secret key must not end up in a test log.
 
-const gap = vi.hoisted(() => ({ run: undefined as undefined | (() => void) }));
+const gap = vi.hoisted(() => ({
+	run: undefined as undefined | (() => void),
+	/** How many times a new identity was built since the last reset: an early refusal builds none. */
+	built: 0,
+	/** Makes the link step of an exclusive write fail, as a file system without hard links does. */
+	link: undefined as undefined | NodeJS.ErrnoException,
+}));
 
 vi.mock("../lib/identity.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("../lib/identity.js")>();
 	const inTheGap =
 		<A extends unknown[], R>(build: (...args: A) => R) =>
 		(...args: A): R => {
+			gap.built++;
 			const run = gap.run;
 			gap.run = undefined;
 			run?.();
@@ -38,6 +45,19 @@ vi.mock("../lib/identity.js", async (importOriginal) => {
 		...actual,
 		createIdentity: inTheGap(actual.createIdentity),
 		identityFromSecret: inTheGap(actual.identityFromSecret),
+	};
+});
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		linkSync: (from: string, to: string) => {
+			if (gap.link) {
+				throw gap.link;
+			}
+			return actual.linkSync(from, to);
+		},
 	};
 });
 
@@ -52,10 +72,12 @@ const ALREADY = 'Profile "default" already has an identity.';
 
 beforeEach(() => {
 	box = sandbox();
+	gap.built = 0;
 });
 
 afterEach(() => {
 	gap.run = undefined;
+	gap.link = undefined;
 	restoreStdin?.();
 	restoreStdin = undefined;
 	box.restore();
@@ -227,5 +249,138 @@ describe("the ordinary cases of agx identity new and import keep working", () =>
 		expect(run.code).toBe(EXIT.generic);
 		expect(run.stderr).toMatch(/EEXIST|ENOTDIR/);
 		expect(plain(run.stderr)).not.toContain("already has an identity");
+	});
+});
+
+describe("agx identity new, when the profile already has an identity at the look", () => {
+	it("stops before it makes a key, prints nothing and does not touch the file", async () => {
+		saveIdentity("default", other);
+		const before = readFileSync(identityPath("default"));
+		const inode = statSync(identityPath("default")).ino;
+		gap.built = 0;
+		const run = await agx("identity", "new");
+		expect(run.code).toBe(EXIT.config);
+		expect(plain(run.stderr)).toContain(ALREADY);
+		expect(run.stdout).toBe("");
+		expect(gap.built).toBe(0);
+		expect(readFileSync(identityPath("default")).equals(before)).toBe(true);
+		expect(statSync(identityPath("default")).ino).toBe(inode);
+		expect(files()).toEqual(["identity.json"]);
+	});
+
+	it("import stops before it makes an identity from the key too", async () => {
+		saveIdentity("default", other);
+		gap.built = 0;
+		const run = await agx("identity", "import", incoming.secretKeyHex);
+		expect(run.code).toBe(EXIT.config);
+		expect(gap.built).toBe(0);
+		expect(stored().secretKeyHex === other.secretKeyHex).toBe(true);
+	});
+});
+
+describe("agx identity new and import, when identity.json is a symlink", () => {
+	/** A symlink named identity.json: to a file with content ("live"), or to a name with nothing behind it ("dangling"). */
+	function linkIdentity(kind: "live" | "dangling"): string {
+		const elsewhere = join(box.home, "elsewhere.json");
+		if (kind === "live") {
+			writeFileSync(elsewhere, "not an identity\n");
+		}
+		ensureDir(profileDir("default"));
+		symlinkSync(elsewhere, identityPath("default"));
+		return elsewhere;
+	}
+
+	it.each([
+		["new", "live"],
+		["new", "dangling"],
+		["import", "live"],
+		["import", "dangling"],
+	] as const)("%s with a %s symlink is refused, and the symlink and what it points to are left as they were", async (command, kind) => {
+		const elsewhere = linkIdentity(kind);
+		const run =
+			command === "new"
+				? await agx("identity", "new")
+				: await agx("identity", "import", incoming.secretKeyHex);
+		expect(run.code).toBe(EXIT.config);
+		expect(plain(run.stderr)).toContain(ALREADY);
+		expect(run.stdout).toBe("");
+		expect(holdsHex(run.stdout + run.stderr)).toBe(false);
+		expect(lstatSync(identityPath("default")).isSymbolicLink()).toBe(true);
+		expect(readlinkSync(identityPath("default"))).toBe(elsewhere);
+		if (kind === "live") {
+			expect(readFileSync(elsewhere, "utf8")).toBe("not an identity\n");
+		} else {
+			expect(lstatSync(elsewhere, { throwIfNoEntry: false })).toBeUndefined();
+		}
+		expect(files()).toEqual(["identity.json"]);
+	});
+
+	it("--force still replaces the symlink with a private identity file, as a rename always did", async () => {
+		const elsewhere = linkIdentity("live");
+		const run = await agx("identity", "new", "--force");
+		expect(run.code).toBe(EXIT.ok);
+		expect(lstatSync(identityPath("default")).isSymbolicLink()).toBe(false);
+		expect(mode(identityPath("default"))).toBe(0o600);
+		expect(readFileSync(elsewhere, "utf8")).toBe("not an identity\n");
+	});
+});
+
+describe("agx identity new and import, on a file system that cannot make hard links", () => {
+	const CODES = ["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"];
+	const failLink = (code: string) => {
+		gap.link = Object.assign(
+			new Error(`${code}: operation not supported on socket, link '${identityPath("default")}.1.ab.tmp' -> '${identityPath("default")}'`),
+			{ code },
+		);
+	};
+
+	it.each(CODES)("identity new says so in plain words and writes nothing (%s)", async (code) => {
+		failLink(code);
+		const run = await agx("identity", "new");
+		const shown = plain(run.stderr);
+		expect(run.code).toBe(EXIT.config);
+		expect(shown).toContain("hard links");
+		expect(shown).toContain("AGX_HOME");
+		expect(shown).toContain("agx identity new --force");
+		expect(shown).not.toContain(code);
+		expect(shown).not.toContain(".tmp");
+		expect(shown).not.toContain("already has an identity");
+		expect(run.stdout).toBe("");
+		expect(holdsHex(run.stdout + run.stderr)).toBe(false);
+		expect(files()).toEqual([]);
+	});
+
+	it.each(CODES)("identity import says so, and shows no part of the key (%s)", async (code) => {
+		failLink(code);
+		const run = await agx("identity", "import", incoming.secretKeyHex);
+		const shown = plain(run.stderr);
+		expect(run.code).toBe(EXIT.config);
+		expect(shown).toContain("hard links");
+		expect(shown).toContain("AGX_HOME");
+		expect(shown).toContain("agx identity import <nsec> --force");
+		expect(shown).not.toContain(".tmp");
+		for (const out of [run.stdout, run.stderr]) {
+			expect(out.includes(incoming.secretKeyHex)).toBe(false);
+			expect(out.includes(INCOMING_NSEC)).toBe(false);
+		}
+		expect(run.stdout).toBe("");
+		expect(files()).toEqual([]);
+	});
+
+	it("--force does not need hard links, so it still works there", async () => {
+		failLink("ENOTSUP");
+		const run = await agx("identity", "new", "--force");
+		expect(run.code).toBe(EXIT.ok);
+		expect(mode(identityPath("default"))).toBe(0o600);
+		expect(files()).toEqual(["identity.json"]);
+	});
+
+	it("a failure of the link for another reason is not described as a missing feature", async () => {
+		gap.link = Object.assign(new Error("EIO: i/o error, link"), { code: "EIO" });
+		const run = await agx("identity", "new");
+		expect(run.code).toBe(EXIT.generic);
+		expect(run.stderr).toContain("EIO");
+		expect(plain(run.stderr)).not.toContain("hard links");
+		expect(files()).toEqual([]);
 	});
 });

@@ -124,6 +124,15 @@ describe("saving the identity of a profile that already has one", () => {
 		expect(files()).toEqual(["identity.json"]);
 	});
 
+	it("treats replace: false like no option at all: it refuses", () => {
+		const first = createIdentity();
+		saveIdentity("default", first);
+		const before = readFileSync(identityPath("default"));
+		expect(() => saveIdentity("default", createIdentity(), { replace: false })).toThrow();
+		expect(() => saveIdentity("default", createIdentity(), {})).toThrow();
+		expect(readFileSync(identityPath("default")).equals(before)).toBe(true);
+	});
+
 	it("replaces a file that is too open with a private one when asked to", () => {
 		saveIdentity("default", createIdentity());
 		chmodSync(identityPath("default"), 0o644);
