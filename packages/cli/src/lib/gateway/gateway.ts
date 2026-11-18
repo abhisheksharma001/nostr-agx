@@ -19,7 +19,7 @@ import { loadIdentity } from "../identity.js";
 import { createCollector } from "../inbox.js";
 import { acquireLock } from "../lock.js";
 import { profileDir } from "../paths.js";
-import { toHexPubkey } from "../peer.js";
+import { isPastedSecretKey, toHexPubkey } from "../peer.js";
 import { FileSeenStore, loadState, updateState } from "../state.js";
 import { MessageStore } from "../store/message-store.js";
 import { createTransport } from "../transport.js";
@@ -121,6 +121,11 @@ const SHUTDOWN_WAIT_MS = 8_000;
 
 function nowSec(): number {
 	return Math.floor(Date.now() / 1000);
+}
+
+/** A request path or id as it may be quoted in an answer or a log line: never a pasted secret key. */
+function shown(value: string): string {
+	return isPastedSecretKey(value) ? "(a value with a secret key, not shown)" : value;
 }
 
 function bearer(req: IncomingMessage): string {
@@ -482,7 +487,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				return;
 			}
 			if (!path.startsWith("/v1/")) {
-				throw new ApiError(404, "not_found", `No route for ${method} ${path}`);
+				throw new ApiError(404, "not_found", `No route for ${method} ${shown(path)}`);
 			}
 			const keyId = verifyGatewayKey(name, bearer(req));
 			if (keyId === null) {
@@ -596,14 +601,14 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				if (method === "GET") {
 					const subscription = subscriptions.get(id);
 					if (!subscription) {
-						throw new ApiError(404, "not_found", `No subscription ${id}`);
+						throw new ApiError(404, "not_found", `No subscription ${shown(id)}`);
 					}
 					sendJson(res, 200, viewOf(subscription));
 					return;
 				}
 				if (method === "DELETE") {
 					if (!subscriptions.delete(id)) {
-						throw new ApiError(404, "not_found", `No subscription ${id}`);
+						throw new ApiError(404, "not_found", `No subscription ${shown(id)}`);
 					}
 					advertise();
 					log(`UNSUB ${id}`);
@@ -612,7 +617,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 					return;
 				}
 			}
-			throw new ApiError(404, "not_found", `No route for ${method} ${path}`);
+			throw new ApiError(404, "not_found", `No route for ${method} ${shown(path)}`);
 		};
 
 		const server: Server = createServer((req, res) => {
@@ -625,7 +630,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 					sendError(res, error);
 					return;
 				}
-				log(`API error on ${req.method} ${req.url}: ${error instanceof Error ? error.message : String(error)}`);
+				log(`API error on ${req.method} ${shown(req.url ?? "")}: ${error instanceof Error ? error.message : String(error)}`);
 				sendError(res, new ApiError(500, "internal_error", "The gateway could not complete the request"));
 			});
 		});
