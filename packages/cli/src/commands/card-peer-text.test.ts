@@ -1,5 +1,6 @@
 import { CARD_KIND, generateKeypair, localSigner, type NostrEvent, RELAY_LIST_KIND, toNpub } from "@nostr-agx/nostr";
 import kleur from "kleur";
+import { verifyEvent } from "nostr-tools";
 import WebSocket from "ws";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { updateProfile } from "../lib/config.js";
@@ -11,12 +12,20 @@ import { agx, jsonDocuments, sandbox } from "../test/helpers.js";
 // published to an in-process relay on a free port by throwaway identities made here.
 
 // The NIP-05 lookup normally reaches a public host; here the answer is chosen by the test,
-// and no test reaches the network.
-const lookup = vi.hoisted(() => ({ answer: null as string | null }));
-vi.mock("@nostr-agx/nostr", async (importOriginal) => ({
-	...(await importOriginal<typeof import("@nostr-agx/nostr")>()),
-	fetchNip05Pubkey: () => Promise.resolve(lookup.answer),
+// and no test reaches the network. `parsed`, when set, replaces the parser's answer, so a test
+// can hand the command a name and a domain that the real parser would refuse.
+const lookup = vi.hoisted(() => ({
+	answer: null as string | null,
+	parsed: null as { name: string; domain: string } | null,
 }));
+vi.mock("@nostr-agx/nostr", async (importOriginal) => {
+	const original = await importOriginal<typeof import("@nostr-agx/nostr")>();
+	return {
+		...original,
+		fetchNip05Pubkey: () => Promise.resolve(lookup.answer),
+		parseNip05: (identifier: string) => lookup.parsed ?? original.parseNip05(identifier),
+	};
+});
 
 const ESC = String.fromCharCode(0x1b);
 const BEL = String.fromCharCode(0x07);
@@ -30,6 +39,11 @@ const NEL = String.fromCharCode(0x85);
 const CSI = String.fromCharCode(0x9b);
 const LS = String.fromCharCode(0x2028);
 const PS = String.fromCharCode(0x2029);
+const TAB = String.fromCharCode(0x09);
+/** Characters that are not control characters and must reach the terminal as they were published. */
+const ZWJ = String.fromCharCode(0x200d);
+const VS16 = String.fromCharCode(0xfe0f);
+const COMBINING_ACUTE = String.fromCharCode(0x0301);
 /** What each control character is printed as. */
 const R = String.fromCharCode(0xfffd);
 
@@ -44,6 +58,7 @@ beforeAll(() => {
 beforeEach(async () => {
 	box = sandbox();
 	lookup.answer = null;
+	lookup.parsed = null;
 	relay = await startRelay({ port: 0 });
 	updateProfile("default", { relays: [relayUrl()] });
 });
@@ -89,15 +104,16 @@ async function sendToRelay(event: NostrEvent): Promise<void> {
 	});
 }
 
-/** Publishes a card whose content is exactly `content`, and an address list when `addresses` is given. */
+/** Publishes a card whose content is exactly `content` (with `tags`, when given), and an address list when `addresses` is given. */
 async function publishCard(
 	content: Record<string, unknown>,
 	addresses?: string[],
+	tags: string[][] = [],
 ): Promise<{ npub: string; event: NostrEvent }> {
 	const keys = generateKeypair();
 	const signer = localSigner(keys.secretKey);
 	const now = Math.floor(Date.now() / 1000);
-	const event = await signer.signEvent({ kind: CARD_KIND, created_at: now, tags: [], content: JSON.stringify(content) });
+	const event = await signer.signEvent({ kind: CARD_KIND, created_at: now, tags, content: JSON.stringify(content) });
 	await sendToRelay(event);
 	if (addresses) {
 		await sendToRelay(
@@ -222,23 +238,54 @@ describe("agx card, when the card holds control characters", () => {
 		expect(run.stdout).toContain(`example.com publishes ab${R}[2Jcccccccccc… for "bob" — a DIFFERENT key`);
 	});
 
-	it("prints the raw event with the characters JSON leaves as they are replaced, and keeps its lines", async () => {
-		const { npub } = await publishCard({
-			...PLAIN_CARD,
-			payloadTypes: [`text/plain${CSI}31m`],
-			encryption: [`nip44${DEL}`],
-			version: `1.0.0${LS}second-line`,
-		});
+});
+
+// The raw event is what a reader copies to check the signature, so it must stay the event that was
+// signed: a character that is replaced in it makes the copy a different event.
+describe("agx card --raw, when the card holds control characters", () => {
+	const HOSTILE_CARD = {
+		...PLAIN_CARD,
+		org: `Acme${ESC}[31m${LF}forged`,
+		capabilities: [`a${NUL}b`, `c${BEL}d`],
+		payloadTypes: [`text/plain${CSI}31m`],
+		encryption: [`nip44${DEL}`, `x${NEL}y`],
+		version: `1.0.0${LS}second-line${PS}`,
+	};
+	const HOSTILE_TAGS = [["client", `tool${CSI}1;31m${LS}`]];
+
+	/** The JSON printed under the "Raw event" heading: from its opening brace to the closing brace on a line of its own. */
+	function rawBlock(stdout: string): string {
+		const heading = "Raw event\n";
+		const start = stdout.indexOf(heading);
+		expect(start, "the Raw event heading").toBeGreaterThanOrEqual(0);
+		const after = stdout.slice(start + heading.length);
+		return after.slice(0, after.indexOf("\n}\n") + 2);
+	}
+
+	it("prints an event that parses back to the one that was published, and whose signature still verifies", async () => {
+		const { npub, event } = await publishCard(HOSTILE_CARD, undefined, HOSTILE_TAGS);
+		expect(verifyEvent(event)).toBe(true);
+
+		const run = await agx("card", npub, "--raw");
+
+		expect(run.code, run.stderr).toBe(0);
+		const printed = JSON.parse(rawBlock(run.stdout));
+		expect(printed).toEqual(JSON.parse(JSON.stringify(event)));
+		expect(verifyEvent(printed)).toBe(true);
+	});
+
+	it("writes no raw control character, replaces nothing inside the event, and keeps its lines", async () => {
+		const { npub } = await publishCard(HOSTILE_CARD, undefined, HOSTILE_TAGS);
 
 		const run = await agx("card", npub, "--raw");
 
 		expect(run.code, run.stderr).toBe(0);
 		expect(strayControls(run.stdout)).toEqual([]);
-		expect(run.stdout).toContain(`text/plain${R}31m`);
-		expect(run.stdout).toContain(`nip44${R}`);
-		expect(run.stdout).toContain(`1.0.0${R}second-line`);
+		// The lines above the heading show the card's text with control characters replaced; the event does not.
+		const fromHeading = run.stdout.slice(run.stdout.indexOf("Raw event"));
+		expect(fromHeading).not.toContain(R);
 		// The raw event is the one field that is meant to span lines.
-		expect(run.stdout).toContain('Raw event\n{\n  "kind": 11337,\n  "created_at": ');
+		expect(fromHeading).toContain('Raw event\n{\n  "kind": 11337,\n  "created_at": ');
 	});
 });
 
@@ -324,6 +371,40 @@ describe("agx card, with ordinary text", () => {
 		expect(field(run.stdout, "card version")).toBe("2");
 	});
 
+	// A zero or a false is a value the card holds, not a missing one: it is printed, as it was before.
+	it.each([
+		["version", 0, "card version", "0"],
+		["version", false, "card version", "false"],
+		["nip05", 0, "nip05 (claimed)", "0"],
+		["nip05", false, "nip05 (claimed)", "false"],
+		["nip05", "", "nip05 (claimed)", "—"],
+	])("prints a card's %s of %j as it did before", async (key, typed, label, shown) => {
+		const { npub } = await publishCard({ ...PLAIN_CARD, [key]: typed });
+
+		const run = await agx("card", npub);
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(field(run.stdout, label)).toBe(shown);
+	});
+
+	it("prints a tab, joiners, variation selectors, right-to-left text and combining marks exactly as published", async () => {
+		const text = `tab${TAB}here 👩${ZWJ}💻 heart❤${VS16} שלום مرحبا e${COMBINING_ACUTE}`;
+		const { npub } = await publishCard(
+			{ ...PLAIN_CARD, org: text, capabilities: [text, "x"], version: text },
+			[`wss://${text}.example`],
+		);
+
+		const run = await agx("card", npub);
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(run.stdout).not.toContain(R);
+		const lines = run.stdout.split("\n");
+		expect(lines).toContain(`Agent Card — ${text}`);
+		expect(field(run.stdout, "capabilities")).toBe(`${text}, x`);
+		expect(field(run.stdout, "card version")).toBe(text);
+		expect(lines).toContain(`  wss://${text}.example`);
+	});
+
 	it("prints the raw event as JSON, unchanged", async () => {
 		const { npub, event } = await publishCard(PLAIN_CARD);
 
@@ -331,5 +412,81 @@ describe("agx card, with ordinary text", () => {
 
 		expect(run.code, run.stderr).toBe(0);
 		expect(run.stdout).toContain(`Raw event\n${JSON.stringify(event, null, 2)}\n`);
+	});
+});
+
+// The verdict words are coloured at a terminal. Only the card's own text is cleaned, so the colour
+// codes around the words must come through untouched.
+describe("agx card --verify, with colour on", () => {
+	const VERDICTS = [
+		{
+			name: "verified",
+			card: { nip05: "bob@example.com" },
+			answer: (author: string): string | null => author,
+			line: () => `  ${kleur.green("VERIFIED")}  bob@example.com  —  example.com vouches for this key`,
+		},
+		{
+			name: "not a valid identifier",
+			card: { nip05: `ceo${ESC}[1A${ESC}[2K@evil.example` },
+			answer: (): string | null => null,
+			line: () => `  ${kleur.red("IMPOSTOR")}  "ceo${R}[1A${R}[2K@evil.example" is not a valid name@domain identifier`,
+		},
+		{
+			name: "unreachable",
+			card: { nip05: "bob@example.com" },
+			answer: (): string | null => null,
+			line: () => `  ${kleur.yellow("UNVERIFIED")}  example.com did not serve a usable mapping for "bob"`,
+		},
+		{
+			name: "no handle",
+			card: { nip05: null },
+			answer: (): string | null => null,
+			line: () => `  ${kleur.dim("—")}  the card claims no NIP-05 handle`,
+		},
+	];
+
+	it.each(VERDICTS)("prints the $name verdict line with its colour codes", async ({ card, answer, line }) => {
+		const { npub, event } = await publishCard({ ...PLAIN_CARD, ...card });
+		lookup.answer = answer(event.pubkey);
+		const colourWas = kleur.enabled;
+		kleur.enabled = true;
+		try {
+			const run = await agx("card", npub, "--verify");
+
+			expect(run.code, run.stderr).toBe(0);
+			expect(run.stdout.split("\n")).toContain(line());
+		} finally {
+			kleur.enabled = colourWas;
+		}
+	});
+});
+
+// The real parser accepts only letters, digits and a few marks in a name and a domain, so a name or a
+// domain with a control character cannot reach these lines today. The answers here come from a stand-in
+// for the parser, so the lines are checked on their own and do not depend on it staying that strict.
+describe("agx card --verify, when the parsed name and domain hold control characters", () => {
+	it("prints the UNVERIFIED line with control characters replaced", async () => {
+		const { npub } = await publishCard({ ...PLAIN_CARD, nip05: "bob@example.com" });
+		lookup.parsed = { name: `bo${ESC}[2Jb`, domain: `exa${ESC}]0;x${BEL}mple.com` };
+
+		const run = await agx("card", npub, "--verify");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(strayControls(run.stdout)).toEqual([]);
+		expect(run.stdout.split("\n")).toContain(
+			`  UNVERIFIED  exa${R}]0;x${R}mple.com did not serve a usable mapping for "bo${R}[2Jb"`,
+		);
+	});
+
+	it("prints the VERIFIED line with control characters replaced", async () => {
+		const { npub, event } = await publishCard({ ...PLAIN_CARD, nip05: `bob@exa${ESC}[2Jmple.com` });
+		lookup.parsed = { name: "bob", domain: `exa${ESC}[2Jmple.com` };
+		lookup.answer = event.pubkey;
+
+		const run = await agx("card", npub, "--verify");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(strayControls(run.stdout)).toEqual([]);
+		expect(run.stdout.split("\n")).toContain(`  VERIFIED  bob@exa${R}[2Jmple.com  —  exa${R}[2Jmple.com vouches for this key`);
 	});
 });
