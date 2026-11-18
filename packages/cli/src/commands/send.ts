@@ -72,7 +72,7 @@ export async function sendCommand(
 			(res.accepted ?? 0) > 0 && res.deliveredToPeer === false;
 		const detail =
 			refused.length > 0
-				? refused.map((r) => `${r.relay} (${neutralizeControls(r.error)})`).join("; ")
+				? refused.map((r) => `${neutralizeControls(r.relay)} (${neutralizeControls(r.error)})`).join("; ")
 				: (res.errors ?? []).join("; ") || "unknown error";
 		throw new AgxCliError(
 			peerRefused
@@ -103,15 +103,16 @@ export async function sendCommand(
 	// One means shorten the message or get authorized; the other means try
 	// again later.
 	//
-	// The reason is the relay's own text, so it is printed as text: control
-	// characters (an escape sequence, a line break) are replaced, not passed on
-	// to the terminal.
+	// The reason is the relay's own text, and the address can be one the
+	// recipient listed, so both are printed as text: control characters (an
+	// escape sequence, a line break) are replaced, not passed on to the terminal.
 	for (const r of res.rejected ?? []) {
+		const relay = neutralizeControls(r.relay);
 		const reason = neutralizeControls(r.error);
 		warn(
 			r.kind === "unreachable"
-				? `relay unreachable: ${r.relay} — ${reason}`
-				: `relay refused: ${r.relay} — ${reason}`,
+				? `relay unreachable: ${relay} — ${reason}`
+				: `relay refused: ${relay} — ${reason}`,
 		);
 	}
 	json({
