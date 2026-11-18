@@ -2,7 +2,7 @@ import { generateKeypair, toNpub } from "@nostr-agx/nostr";
 import kleur from "kleur";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { updateProfile } from "../lib/config.js";
-import { setCredential } from "../lib/credentials.js";
+import { getCredential, setCredential } from "../lib/credentials.js";
 import { agx, fakeClock, jsonDocuments, sandbox, useClock } from "../test/helpers.js";
 import { CONTRACT, type MockIndexServer, startMockIndexServer } from "../test/mock-index-server.js";
 import { renderListingRows } from "./listing.js";
@@ -17,6 +17,11 @@ const LF = String.fromCharCode(0x0a);
 const DEL = String.fromCharCode(0x7f);
 const CSI = String.fromCharCode(0x9b);
 const LS = String.fromCharCode(0x2028);
+const TAB = String.fromCharCode(0x09);
+/** Characters that are not control characters and must reach the terminal as they were sent. */
+const ZWJ = String.fromCharCode(0x200d);
+const VS16 = String.fromCharCode(0xfe0f);
+const COMBINING_ACUTE = String.fromCharCode(0x0301);
 /** What each control character is printed as. */
 const R = String.fromCharCode(0xfffd);
 
@@ -154,6 +159,12 @@ describe("the rows agx search and agx listing build", () => {
 				"—",
 				`invoice${R}[1;31m.parse,pay${R}PAID`,
 			],
+		]);
+	});
+
+	it("replace control characters in a verified handle as well, and add no note to it", () => {
+		expect(renderListingRows([{ ...ODD_LISTING, verified: true }])).toEqual([
+			[SHOWN.displayName, `npub1${R}[31mqq…qqqq`, SHOWN.handle, "yes", `invoice${R}[1;31m.parse,pay${R}PAID`],
 		]);
 	});
 
@@ -451,5 +462,286 @@ describe("agx search and agx listing, with ordinary text", () => {
 		expect(field(run.stdout, "source")).toBe("team");
 		expect(field(run.stdout, "capabilities")).toBe("invoice.review, ñandú.résumé");
 		expect(run.stdout.split("\n")).toContain("· Listings are born as drafts. Publish it with:  agx listing publish l_7");
+	});
+});
+
+describe("agx search and agx listing, when a number or a flag in the answer holds control characters", () => {
+	it("agx search prints the total on its heading line with control characters replaced", async () => {
+		answer("agentIndex/searchListings", { listings: [CLEAN_LISTING], total: `1${ESC}[2J${LF}FORGED` });
+
+		const run = await agx("search");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(strayControls(run.stdout)).toEqual([]);
+		expect(run.stdout.split("\n")).toContain(`1${R}[2J${R}FORGED results — searching as "acme-robotics"`);
+	});
+
+	it("agx listing set-policy prints the policy flag and the daily cap with control characters replaced", async () => {
+		answer("agentIndex/updateListing", {
+			...ODD_LISTING,
+			autoAllowContact: `true${LF}  dailyCap         999`,
+			autoAllowCapabilities: ["pay"],
+			autoAllowDailyCap: `5${ESC}[2K`,
+		});
+
+		const run = await agx("listing", "set-policy", "l_9", "--auto-allow", "--capability", "pay");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(strayControls(run.stdout)).toEqual([]);
+		expect(field(run.stdout, "autoAllowContact")).toBe(`true${R}  dailyCap         999`);
+		expect(field(run.stdout, "dailyCap")).toBe(`5${R}[2K`);
+		expect(run.stdout.split("\n").filter((l) => l.startsWith("  dailyCap"))).toHaveLength(1);
+	});
+
+	it("agx search and agx listing list print the organization on one heading line with control characters replaced", async () => {
+		const slug = `acme${ESC}[2J${LF}FORGED`;
+		const stored = getCredential("default");
+		if (!stored) {
+			throw new Error("the test credential is missing");
+		}
+		setCredential("default", { ...stored, organization: { id: "org_test", name: "Test organization", slug } });
+		updateProfile("default", { orgSlug: slug });
+		answer("agentIndex/searchListings", { listings: [], total: 0 });
+
+		const search = await agx("search");
+		const list = await agx("listing", "list");
+
+		for (const run of [search, list]) {
+			expect(run.code, run.stderr).toBe(0);
+			expect(strayControls(run.stdout)).toEqual([]);
+		}
+		expect(search.stdout.split("\n")).toContain(`0 results — searching as "acme${R}[2J${R}FORGED"`);
+		expect(list.stdout.split("\n")).toContain(`listings owned by "acme${R}[2J${R}FORGED"`);
+	});
+
+	it("agx search --json keeps a total that holds control characters as the index sent it", async () => {
+		const total = `1${ESC}[2J${LF}FORGED`;
+		answer("agentIndex/searchListings", { listings: [CLEAN_LISTING], total });
+
+		const run = await agx("search", "--json");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(strayControls(run.stdout)).toEqual([]);
+		expect(lastJson(run.stdout)).toEqual({ listings: [CLEAN_LISTING], total });
+	});
+
+	it("agx listing set-policy --json keeps the flag and the cap as the index sent them", async () => {
+		const reply = {
+			...ODD_LISTING,
+			autoAllowContact: `true${LF}  dailyCap         999`,
+			autoAllowCapabilities: ["pay"],
+			autoAllowDailyCap: `5${ESC}[2K`,
+		};
+		answer("agentIndex/updateListing", reply);
+
+		const run = await agx("listing", "set-policy", "l_9", "--auto-allow", "--capability", "pay", "--json");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(strayControls(run.stdout)).toEqual([]);
+		expect(lastJson(run.stdout)).toEqual(reply);
+	});
+});
+
+// The index's answer is JSON, so a field the types call a string can arrive as null, as a number or as
+// something that is not text. A line with a label shows a dash for null and a table cell stays empty,
+// as before; a number prints as that number.
+describe("agx search and agx listing, when a text field is null or is not text", () => {
+	it("agx search prints a listing with no name as an empty cell", async () => {
+		answer("agentIndex/searchListings", { listings: [{ ...CLEAN_LISTING, displayName: null }], total: 1 });
+
+		const run = await agx("search");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(tableLines(run.stdout, "NAME")[1]).toBe(
+			["    ", "npub1qqqqqqq…qqqq", "desk@example.com", "yes     ", "invoice.review,ñandú.résumé"].join("  "),
+		);
+	});
+
+	it("agx listing list prints a listing with no status as an empty cell", async () => {
+		answer("agentIndex/searchListings", { listings: [{ ...CLEAN_LISTING, status: null }], total: 1 });
+
+		const run = await agx("listing", "list");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(tableLines(run.stdout, "ID")[1]).toBe(
+			["l_7", "invoice-desk", "      ", "public    ", "invoice.review,ñandú.résumé"].join("  "),
+		);
+	});
+
+	it("agx listing get prints a field that is null as a dash", async () => {
+		answer("agentIndex/getListing", {
+			listing: { ...CLEAN_LISTING, id: null, slug: null, npub: null, status: null, visibility: null, summary: null },
+			verificationEvents: [],
+		});
+
+		const run = await agx("listing", "get", "l_7");
+
+		expect(run.code, run.stderr).toBe(0);
+		for (const label of ["id", "slug", "npub", "status", "visibility", "summary"]) {
+			expect(field(run.stdout, label), label).toBe("—");
+		}
+	});
+
+	it("agx listing get prints a field the index left out as a dash", async () => {
+		const { slug: _slug, status: _status, ...rest } = CLEAN_LISTING;
+		answer("agentIndex/getListing", { listing: rest, verificationEvents: [] });
+
+		const run = await agx("listing", "get", "l_7");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(field(run.stdout, "slug")).toBe("—");
+		expect(field(run.stdout, "status")).toBe("—");
+	});
+
+	it.each([
+		[7, "7"],
+		[0, "0"],
+		[false, "false"],
+	])("agx listing get prints a summary of %j as %s", async (summary, shown) => {
+		answer("agentIndex/getListing", { listing: { ...CLEAN_LISTING, summary }, verificationEvents: [] });
+
+		const run = await agx("listing", "get", "l_7");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(field(run.stdout, "summary")).toBe(shown);
+	});
+
+	it("agx listing get prints a handle that is a number as that number", async () => {
+		answer("agentIndex/getListing", { listing: { ...CLEAN_LISTING, handle: 42, verified: false }, verificationEvents: [] });
+
+		const run = await agx("listing", "get", "l_7");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(field(run.stdout, "handle")).toBe("42 (unverified)");
+	});
+
+	it("agx search prints a handle that is a number as that number", async () => {
+		answer("agentIndex/searchListings", { listings: [{ ...CLEAN_LISTING, handle: 42, verified: false }], total: 1 });
+
+		const run = await agx("search");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(tableLines(run.stdout, "NAME")[1]).toContain("  42 (unverified)  ");
+	});
+
+	it("agx listing set-policy prints a flag that is false and a cap of zero as they are", async () => {
+		answer("agentIndex/updateListing", {
+			...CLEAN_LISTING,
+			autoAllowContact: false,
+			autoAllowCapabilities: [],
+			autoAllowDailyCap: 0,
+		});
+
+		const run = await agx("listing", "set-policy", "l_7", "--no-auto-allow");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(field(run.stdout, "autoAllowContact")).toBe("false");
+		expect(field(run.stdout, "dailyCap")).toBe("0");
+	});
+
+	it("agx listing set-policy prints a flag the index left out as a dash", async () => {
+		answer("agentIndex/updateListing", { ...CLEAN_LISTING, autoAllowCapabilities: [] });
+
+		const run = await agx("listing", "set-policy", "l_7", "--no-auto-allow");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(field(run.stdout, "autoAllowContact")).toBe("—");
+		expect(field(run.stdout, "dailyCap")).toBe("—");
+	});
+
+	it("agx listing get prints an object or a list where text is expected as a fixed note, never its content", async () => {
+		answer("agentIndex/getListing", {
+			listing: { ...CLEAN_LISTING, summary: { note: `SECRET${ESC}[2J` }, status: [`listed${LF}FORGED`] },
+			verificationEvents: [],
+		});
+
+		const run = await agx("listing", "get", "l_7");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(strayControls(run.stdout)).toEqual([]);
+		expect(field(run.stdout, "summary")).toBe("[not text]");
+		expect(field(run.stdout, "status")).toBe("[not text]");
+		expect(run.stdout).not.toContain("SECRET");
+		expect(run.stdout).not.toContain("FORGED");
+	});
+});
+
+describe("agx search and agx listing get, when a verified handle holds control characters", () => {
+	const VERIFIED_ODD = { ...ODD_LISTING, verified: true };
+
+	it("agx search prints it with control characters replaced and without the unverified note", async () => {
+		answer("agentIndex/searchListings", { listings: [VERIFIED_ODD], total: 1 });
+
+		const run = await agx("search");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(strayControls(run.stdout)).toEqual([]);
+		const row = tableLines(run.stdout, "NAME")[1] ?? "";
+		expect(row).toContain(SHOWN.handle);
+		expect(row).not.toContain("(unverified)");
+	});
+
+	it("agx listing get prints it with control characters replaced and without the unverified note", async () => {
+		answer("agentIndex/getListing", { listing: VERIFIED_ODD, verificationEvents: [] });
+
+		const run = await agx("listing", "get", "l_9");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(strayControls(run.stdout)).toEqual([]);
+		expect(field(run.stdout, "handle")).toBe(SHOWN.handle);
+		expect(field(run.stdout, "verified")).toBe("yes");
+	});
+});
+
+// At a terminal the labels and the dash are dimmed. The dash that stands for an empty list or no handle
+// is plain text, the one that stands for an empty value is dimmed, and both stay as they were.
+describe("agx listing get, with colour on", () => {
+	it("prints the dash for an empty list and for no handle as plain text, and the dash for no summary dimmed", async () => {
+		answer("agentIndex/getListing", {
+			listing: { ...CLEAN_LISTING, summary: null, handle: null, capabilities: [] },
+			verificationEvents: [],
+		});
+		const colourWas = kleur.enabled;
+		kleur.enabled = true;
+		try {
+			const run = await agx("listing", "get", "l_7");
+
+			expect(run.code, run.stderr).toBe(0);
+			const lines = run.stdout.split("\n");
+			expect(lines).toContain(`  ${kleur.dim("capabilities".padEnd(16))} —`);
+			expect(lines).toContain(`  ${kleur.dim("handle".padEnd(16))} —`);
+			expect(lines).toContain(`  ${kleur.dim("summary".padEnd(16))} ${kleur.dim("—")}`);
+		} finally {
+			kleur.enabled = colourWas;
+		}
+	});
+});
+
+describe("agx search and agx listing get, with a tab, joiners, variation selectors, right-to-left text and combining marks", () => {
+	const TEXT = `tab${TAB}here 👩${ZWJ}💻 heart❤${VS16} שלום مرحبا e${COMBINING_ACUTE}`;
+	const LISTING = { ...CLEAN_LISTING, displayName: TEXT, summary: TEXT, capabilities: [TEXT] };
+
+	it("agx listing get prints them exactly as sent", async () => {
+		answer("agentIndex/getListing", { listing: LISTING, verificationEvents: [] });
+
+		const run = await agx("listing", "get", "l_7");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(run.stdout).not.toContain(R);
+		expect(run.stdout.split("\n")).toContain(TEXT);
+		expect(field(run.stdout, "summary")).toBe(TEXT);
+		expect(field(run.stdout, "capabilities")).toBe(TEXT);
+	});
+
+	it("agx search prints them exactly as sent", async () => {
+		answer("agentIndex/searchListings", { listings: [LISTING], total: 1 });
+
+		const run = await agx("search");
+
+		expect(run.code, run.stderr).toBe(0);
+		expect(run.stdout).not.toContain(R);
+		expect(tableLines(run.stdout, "NAME")[1]).toBe(
+			[TEXT, "npub1qqqqqqq…qqqq", "desk@example.com", "yes     ", TEXT].join("  "),
+		);
 	});
 });
