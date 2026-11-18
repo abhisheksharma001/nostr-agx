@@ -91,8 +91,71 @@ export function loadConfig(): AgxConfig {
 	return parsed.data;
 }
 
+/**
+ * Write `config.json`. A key this version does not know (a newer version wrote
+ * it, or someone added it by hand), at the top level or inside a profile, is
+ * written back as it was read, after the known keys. Known keys are always
+ * written from `config`.
+ */
 export function saveConfig(config: AgxConfig): void {
-	writePrivateJson(configPath(), migrateLegacyKeys(config, storedConfig()));
+	writePrivateJson(
+		configPath(),
+		withUnknownKeys(migrateLegacyKeys(config, storedConfig())),
+	);
+}
+
+const KNOWN_CONFIG_KEYS: ReadonlySet<string> = new Set(
+	Object.keys(configSchema.shape),
+);
+const KNOWN_PROFILE_KEYS: ReadonlySet<string> = new Set(
+	Object.keys(profileSchema.shape),
+);
+
+/** `value` if it is a plain JSON object, else null (an array, null, a number...). */
+function asObject(value: unknown): Record<string, unknown> | null {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: null;
+}
+
+/** `config.json` as plain JSON, or undefined if there is none or it is not JSON.
+ * Only used to find keys to keep: {@link loadConfig} is what refuses a bad file. */
+function storedJson(): unknown {
+	try {
+		return JSON.parse(readFileSync(configPath(), "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+/** The entries of `value` whose key is not in `known`, in file order. */
+function unknownKeysOf(
+	value: unknown,
+	known: ReadonlySet<string>,
+): Record<string, unknown> {
+	return Object.fromEntries(
+		Object.entries(asObject(value) ?? {}).filter(([key]) => !known.has(key)),
+	);
+}
+
+/** `config` plus the unknown keys now on disk, each on the profile (or the top
+ * level) it was read from. A profile that is not in `config` is not written. */
+function withUnknownKeys(config: AgxConfig): Record<string, unknown> {
+	const stored = asObject(storedJson());
+	const storedProfiles = asObject(stored?.profiles);
+	return {
+		...config,
+		profiles: Object.fromEntries(
+			Object.entries(config.profiles).map(([name, profile]) => [
+				name,
+				{
+					...profile,
+					...unknownKeysOf(storedProfiles?.[name], KNOWN_PROFILE_KEYS),
+				},
+			]),
+		),
+		...unknownKeysOf(stored, KNOWN_CONFIG_KEYS),
+	};
 }
 
 /** `config.json` as it is on disk right now, or null if there is none (or it
