@@ -9,6 +9,10 @@ import {
 import kleur from "kleur";
 import { effectiveProfile, resolveProfileName } from "../lib/config.js";
 import { AgxCliError, EXIT } from "../lib/errors.js";
+import {
+	neutralizeBodyControls,
+	neutralizeControls,
+} from "../lib/inbound-lines.js";
 import { heading, info, json, kv, say, warn } from "../lib/output.js";
 import { toDisplayNpub, toHexPubkey } from "../lib/peer.js";
 
@@ -111,6 +115,17 @@ interface ParsedCard {
 	version?: string;
 }
 
+/** A single-line value the card's publisher controls, safe to print: control
+ * characters (ESC among them) become U+FFFD. */
+function peerText(value: unknown): string {
+	return neutralizeControls(String(value));
+}
+
+/** A peer-controlled list on one line, or "—" when empty. */
+function peerList(values: unknown[] | undefined): string {
+	return peerText((values ?? []).join(", ")) || "—";
+}
+
 export async function cardCommand(
 	peer: string,
 	options: CardOptions,
@@ -163,14 +178,14 @@ export async function cardCommand(
 		);
 	}
 
-	heading(card.org ? `Agent Card — ${card.org}` : "Agent Card");
+	heading(card.org ? `Agent Card — ${peerText(card.org)}` : "Agent Card");
 	kv("npub", toDisplayNpub(pubkey));
-	kv("capabilities", (card.capabilities ?? []).join(", ") || "—");
-	kv("nip05 (claimed)", card.nip05 ?? null);
-	kv("relays", (card.relays ?? []).join(", ") || "—");
-	kv("payload types", (card.payloadTypes ?? []).join(", ") || "—");
-	kv("encryption", (card.encryption ?? []).join(", ") || "—");
-	kv("card version", card.version ?? null);
+	kv("capabilities", peerList(card.capabilities));
+	kv("nip05 (claimed)", peerText(card.nip05 ?? ""));
+	kv("relays", peerList(card.relays));
+	kv("payload types", peerList(card.payloadTypes));
+	kv("encryption", peerList(card.encryption));
+	kv("card version", peerText(card.version ?? ""));
 	kv("event id", cardEvent.id);
 	kv("published", new Date(cardEvent.created_at * 1000).toISOString());
 	kv(
@@ -192,7 +207,7 @@ export async function cardCommand(
 		switch (verdict.kind) {
 			case "verified":
 				say(
-					`  ${kleur.green("VERIFIED")}  ${card.nip05}  —  ${verdict.detail}`,
+					`  ${kleur.green("VERIFIED")}  ${peerText(card.nip05)}  —  ${peerText(verdict.detail)}`,
 				);
 				say(
 					kleur.dim(
@@ -201,7 +216,7 @@ export async function cardCommand(
 				);
 				break;
 			case "mismatch":
-				say(`  ${kleur.red("IMPOSTOR")}  ${verdict.detail}`);
+				say(`  ${kleur.red("IMPOSTOR")}  ${peerText(verdict.detail)}`);
 				say(
 					kleur.dim(
 						"  The card claims a handle the domain does not back. Treat every claim on it as unfounded.",
@@ -209,7 +224,7 @@ export async function cardCommand(
 				);
 				break;
 			case "unreachable":
-				say(`  ${kleur.yellow("UNVERIFIED")}  ${verdict.detail}`);
+				say(`  ${kleur.yellow("UNVERIFIED")}  ${peerText(verdict.detail)}`);
 				say(
 					kleur.dim(
 						"  Verification needs a PUBLIC https host — the resolver blocks localhost and\n  private addresses with no bypass, because that guard is the control. For a\n  local run, expose your local index: cloudflared tunnel --url http://localhost:3000",
@@ -217,7 +232,7 @@ export async function cardCommand(
 				);
 				break;
 			case "none":
-				say(`  ${kleur.dim("—")}  ${verdict.detail}`);
+				say(`  ${kleur.dim("—")}  ${peerText(verdict.detail)}`);
 				break;
 		}
 	} else if (card.nip05) {
@@ -235,7 +250,7 @@ export async function cardCommand(
 		say("");
 		heading("Relay list (NIP-65)");
 		for (const url of advertised) {
-			say(`  ${url}`);
+			say(`  ${peerText(url)}`);
 		}
 		if (
 			advertised.some((u) => /^wss?:\/\/(localhost|127\.0\.0\.1)/.test(u))
@@ -250,7 +265,7 @@ export async function cardCommand(
 	if (options.raw) {
 		say("");
 		heading("Raw event");
-		say(JSON.stringify(cardEvent, null, 2));
+		say(neutralizeBodyControls(JSON.stringify(cardEvent, null, 2)));
 	}
 
 	say("");
