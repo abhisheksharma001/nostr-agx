@@ -13,7 +13,7 @@ import { renderMessageLines } from "./threads.js";
  * may be a secret key pasted in by mistake, and a parse error can quote the file.
  */
 export const ALLOWLIST_UNREADABLE =
-	"The allowlist cannot be read, so nobody is authorised and every sender is held until it is fixed. Run `agx doctor --local` to see which entry is wrong.";
+	"The allowlist cannot be read, so nobody is authorised and every sender's messages are held. They stay held after it is fixed: release a sender with `agx held allow <npub>`. Run `agx doctor --local` to see which entry is wrong.";
 
 export const INBOX_SCHEMA = "agx.inbox/1";
 export const INBOX_SUMMARY_SCHEMA = "agx.inbox.summary/1";
