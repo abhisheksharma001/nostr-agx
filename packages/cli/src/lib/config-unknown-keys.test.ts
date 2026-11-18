@@ -1,9 +1,9 @@
-import { chmodSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { agx, sandbox } from "../test/helpers.js";
 import { configSchema, getProfile, saveConfig, updateProfile } from "./config.js";
-import { EXIT } from "./errors.js";
+import { AgxCliError, EXIT } from "./errors.js";
 
 /**
  * `config.json` can carry keys this version does not know (a newer version
@@ -243,5 +243,45 @@ describe("saveConfig when the file on disk is not what was read", () => {
 		writeRaw("{ not json");
 		saveConfig(known(["ws://127.0.0.1:9"]));
 		expect(text()).toBe(expected(["ws://127.0.0.1:9"]));
+	});
+});
+
+describe("a value nested too deeply to write back", () => {
+	/** A valid file whose unknown `deep` value is `depth` arrays inside each other. */
+	const deepFile = (depth: number) =>
+		`{"version":1,"currentProfile":"alpha","deep":${"[".repeat(depth)}${"]".repeat(depth)},"profiles":{"alpha":{"orgSlug":"acme"}}}\n`;
+
+	it("is refused with exit 3, the message does not show it, and the file is left as it was", async () => {
+		const content = deepFile(100_000);
+		writeRaw(content);
+		const run = await agx("config", "set", "relays", "ws://127.0.0.1:9");
+		expect(run.code).toBe(EXIT.config);
+		expect(run.stderr).toMatch(/nested too deeply/);
+		expect(run.stderr).not.toMatch(/call stack/i);
+		expect(run.stderr).not.toContain("[[[[");
+		expect(text()).toBe(content);
+	});
+
+	it("a command that does not save still works on that file", async () => {
+		writeRaw(deepFile(100_000));
+		expect((await agx("config", "show")).code).toBe(EXIT.ok);
+	});
+
+	it("a value 6000 levels deep is still kept", async () => {
+		writeRaw(deepFile(6000));
+		expect((await agx("config", "set", "relays", "ws://127.0.0.1:9")).code).toBe(EXIT.ok);
+		expect(JSON.stringify(readConfig().deep)).toBe(`${"[".repeat(6000)}${"]".repeat(6000)}`);
+	});
+
+	it("a write failure that is not about depth is not reworded", () => {
+		mkdirSync(file());
+		let thrown: unknown;
+		try {
+			saveConfig(configSchema.parse({}));
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBeInstanceOf(Error);
+		expect(thrown).not.toBeInstanceOf(AgxCliError);
 	});
 });
