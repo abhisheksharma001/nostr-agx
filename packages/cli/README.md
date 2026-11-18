@@ -256,8 +256,11 @@ runs: it picks up the allowlist and the decision on its next poll. A kept messag
 If the saved allowlist cannot be read while `serve` runs (an entry that is not an npub or
 hex pubkey, after a hand edit), `serve` authorises nobody until it reads cleanly again: task
 requests are denied (`--allow-all` still accepts them), every sender is held with their text
-kept, and `serve` says so once.
-`agx wait` and `agx gateway` do the same. `agx doctor --local` names the bad entry by position.
+kept, and `serve` says so once. What was held stays held after the list is repaired, until you
+run `agx held allow <npub>`.
+`agx wait` holds every sender the same way. `agx gateway` holds every sender instead of adding
+them to its history, while its tasks and webhooks still follow each subscription's own `allowedPeers`.
+`agx doctor --local` names the bad entry by position.
 
 `--allowed-only` changes **printing only**. A held message is still counted and
 recorded as seen, `--reply-any` still auto-replies to it, and `--allow-all` still
