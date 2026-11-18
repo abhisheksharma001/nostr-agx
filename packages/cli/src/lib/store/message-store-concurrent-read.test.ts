@@ -320,3 +320,35 @@ describe("a reader that overlaps the writer's save of a queued mark-read, ignore
 		);
 	});
 });
+
+describe("a known limit of reading the queue before the history", () => {
+	it("a queued mark-read applied twice marks a message that arrived in the same poll, for that one read (known limit)", () => {
+		const shownAsRead: string[] = [];
+		forEveryLanding(
+			(after) => {
+				freshDir();
+				seedTwoUnreadThreads();
+				MessageStore.spool(dir, { kind: "read", contextId: "fresh" });
+				const writer = new MessageStore(dir, () => CLOCK, { claimSpool: true });
+				// The same poll: a message arrives in that thread after the writer took over the mark-read.
+				writer.addInbound(message({ id: "u2", contextId: "fresh", at: "2026-10-07T11:00:00.000Z" }));
+				return openReader(after, () => writer.flush());
+			},
+			(reader, landing) => {
+				if (reader.getThread("fresh").some((m) => m.id === "u2" && m.readAt !== null)) {
+					shownAsRead.push(landing);
+				}
+				// Whatever that one read showed, what is saved is right: "u2" is unread on disk.
+				const saved = new MessageStore(dir, () => CLOCK).getThread("fresh");
+				expect(saved.map((m) => [m.id, m.readAt !== null]), landing).toEqual([
+					["u1", true],
+					["u2", false],
+				]);
+			},
+		);
+		// A mark-read is not matched by id, so a reader that read the queued file and then a history that
+		// already holds its effect applies it again. Queueing the ids it showed would end this. When that
+		// is done this test is expected to fail: replace it with one that expects "u2" unread everywhere.
+		expect(shownAsRead.length, "no place a save can land showed the message as read").toBeGreaterThan(0);
+	});
+});
