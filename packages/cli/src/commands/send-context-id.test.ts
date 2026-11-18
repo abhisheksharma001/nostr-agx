@@ -52,7 +52,7 @@ const UNSAFE: [string, string, string][] = [
 	["a bare carriage return", "x\ry", "x�y"],
 	["a delete character", "x\u007fy", "x�y"],
 	["a C1 control (CSI)", "x\u009b2Jy", "x�2Jy"],
-	["a line separator", "x y", "x�y"],
+	["a line separator", "x\u2028y", "x�y"],
 	["a newline that starts a second line", "x\n✓ Sent to npub1elsewhere", "x�✓ Sent to npub1elsewhere"],
 ];
 
