@@ -1,4 +1,4 @@
-import { type AddressInfo, connect as netConnect, createServer, type Socket } from "node:net";
+import { type AddressInfo, connect as netConnect, createServer, Socket } from "node:net";
 import { afterAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { profileSchema } from "../lib/config.js";
@@ -63,6 +63,7 @@ const WAYS: Array<[string, (port: number) => Promise<string>]> = [
 	["ws to 127.0.0.1", (port) => dialWs(`ws://127.0.0.1:${port}`)],
 	["ws to localhost", (port) => dialWs(`ws://localhost:${port}`)],
 	["net.connect(port, host)", (port) => dialNet(netConnect(port, "127.0.0.1"))],
+	["new Socket().connect(port, host)", (port) => dialNet(new Socket().connect(port, "127.0.0.1"))],
 	["net.connect({ port })", (port) => dialNet(netConnect({ port }))],
 ];
 

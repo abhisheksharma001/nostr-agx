@@ -24,19 +24,14 @@ export function guardedPorts(): number[] {
 	return [...active].flatMap((guard) => [...guard.ports]);
 }
 
-/** Where a `socket.connect(...)` call is aimed; null for a unix socket path. */
+/** Where a `socket.connect(...)` call is aimed; null when it names no port
+ * (a unix socket path has none: its `port` reads as NaN, which is never guarded). */
 function targetOf(args: unknown[]): { host: string; port: number } | null {
 	// `net.connect()` calls `socket.connect()` with its own `[options, callback]`.
 	const first = Array.isArray(args[0]) ? args[0][0] : args[0];
 	if (typeof first === "object" && first !== null) {
-		const { host, port, path } = first as {
-			host?: string;
-			port?: number | string;
-			path?: string;
-		};
-		return path === undefined
-			? { host: host ?? "localhost", port: Number(port) }
-			: null;
+		const { host, port } = first as { host?: string; port?: number | string };
+		return { host: host ?? "localhost", port: Number(port) };
 	}
 	if (typeof first === "number" || (typeof first === "string" && /^\d+$/.test(first))) {
 		return {
