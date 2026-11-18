@@ -270,7 +270,10 @@ describe.skipIf(!existsSync(AGX))("serve while its saved allowlist cannot be rea
 		expect([...inbound()].sort()).toEqual(["m1 while healthy", "m2 while paused", "m3 while paused", "m4 sent as it stops"]);
 
 		// A serve started while the list cannot be read is paused from its first loop, and picks up
-		// from the place the last run saved once the list reads again.
+		// from the place the last run saved once the list reads again. That place is put an hour back
+		// first, so that it cannot be mistaken for "now" when the clock has not ticked over yet.
+		const saved = state();
+		writeFileSync(profileFile("state.json"), `${JSON.stringify({ ...saved, cursor: saved.cursor - 3600 })}\n`);
 		setAllowlist([JUNK]);
 		const restarted = start("--profile", PROFILE, "serve", "--no-reply", "--no-tasks", "--poll-interval", "200");
 		await until(() => times(restarted.output(), WARNING) === 1, 15_000);
@@ -294,6 +297,14 @@ describe.skipIf(!existsSync(AGX))("serve while its saved allowlist cannot be rea
 		expect.soft(times(end.stdout, WARNING)).toBe(1);
 		expect.soft(times(end.stdout, RESUMED)).toBe(1);
 		expect.soft(inboxPolls()[third.polls]?.[0]?.since).toBe(third.cursor - LOOKBACK_SEC);
+		// That poll reads the hour again, and nothing that was delivered before comes twice.
+		expect.soft([...inbound()].sort()).toEqual([
+			"m1 while healthy",
+			"m2 while paused",
+			"m3 while paused",
+			"m4 sent as it stops",
+			"m5 sent to a serve that started paused",
+		]);
 		expect.soft(`${end.stdout}${end.stderr}`).not.toContain(JUNK);
 	}, 240_000);
 });
