@@ -13,6 +13,7 @@ import {
 	usageError,
 } from "../lib/errors.js";
 import { loadIdentityFile } from "../lib/identity.js";
+import { neutralizeControls } from "../lib/inbound-lines.js";
 import {
 	heading,
 	info,
@@ -126,9 +127,8 @@ function resolveListingId(
  */
 function renderHandle(listing: PublicListing): string {
 	if (listing.handle) {
-		return listing.verified
-			? listing.handle
-			: `${listing.handle} (unverified)`;
+		const handle = neutralizeControls(listing.handle);
+		return listing.verified ? handle : `${handle} (unverified)`;
 	}
 	return "—";
 }
@@ -216,19 +216,22 @@ export async function listingCreateCommand(
 		});
 	}
 
-	ok(`Created listing ${listing.id}`);
-	kv("slug", listing.slug);
-	kv("source", listing.source);
-	kv("status", listing.status);
-	kv("visibility", listing.visibility);
-	kv("capabilities", listing.capabilities.join(", ") || "—");
+	ok(`Created listing ${neutralizeControls(listing.id)}`);
+	kv("slug", neutralizeControls(listing.slug));
+	kv("source", neutralizeControls(listing.source));
+	kv("status", neutralizeControls(listing.status));
+	kv("visibility", neutralizeControls(listing.visibility));
+	kv(
+		"capabilities",
+		neutralizeControls(listing.capabilities.join(", ")) || "—",
+	);
 	if (options.pubkey) {
 		// The server's answer, as `agx register` prints it, not the local list.
-		kv("relays", listing.relays.join(", ") || "—");
+		kv("relays", neutralizeControls(listing.relays.join(", ")) || "—");
 	}
 	say("");
 	info(
-		`Listings are born as drafts. Publish it with:  agx listing publish ${listing.id}`,
+		`Listings are born as drafts. Publish it with:  agx listing publish ${neutralizeControls(listing.id)}`,
 	);
 	if (listing.capabilities.length === 0) {
 		warn(
@@ -296,11 +299,11 @@ export async function listingListCommand(
 	heading(`listings owned by "${creds.orgSlug}"`);
 	table(
 		result.listings.map((l) => [
-			l.id,
-			l.slug,
-			l.status,
-			l.visibility,
-			l.capabilities.join(","),
+			neutralizeControls(l.id),
+			neutralizeControls(l.slug),
+			neutralizeControls(l.status),
+			neutralizeControls(l.visibility),
+			neutralizeControls(l.capabilities.join(",")),
 		]),
 		["ID", "SLUG", "STATUS", "VISIBILITY", "CAPABILITIES"],
 	);
@@ -323,19 +326,19 @@ export async function listingGetCommand(
 		throw toCliError(error, "getListing", creds.baseUrl);
 	}
 	const l = result.listing;
-	heading(l.displayName);
-	kv("id", l.id);
-	kv("slug", l.slug);
-	kv("npub", l.npub);
+	heading(neutralizeControls(l.displayName));
+	kv("id", neutralizeControls(l.id));
+	kv("slug", neutralizeControls(l.slug));
+	kv("npub", neutralizeControls(l.npub));
 	kv("handle", renderHandle(l));
 	kv("verified", l.verified ? "yes" : "no");
-	kv("status", l.status);
-	kv("visibility", l.visibility);
-	kv("capabilities", l.capabilities.join(", ") || "—");
-	kv("summary", l.summary ?? null);
+	kv("status", neutralizeControls(l.status));
+	kv("visibility", neutralizeControls(l.visibility));
+	kv("capabilities", neutralizeControls(l.capabilities.join(", ")) || "—");
+	kv("summary", neutralizeControls(l.summary ?? ""));
 	if (l.status === "listed" && l.visibility !== "public") {
 		warn(
-			`Listed, but visibility is "${l.visibility}" — directory search returns public entries only, so nobody else can find it.`,
+			`Listed, but visibility is "${neutralizeControls(l.visibility)}" — directory search returns public entries only, so nobody else can find it.`,
 		);
 	}
 	json(result);
@@ -390,9 +393,12 @@ export async function listingPublishCommand(
 		throw cli;
 	}
 
-	ok(`Listing is now "${result.listing.status}".`);
-	kv("visibility", result.listing.visibility);
-	kv("capabilities", result.listing.capabilities.join(", ") || "—");
+	ok(`Listing is now "${neutralizeControls(result.listing.status)}".`);
+	kv("visibility", neutralizeControls(result.listing.visibility));
+	kv(
+		"capabilities",
+		neutralizeControls(result.listing.capabilities.join(", ")) || "—",
+	);
 
 	// An EXTERNAL listing has no server-signed Agent Card — the index never holds
 	// its key. Reporting "card published" here would be a lie.
@@ -418,7 +424,7 @@ export async function listingPublishCommand(
 	}
 	if (result.listing.visibility !== "public") {
 		warn(
-			`Visibility is "${result.listing.visibility}" — a directory search returns only public + listed entries, so other organizations still cannot find it.`,
+			`Visibility is "${neutralizeControls(result.listing.visibility)}" — a directory search returns only public + listed entries, so other organizations still cannot find it.`,
 		);
 		say(kleur.dim("  agx listing set-visibility public"));
 	}
@@ -465,7 +471,10 @@ async function waitUntilPublic(
 		if (listing.status === "listed" && listing.visibility === "public") {
 			ok("The listing is public and listed.");
 			kv("visibility", listing.visibility);
-			kv("capabilities", listing.capabilities.join(", ") || "—");
+			kv(
+				"capabilities",
+				neutralizeControls(listing.capabilities.join(", ")) || "—",
+			);
 			json({ listing, confirmed: true });
 			return;
 		}
@@ -495,7 +504,7 @@ export async function listingSetVisibilityCommand(
 	} catch (error) {
 		throw toCliError(error, "updateListing", creds.baseUrl);
 	}
-	ok(`Visibility is now "${result.visibility}".`);
+	ok(`Visibility is now "${neutralizeControls(result.visibility)}".`);
 	reportRetraction(result.cardRetractionRequested);
 	json(result);
 }
@@ -515,7 +524,7 @@ export async function listingDelistCommand(
 	} catch (error) {
 		throw toCliError(error, "delistListing", creds.baseUrl);
 	}
-	ok(`Listing is now "${result.listing.status}".`);
+	ok(`Listing is now "${neutralizeControls(result.listing.status)}".`);
 	reportRetraction(result.cardRetractionRequested);
 	json(result);
 }
@@ -579,7 +588,10 @@ export async function listingSetPolicyCommand(
 	}
 	ok("Auto-allow policy updated.");
 	kv("autoAllowContact", String(result.autoAllowContact));
-	kv("capabilities", (result.autoAllowCapabilities ?? []).join(", ") || "—");
+	kv(
+		"capabilities",
+		neutralizeControls((result.autoAllowCapabilities ?? []).join(", ")) || "—",
+	);
 	kv("dailyCap", result.autoAllowDailyCap ?? null);
 	if (
 		result.autoAllowContact &&
@@ -607,10 +619,10 @@ function reportRetraction(requested: boolean | undefined): void {
 
 export function renderListingRows(listings: PublicListing[]): string[][] {
 	return listings.map((l) => [
-		l.displayName,
-		shortNpub(l.npub),
+		neutralizeControls(l.displayName),
+		neutralizeControls(shortNpub(l.npub)),
 		renderHandle(l),
 		l.verified ? "yes" : "—",
-		l.capabilities.join(","),
+		neutralizeControls(l.capabilities.join(",")),
 	]);
 }
