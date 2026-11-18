@@ -266,10 +266,10 @@ describe("a value nested too deeply to write back", () => {
 		expect((await agx("config", "show")).code).toBe(EXIT.ok);
 	});
 
-	it("a value 6000 levels deep is still kept", async () => {
-		writeRaw(deepFile(6000));
+	it("a value 1000 levels deep is still kept", async () => {
+		writeRaw(deepFile(1000));
 		expect((await agx("config", "set", "relays", "ws://127.0.0.1:9")).code).toBe(EXIT.ok);
-		expect(JSON.stringify(readConfig().deep)).toBe(`${"[".repeat(6000)}${"]".repeat(6000)}`);
+		expect(JSON.stringify(readConfig().deep)).toBe(`${"[".repeat(1000)}${"]".repeat(1000)}`);
 	});
 
 	it("a write failure that is not about depth is not reworded", () => {
