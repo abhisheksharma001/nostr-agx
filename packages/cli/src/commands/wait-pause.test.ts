@@ -460,6 +460,27 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 		expect.soft(report(run)).toMatchObject({ timedOut: true, truncated: true, relays: [{ url: "ws://127.0.0.1:1", status: "unreachable" }] });
 	});
 
+	it("still exits 5 when the list broke and was repaired and no relay answered at any point", async () => {
+		const pair = await allowedPair();
+		updateProfile("receiver", { relays: ["ws://127.0.0.1:1"] });
+		onEverySleep((n) => {
+			if (n === 1) {
+				updateProfile("receiver", { allow: [...pair.named, JUNK] });
+			}
+			if (n === 3) {
+				updateProfile("receiver", { allow: pair.named });
+			}
+		});
+
+		const run = await startWait({ profile: "receiver", timeout: "1" }).done;
+
+		// Only a wait that ends paused takes the list's code. A repaired list leaves the relays to decide,
+		// and a turn that did not poll must not count as a relay answering.
+		expect.soft(times(run.stderr, RESUMED)).toBe(1);
+		expect.soft(run.code).toBe(EXIT.network);
+		expect.soft(report(run)).toMatchObject({ relays: [{ url: "ws://127.0.0.1:1", status: "unreachable" }] });
+	});
+
 	it("is an ordinary quiet timeout when the list was repaired before the deadline and nothing came", async () => {
 		const pair = await allowedPair();
 		onEverySleep((n) => {
