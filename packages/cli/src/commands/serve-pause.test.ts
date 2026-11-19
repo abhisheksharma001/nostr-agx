@@ -562,6 +562,22 @@ describe("a running agx serve whose saved allowlist breaks and is repaired", () 
 
 		expect(inboxTexts()).toEqual(["sent after the repair"]);
 	});
+
+	it("still applies what other commands queued while the list cannot be read", async () => {
+		const decided = createIdentity().npub;
+		const serve = startServe();
+		await serve.until("serve to start", () => serve.output().includes("watching for messages"));
+
+		updateProfile("default", { allow: [ally.publicKey, JUNK] });
+		await serve.until("the pause", () => serve.output().includes(PAUSED));
+		// What `agx held ignore` leaves for the process that holds the profile lock, which is this serve.
+		MessageStore.spool(profileDir("default"), { kind: "decision", action: "ignore", npub: decided });
+		await serve.until("the queued decision to be applied", () => stored().heldStatus(decided) === "ignored");
+		await serve.stop();
+
+		// The list was never repaired: it was applied while paused.
+		expect(times(serve.output(), RESUMED)).toBe(0);
+	});
 });
 
 describe("agx serve when the saved allowlist reads cleanly", () => {
