@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { DEFAULT_CONTENT_TYPE, DEFAULT_POLL_OVERLAP_SEC } from "@nostr-agx/core";
 import { MAX_WRAP_BACKDATE_SEC } from "@nostr-agx/nostr";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +7,7 @@ import { EXIT } from "../lib/errors.js";
 import { loadIdentity } from "../lib/identity.js";
 import { INBOX_SUMMARY_SCHEMA, type InboxReport, type InboxSummary } from "../lib/inbox.js";
 import { setJsonMode } from "../lib/output.js";
-import { profileDir, seenPath } from "../lib/paths.js";
+import { configPath, profileDir, seenPath } from "../lib/paths.js";
 import { toHexPubkey } from "../lib/peer.js";
 import { setRuntimeForTests } from "../lib/runtime.js";
 import { loadState, updateState } from "../lib/state.js";
@@ -158,11 +158,12 @@ function onEverySleep(hook: (n: number) => void | Promise<void>): void {
 	});
 }
 
-function startWait(options: { profile: string; timeout: string; summary?: boolean }) {
+function startWait(options: { profile: string; timeout: string; summary?: boolean; json?: boolean }) {
 	const controller = new AbortController();
 	controllers.push(controller);
-	setJsonMode(true);
-	const done = capture(() => waitCommand({ ...options, signal: controller.signal })).then((result) => {
+	setJsonMode(options.json ?? true);
+	const { json: _json, ...waitOptions } = options;
+	const done = capture(() => waitCommand({ ...waitOptions, signal: controller.signal })).then((result) => {
 		const code = Number(process.exitCode ?? EXIT.ok);
 		process.exitCode = undefined;
 		return { ...result, code };
@@ -175,15 +176,18 @@ function report(run: { stdout: string }): InboxReport & { timedOut: boolean } {
 	return jsonDocuments(run.stdout).at(-1) as InboxReport & { timedOut: boolean };
 }
 
-function summary(run: { stdout: string }): InboxSummary & { timedOut: boolean } {
-	return jsonDocuments(run.stdout).at(-1) as InboxSummary & { timedOut: boolean };
+function summary(run: { stdout: string }): InboxSummary & { timedOut: boolean; truncated: boolean } {
+	return jsonDocuments(run.stdout).at(-1) as InboxSummary & { timedOut: boolean; truncated: boolean };
 }
+
+/** What `agx wait` does when it starts with the list as it is saved now. */
+const startedNow = (timeout = "1") => agx("--profile", "receiver", "wait", "--timeout", timeout);
 
 const times = (text: string, part: string): number => text.split(part).length - 1;
 const receiverStore = () => new MessageStore(profileDir("receiver"));
 
 describe("agx wait while the saved allowlist cannot be read", () => {
-	it("asks the relays for nothing and waits out --timeout with the normal result", async () => {
+	it("asks the relays for nothing and waits out --timeout, then reports that nothing was fetched", async () => {
 		const pair = await allowedPair();
 		await publish("sender", pair.receiver, "sent while paused");
 		// The list breaks while it still names the sender, before the first poll: every turn is paused.
@@ -197,11 +201,12 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 		const run = await startWait({ profile: "receiver", timeout: "1", summary: true }).done;
 
 		expect.soft(turns).toBeGreaterThan(3);
-		expect.soft(run.code).toBe(EXIT.ok);
-		expect.soft(summary(run)).toMatchObject({ schema: INBOX_SUMMARY_SCHEMA, new: 0, held: 0, timedOut: true });
+		// A wait that never polled is not a quiet one: the batch is not whole, and it fails as at start-up.
+		expect.soft(run.code).toBe(EXIT.usage);
+		expect.soft(summary(run)).toMatchObject({ schema: INBOX_SUMMARY_SCHEMA, new: 0, held: 0, timedOut: true, truncated: true });
 		expect.soft(inboxPolls()).toHaveLength(0);
 		expect.soft(times(run.stderr, WARNING)).toBe(1);
-		// It ended the normal way, but it has not polled: the write at the end records no poll.
+		// It has not polled: the write at the end records no poll.
 		expect.soft(loadState("receiver").lastPumpAt).toBeNull();
 	});
 
@@ -377,14 +382,116 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 
 		const run = await startWait({ profile: "receiver", timeout: "1" }).done;
 
-		// No poll, no stored mail, and still the normal timeout result: the relays did answer the probe.
+		// No poll, no stored mail, and a result that says so: the relays did answer the probe, but nothing was fetched.
 		expect.soft(inboxPolls()).toHaveLength(0);
-		expect.soft(run.code).toBe(EXIT.ok);
-		expect.soft(report(run)).toMatchObject({ timedOut: true, messages: [], truncated: false });
+		expect.soft(run.code).toBe(EXIT.usage);
+		expect.soft(report(run)).toMatchObject({ timedOut: true, messages: [], truncated: true });
 		expect.soft(times(run.stderr, WARNING)).toBe(1);
 		expect.soft(run.stderr).toContain(PAUSED);
 		expect.soft(loadState("receiver").cursor).toBe(STALE_CURSOR);
 		expect.soft(loadState("receiver").lastPumpAt).toBeNull();
+	});
+
+	it("reports a wait that ends with the list still unreadable as incomplete, and exits as a wait started with that list does", async () => {
+		const pair = await allowedPair();
+		await publish("sender", pair.receiver, "sent while paused");
+		seam.beforeTransport = () => updateProfile("receiver", { allow: [...pair.named, JUNK] });
+		onEverySleep(() => undefined);
+
+		const run = await startWait({ profile: "receiver", timeout: "1" }).done;
+		const atStart = await startedNow();
+
+		// The code is whatever a wait gives when it starts with this list, so a script has one thing to handle.
+		expect(atStart.code).toBe(EXIT.usage);
+		expect.soft(run.code).toBe(atStart.code);
+		expect.soft(report(run)).toMatchObject({ timedOut: true, truncated: true, messages: [], held: [], receipts: [] });
+		expect.soft(times(run.stderr, WARNING)).toBe(1);
+	});
+
+	it("carries the same in --summary --json: the field is there, and the exit code", async () => {
+		const pair = await allowedPair();
+		seam.beforeTransport = () => updateProfile("receiver", { allow: [...pair.named, JUNK] });
+		onEverySleep(() => undefined);
+
+		const run = await startWait({ profile: "receiver", timeout: "1", summary: true }).done;
+
+		expect.soft(run.code).toBe(EXIT.usage);
+		expect.soft(summary(run)).toMatchObject({ schema: INBOX_SUMMARY_SCHEMA, new: 0, unread: 0, held: 0, timedOut: true, truncated: true });
+	});
+
+	it("exits with that code in the human output too, which still ends with the usual line", async () => {
+		const pair = await allowedPair();
+		seam.beforeTransport = () => updateProfile("receiver", { allow: [...pair.named, JUNK] });
+		onEverySleep(() => undefined);
+
+		const run = await startWait({ profile: "receiver", timeout: "1", json: false }).done;
+
+		expect.soft(run.code).toBe(EXIT.usage);
+		expect.soft(run.stdout).toContain("0 new · 0 unread · 0 held · timed out");
+		expect.soft(run.stderr).toContain(PAUSED);
+	});
+
+	it("exits with the code of a config.json that cannot be read when that is what paused it", async () => {
+		await allowedPair();
+		seam.beforeTransport = () => writeFileSync(configPath(), '{"version":1,"currentProfile":');
+		onEverySleep(() => undefined);
+
+		const run = await startWait({ profile: "receiver", timeout: "1" }).done;
+		const atStart = await startedNow();
+
+		expect(atStart.code).toBe(EXIT.config);
+		expect.soft(run.code).toBe(atStart.code);
+		expect.soft(report(run)).toMatchObject({ timedOut: true, truncated: true, messages: [] });
+		expect.soft(times(run.stderr, WARNING)).toBe(1);
+	});
+
+	it("exits with the list's code, not the relays', when no relay answered either", async () => {
+		const pair = await allowedPair();
+		updateProfile("receiver", { relays: ["ws://127.0.0.1:1"] });
+		seam.beforeTransport = () => updateProfile("receiver", { allow: [...pair.named, JUNK] });
+		onEverySleep(() => undefined);
+
+		const run = await startWait({ profile: "receiver", timeout: "1" }).done;
+
+		// The list is the thing to fix first; the report still shows that the relay did not answer.
+		expect.soft(run.code).toBe(EXIT.usage);
+		expect.soft(report(run)).toMatchObject({ timedOut: true, truncated: true, relays: [{ url: "ws://127.0.0.1:1", status: "unreachable" }] });
+	});
+
+	it("is an ordinary quiet timeout when the list was repaired before the deadline and nothing came", async () => {
+		const pair = await allowedPair();
+		onEverySleep((n) => {
+			if (n === 1) {
+				updateProfile("receiver", { allow: [...pair.named, JUNK] });
+			}
+			if (n === 3) {
+				updateProfile("receiver", { allow: pair.named });
+			}
+		});
+
+		const run = await startWait({ profile: "receiver", timeout: "1" }).done;
+
+		expect.soft(times(run.stderr, WARNING)).toBe(1);
+		expect.soft(times(run.stderr, RESUMED)).toBe(1);
+		expect.soft(run.code).toBe(EXIT.ok);
+		expect.soft(report(run)).toMatchObject({ timedOut: true, truncated: false, messages: [] });
+	});
+
+	it("is an ordinary quiet timeout in --summary --json too, with the field saying so", async () => {
+		const pair = await allowedPair();
+		onEverySleep((n) => {
+			if (n === 1) {
+				updateProfile("receiver", { allow: [...pair.named, JUNK] });
+			}
+			if (n === 3) {
+				updateProfile("receiver", { allow: pair.named });
+			}
+		});
+
+		const run = await startWait({ profile: "receiver", timeout: "1", summary: true }).done;
+
+		expect.soft(run.code).toBe(EXIT.ok);
+		expect.soft(summary(run)).toMatchObject({ timedOut: true, truncated: false });
 	});
 
 	it("resumes from the cursor it had when it was paused from the first turn", async () => {
