@@ -1,7 +1,7 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { AgxClient, DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
-import { hexToBytes, localSigner, NostrTransport } from "@nostr-agx/nostr";
+import { AgxClient, DEFAULT_CONTENT_TYPE, DEFAULT_POLL_OVERLAP_SEC } from "@nostr-agx/core";
+import { hexToBytes, localSigner, MAX_WRAP_BACKDATE_SEC, NostrTransport } from "@nostr-agx/nostr";
 import kleur from "kleur";
 import { nip19 } from "nostr-tools";
 import WebSocket from "ws";
@@ -33,6 +33,8 @@ const WARNING = "The allowlist cannot be read";
 const GIFT_WRAP_KIND = 1059;
 /** The last poll was an hour ago. A poll that runs moves this to now; a pause leaves it. */
 const STALE_CURSOR = Math.floor(Date.now() / 1000) - 3600;
+/** How far before its place in the inbox a poll asks: the overlap, plus the most a gift wrap's time may be set back. */
+const LOOKBACK_SEC = DEFAULT_POLL_OVERLAP_SEC + MAX_WRAP_BACKDATE_SEC;
 
 type Filters = Parameters<NonNullable<RelayOptions["onRequest"]>>[0];
 
@@ -561,6 +563,25 @@ describe("a running agx serve whose saved allowlist breaks and is repaired", () 
 		await serve.stop();
 
 		expect(inboxTexts()).toEqual(["sent after the repair"]);
+		// A serve that started paused asks from the place it saved, not from the time it started.
+		expect(inboxPolls()[0]?.[0]?.since).toBe(now - 10 * day - LOOKBACK_SEC);
+	});
+
+	it("says so again, and only once more, when the list breaks again after it was repaired", async () => {
+		const serve = startServe();
+		await serve.until("serve to start", () => serve.output().includes("watching for messages"));
+
+		updateProfile("default", { allow: [ally.publicKey, JUNK] });
+		await serve.until("the first warning", () => times(serve.output(), WARNING) === 1);
+		updateProfile("default", { allow: [ally.publicKey] });
+		await serve.until("the repair", () => serve.output().includes(RESUMED));
+		updateProfile("default", { allow: [ally.publicKey, JUNK] });
+		await serve.until("the second warning", () => times(serve.output(), WARNING) === 2);
+		await sleepFor(300);
+		await serve.stop();
+
+		expect.soft(times(serve.output(), WARNING)).toBe(2);
+		expect.soft(times(serve.output(), RESUMED)).toBe(1);
 	});
 
 	it("still applies what other commands queued while the list cannot be read", async () => {
