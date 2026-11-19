@@ -550,6 +550,18 @@ describe("agx serve --allow-all while the saved allowlist cannot be read", () =>
 		expect(heldFrom(stranger)?.messages.map((m) => m.text)).toContain("from a stranger");
 	});
 
+	it("holds a peer given with --allow too: it is dropped with the list while the list cannot be read", async () => {
+		// Plain `serve` no longer polls, so this is the one place a peer given with --allow can still be
+		// let in while the list cannot be read. It must not be: the list's silence authorises nobody.
+		await sendMessage(stranger, "from a peer given with --allow");
+
+		await serveOnceEditing([JUNK], "--allow-all", "--allowed-only", "--allow", stranger.npub);
+
+		expect.soft(inboxPolls().length).toBeGreaterThan(0);
+		expect.soft(inboxTexts()).toEqual([]);
+		expect.soft(heldFrom(stranger)?.messages.map((m) => m.text)).toEqual(["from a peer given with --allow"]);
+	});
+
 	it("still holds a message from a peer the unreadable list names: it authorises nobody either", async () => {
 		// The saved list names the ally when serve starts; the edit that breaks it comes after.
 		await sendMessage(ally, "from a listed peer");
