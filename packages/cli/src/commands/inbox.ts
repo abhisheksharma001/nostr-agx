@@ -97,14 +97,18 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 		const allowed = new Set(profile.allow.map((entry) => toHexPubkey(entry, "allowlist entry")));
 		// True while the list cannot be read: nobody is authorised, so the loop polls nothing.
 		let paused = false;
+		// The code a wait gives when it starts with the list that cannot be read. A wait that ends
+		// still paused exits with it.
+		let unreadableExit: number = EXIT.usage;
 		function refreshAllowed(): void {
 			let current: string[];
 			try {
 				current = effectiveProfile(profileName).allow.map((entry) => toHexPubkey(entry, "allowlist entry"));
-			} catch {
+			} catch (error) {
 				// Nobody is authorised until it reads cleanly: mail waits on the relays meanwhile. On
 				// stderr, so `--json` output stays whole and the warning is not lost with it.
 				allowed.clear();
+				unreadableExit = error instanceof AgxCliError ? error.exitCode : EXIT.generic;
 				if (!paused) {
 					paused = true;
 					notice(ALLOWLIST_PAUSED);
@@ -178,7 +182,7 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 						// Nothing is fetched, so nothing is stored, held or marked seen, and the cursor stays:
 						// the first poll after the list reads again starts where the last one ended. What
 						// other commands queued is still applied. The relays are still probed below, so the
-						// result and exit code are those of a quiet wait.
+						// report shows which answered; a wait that ends still paused is reported as incomplete.
 						store.flush();
 					} else {
 						try {
@@ -263,6 +267,11 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 			return;
 		}
 
+		// A wait that ends while the list still cannot be read has fetched nothing since it broke.
+		if (paused) {
+			truncated = true;
+		}
+
 		const unreadCount = store.listMessages({ direction: "in", unreadOnly: true }).length;
 		let messages = collector.messages;
 		if (options.thread) {
@@ -298,7 +307,10 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 			}
 		}
 
-		if (control.activity ? !everRelayAnswered : summary.relays.ok === 0) {
+		if (paused) {
+			// Fails as a wait that starts with this list does, whatever the relays did.
+			process.exitCode = unreadableExit;
+		} else if (control.activity ? !everRelayAnswered : summary.relays.ok === 0) {
 			process.exitCode = EXIT.network;
 		}
 	} finally {

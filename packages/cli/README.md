@@ -261,11 +261,17 @@ cleanly. Then it picks up where it stopped, and what arrived meanwhile is read o
 repaired list decides: there is no `agx held allow` step. Mail waits on the relays for as long
 as they keep it. `serve --once` exits without polling. `--allow-all` opens tasks to everyone
 whatever the list says, so it keeps polling: tasks still run, and every sender is held with their
-text kept, until you run `agx held allow <npub>`.
-`agx wait` pauses the same way, still ends at `--timeout` with the usual result, and still
-refuses to start when the list cannot be read at the start. `agx gateway` holds every sender
-instead of adding them to its history, while its tasks and webhooks still follow each
-subscription's own `allowedPeers`.
+text kept, until you run `agx held allow <npub>`. A `config.json` that is gone (deleted, or a link
+to nothing), or a profile removed from it, reads as an empty list, not an unreadable one: `serve`
+keeps polling and holds every sender.
+`agx wait` pauses the same way and still refuses to start when the list cannot be read at the
+start. A wait that reaches `--timeout` with the list still unreadable has fetched nothing, so it
+reports `truncated: true` and exits with the code a wait gives when it starts with that list (2
+for an entry that is not an npub or hex pubkey, 3 for a `config.json` that cannot be read),
+whatever the relays did: a script does not take it for a quiet timeout. If the list was repaired
+before the timeout and nothing came, it is an ordinary quiet timeout, exit 0. `agx gateway`
+holds every sender instead of adding them to its history, while its tasks and webhooks still
+follow each subscription's own `allowedPeers`.
 `agx doctor --local` names the bad entry by position.
 
 `--allowed-only` changes **printing only**. A held message is still counted and

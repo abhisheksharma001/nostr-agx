@@ -65,8 +65,10 @@ export interface InboxSummary {
 	unread: number;
 	held: number;
 	relays: { ok: number; unreachable: number };
-	/** Present for `agx wait`; ordinary one-shot inbox output is unchanged. */
+	/** Present for `agx wait`, with `truncated`; ordinary one-shot inbox output is unchanged. */
 	timedOut?: boolean;
+	/** As in the full report: the batch is not whole. Present for `agx wait` only. */
+	truncated?: boolean;
 }
 
 /** ISO time for a unix-seconds value, or `fallback` when the value is not a time `Date` can hold. */
@@ -197,7 +199,7 @@ export function summarize(report: InboxReport, newCount: number, unreadCount: nu
 			ok: report.relays.filter((r) => r.status === "ok").length,
 			unreachable: report.relays.filter((r) => r.status === "unreachable").length,
 		},
-		...(report.timedOut === undefined ? {} : { timedOut: report.timedOut }),
+		...(report.timedOut === undefined ? {} : { timedOut: report.timedOut, truncated: report.truncated }),
 	};
 }
 
