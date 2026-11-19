@@ -13,12 +13,14 @@ import { type RelayOptions, type RunningRelay, startRelay } from "../relay/serve
 /**
  * The BUILT CLI (`dist/agx.js`) as a real `agx serve` process, left running while its saved
  * allowlist breaks, stays broken for several polls, is repaired, and breaks again; then a serve that is
- * started while the list cannot be read. A running serve cannot be stopped from inside a unit test
- * (its Ctrl-C handler exits the process), so this one needs the real thing.
+ * started while the list cannot be read. The same pause and repair are tested in this process by
+ * commands/serve-pause.test.ts, which CI runs. This one runs the built file as a process of its own,
+ * with a real Ctrl-C.
  *
  *   pnpm build && E2E=1 pnpm --filter @nostr-agx/cli exec vitest run src/test/serve-pause.e2e.test.ts
  *
- * Not part of `test:unit`: it needs a fresh build.
+ * Not part of `test:unit`, and CI does not run it: it needs a fresh build, and no script in package.json
+ * points at it. With E2E set and no build it fails, rather than passing without having run.
  */
 
 const AGX = fileURLToPath(new URL("../../dist/agx.js", import.meta.url));
@@ -168,8 +170,11 @@ async function oneMoreLoop(): Promise<void> {
 
 const times = (text: string, part: string): number => text.split(part).length - 1;
 
-describe.skipIf(!existsSync(AGX))("serve while its saved allowlist cannot be read", () => {
+describe("serve while its saved allowlist cannot be read", () => {
 	beforeAll(async () => {
+		if (!existsSync(AGX)) {
+			throw new Error(`${AGX} is missing: run pnpm build first`);
+		}
 		home = mkdtempSync(join(tmpdir(), "agx-e2e-pause-"));
 		relay = await startRelay({
 			port: 0,
@@ -181,7 +186,9 @@ describe.skipIf(!existsSync(AGX))("serve while its saved allowlist cannot be rea
 
 	afterAll(async () => {
 		await relay?.close();
-		rmSync(home, { recursive: true, force: true });
+		if (home) {
+			rmSync(home, { recursive: true, force: true });
+		}
 	});
 
 	it("pauses, says so once, loses nothing, picks up where it stopped, and stops cleanly while paused", async () => {
