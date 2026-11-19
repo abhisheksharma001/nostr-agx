@@ -4,7 +4,7 @@ import { MAX_WRAP_BACKDATE_SEC } from "@nostr-agx/nostr";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { effectiveProfile, updateProfile } from "../lib/config.js";
 import { EXIT } from "../lib/errors.js";
-import { loadIdentity } from "../lib/identity.js";
+import { createIdentity, loadIdentity } from "../lib/identity.js";
 import { INBOX_SUMMARY_SCHEMA, type InboxReport, type InboxSummary } from "../lib/inbox.js";
 import { setJsonMode } from "../lib/output.js";
 import { configPath, profileDir, seenPath } from "../lib/paths.js";
@@ -269,6 +269,8 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 		expect.soft(times(run.stderr, WARNING)).toBe(1);
 		expect.soft(run.stderr).toContain("nobody is authorised");
 		expect.soft(run.stderr).toContain(PAUSED);
+		// The relays decide how long mail waits there; the warning must not promise more than they do.
+		expect.soft(run.stderr).toContain("stays on the relays for as long as they keep it");
 		expect.soft(run.stderr).toContain("agx doctor --local");
 		// Nothing was held, so there is nothing to release: no `agx held allow` step to point at.
 		expect.soft(run.stderr).not.toContain("held allow");
@@ -515,6 +517,28 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 		expect.soft(report(run).held.map((h) => h.count)).toEqual([1]);
 		expect.soft(receiverStore().listMessages({ direction: "in" })).toEqual([]);
 		expect.soft(receiverStore().listHeld().flatMap((h) => h.messages.map((m) => m.text))).toEqual(["sent by a peer taken off the list"]);
+	});
+
+	it("still applies what other commands queued while the list cannot be read", async () => {
+		const pair = await allowedPair();
+		const decided = createIdentity().npub;
+		const waiting = startWait({ profile: "receiver", timeout: "60" });
+		let statusWhilePaused: string | null = null;
+		onEverySleep((n) => {
+			if (n === 1) {
+				updateProfile("receiver", { allow: [...pair.named, JUNK] });
+				// What `agx held ignore` leaves for the process that holds the profile lock, which is this wait.
+				MessageStore.spool(profileDir("receiver"), { kind: "decision", action: "ignore", npub: decided });
+			}
+			if (n === 5) {
+				statusWhilePaused = receiverStore().heldStatus(decided);
+				waiting.controller.abort();
+			}
+		});
+
+		await waiting.done;
+
+		expect(statusWhilePaused).toBe("ignored");
 	});
 
 	it("resumes from the cursor it had when it was paused from the first turn", async () => {

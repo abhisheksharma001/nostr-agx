@@ -9,7 +9,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { getProfile, updateProfile } from "../lib/config.js";
 import { createIdentity, type IdentityFile, saveIdentity } from "../lib/identity.js";
 import { profileDir, seenPath } from "../lib/paths.js";
-import { loadState, updateState } from "../lib/state.js";
+import { FileSeenStore, loadState, updateState } from "../lib/state.js";
 import { MAX_NEW_SENDERS_PER_HOUR, MessageStore } from "../lib/store/message-store.js";
 import { runCli } from "../program.js";
 import { type RelayOptions, type RunningRelay, startRelay } from "../relay/server.js";
@@ -335,6 +335,8 @@ describe("agx serve while the saved allowlist cannot be read", () => {
 		expect.soft(times(out, "The allowlist cannot be read")).toBe(1);
 		expect.soft(out).toContain("nobody is authorised");
 		expect.soft(out).toContain(PAUSED);
+		// The relays decide how long mail waits there; the warning must not promise more than they do.
+		expect.soft(out).toContain("stays on the relays for as long as they keep it");
 		expect.soft(out).toContain("agx doctor --local");
 		// Nothing was held, so there is nothing to release: no `agx held allow` step to point at.
 		expect.soft(out).not.toContain("held allow");
@@ -500,6 +502,66 @@ describe("a running agx serve whose saved allowlist breaks and is repaired", () 
 		expect.soft(times(serve.output(), RESUMED)).toBe(1);
 	});
 
+	it("does not release what was held before the break for a peer the repaired list now names", async () => {
+		const serve = startServe();
+		await serve.until("serve to start", () => serve.output().includes("watching for messages"));
+		await sendMessage(stranger, "held before the break");
+		await serve.until("the stranger's message to be held", () => heldFrom(stranger) !== undefined);
+
+		updateProfile("default", { allow: [ally.publicKey, JUNK] });
+		await serve.until("the pause", () => serve.output().includes(PAUSED));
+		updateProfile("default", { allow: [ally.publicKey, stranger.publicKey] });
+		await serve.until("serve to read the list again", () => serve.output().includes(RESUMED));
+		// From here the stranger is on the list: what they send now goes to the inbox.
+		await sendMessage(stranger, "sent after the repair");
+		await serve.until("the message sent after the repair", () => inboxTexts().length > 0);
+		await serve.stop();
+
+		// What was held stays held until `agx held allow` releases it.
+		expect.soft(inboxTexts()).toEqual(["sent after the repair"]);
+		expect.soft(heldFrom(stranger)?.messages.map((m) => m.text)).toEqual(["held before the break"]);
+	});
+
+	it("does not read again what it had read when its place in the inbox is days behind", async () => {
+		// A relay that did not answer for ten days leaves the place ten days back, while the polls that did
+		// get through recorded what they saw. Seen ids are kept for three days counted from that place, so
+		// a pause must not count them from "now": a message read four days ago would come a second time.
+		const day = 86400;
+		const now = Math.floor(Date.now() / 1000);
+		// The message was sent five days ago: the clock is set back for the sender only.
+		vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+		vi.setSystemTime((now - 5 * day) * 1000);
+		try {
+			await sendMessage(ally, "read before, five days ago");
+		} finally {
+			vi.useRealTimers();
+		}
+		const wrap = relay
+			.events()
+			.find((event) => event.kind === GIFT_WRAP_KIND && event.tags.some((tag) => tag[0] === "p" && tag[1] === receiver.publicKey));
+		expect(wrap?.id).toBeTruthy();
+		updateState("default", { cursor: now - 10 * day });
+		writeFileSync(
+			seenPath("default"),
+			`${JSON.stringify({ version: 2, entries: [{ id: wrap?.id, seenAt: now - 4 * day }], failures: {} })}\n`,
+		);
+		// The setup is what it claims: the message counts as seen, and a poll from the place reaches its wrap.
+		expect(new FileSeenStore("default").has(wrap?.id ?? "")).toBe(true);
+		expect(wrap?.created_at).toBeGreaterThan(now - 12 * day);
+		// Paused from the first loop, so the place is still ten days back when the list is repaired.
+		updateProfile("default", { allow: [ally.publicKey, JUNK] });
+		const serve = startServe();
+		await serve.until("the pause", () => serve.output().includes(PAUSED));
+		await sleepFor(300);
+
+		updateProfile("default", { allow: [ally.publicKey] });
+		await serve.until("the first poll after the repair", () => loadState("default").cursor > now - 9 * day);
+		await sendMessage(ally, "sent after the repair");
+		await serve.until("the message sent after the repair", () => inboxTexts().includes("sent after the repair"));
+		await serve.stop();
+
+		expect(inboxTexts()).toEqual(["sent after the repair"]);
+	});
 });
 
 describe("agx serve when the saved allowlist reads cleanly", () => {
