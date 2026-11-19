@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AgxClient, DEFAULT_CONTENT_TYPE, DEFAULT_POLL_OVERLAP_SEC } from "@nostr-agx/core";
 import { hexToBytes, localSigner, MAX_WRAP_BACKDATE_SEC, NostrTransport } from "@nostr-agx/nostr";
@@ -10,7 +10,7 @@ import { getProfile, updateProfile } from "../lib/config.js";
 import { createIdentity, type IdentityFile, saveIdentity } from "../lib/identity.js";
 import { profileDir, seenPath } from "../lib/paths.js";
 import { FileSeenStore, loadState, updateState } from "../lib/state.js";
-import { MAX_NEW_SENDERS_PER_HOUR, MessageStore } from "../lib/store/message-store.js";
+import { HELD_FILE, MAX_NEW_SENDERS_PER_HOUR, MessageStore } from "../lib/store/message-store.js";
 import { runCli } from "../program.js";
 import { type RelayOptions, type RunningRelay, startRelay } from "../relay/server.js";
 import { agx, sandbox } from "../test/helpers.js";
@@ -266,6 +266,26 @@ const sleepFor = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms
 const stored = () => new MessageStore(profileDir("default"));
 const inboxTexts = () => stored().listMessages({ direction: "in" }).map((m) => m.text);
 const heldFrom = (sender: IdentityFile) => stored().listHeld().find((h) => h.npub === sender.npub);
+/**
+ * The senders in held.jsonl on disk, written by the running serve. A `new MessageStore` also applies in
+ * memory what is still queued for the lock holder, so it cannot tell a queue that was applied from one
+ * that was not.
+ */
+const sendersOnDisk = (): string[] => {
+	const file = join(profileDir("default"), HELD_FILE);
+	if (!existsSync(file)) {
+		return [];
+	}
+	return readFileSync(file, "utf8")
+		.split("\n")
+		.flatMap((line) => {
+			try {
+				return [(JSON.parse(line) as { npub: string }).npub];
+			} catch {
+				return [];
+			}
+		});
+};
 const times = (text: string, part: string): number => text.split(part).length - 1;
 const NSEC = nip19.nsecEncode(hexToBytes(createIdentity().secretKeyHex));
 
@@ -593,10 +613,10 @@ describe("a running agx serve whose saved allowlist breaks and is repaired", () 
 		await serve.until("the pause", () => serve.output().includes(PAUSED));
 		// What `agx held ignore` leaves for the process that holds the profile lock, which is this serve.
 		MessageStore.spool(profileDir("default"), { kind: "decision", action: "ignore", npub: decided });
-		await serve.until("the queued decision to be applied", () => stored().heldStatus(decided) === "ignored");
+		await serve.until("the queued decision to be written", () => sendersOnDisk().includes(decided));
 		await serve.stop();
 
-		// The list was never repaired: it was applied while paused.
+		// The list was never repaired: the decision was applied and written while paused.
 		expect(times(serve.output(), RESUMED)).toBe(0);
 	});
 });

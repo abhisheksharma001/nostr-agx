@@ -1,4 +1,5 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { DEFAULT_CONTENT_TYPE, DEFAULT_POLL_OVERLAP_SEC } from "@nostr-agx/core";
 import { MAX_WRAP_BACKDATE_SEC } from "@nostr-agx/nostr";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +12,7 @@ import { configPath, profileDir, seenPath } from "../lib/paths.js";
 import { toHexPubkey } from "../lib/peer.js";
 import { setRuntimeForTests } from "../lib/runtime.js";
 import { loadState, updateState } from "../lib/state.js";
-import { MessageStore } from "../lib/store/message-store.js";
+import { HELD_FILE, MessageStore } from "../lib/store/message-store.js";
 import { createTransport, makeLogger } from "../lib/transport.js";
 import { type RelayOptions, type RunningRelay, startRelay } from "../relay/server.js";
 import { agx, capture, jsonDocuments, sandbox } from "../test/helpers.js";
@@ -185,6 +186,26 @@ const startedNow = (timeout = "1") => agx("--profile", "receiver", "wait", "--ti
 
 const times = (text: string, part: string): number => text.split(part).length - 1;
 const receiverStore = () => new MessageStore(profileDir("receiver"));
+/**
+ * The senders in held.jsonl on disk, written by the wait itself. A `new MessageStore` also applies in
+ * memory what is still queued for the lock holder, so it cannot tell a queue that was applied from one
+ * that was not.
+ */
+const sendersOnDisk = (): string[] => {
+	const file = join(profileDir("receiver"), HELD_FILE);
+	if (!existsSync(file)) {
+		return [];
+	}
+	return readFileSync(file, "utf8")
+		.split("\n")
+		.flatMap((line) => {
+			try {
+				return [(JSON.parse(line) as { npub: string }).npub];
+			} catch {
+				return [];
+			}
+		});
+};
 
 describe("agx wait while the saved allowlist cannot be read", () => {
 	it("asks the relays for nothing and waits out --timeout, then reports that nothing was fetched", async () => {
@@ -544,7 +565,7 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 		const pair = await allowedPair();
 		const decided = createIdentity().npub;
 		const waiting = startWait({ profile: "receiver", timeout: "60" });
-		let statusWhilePaused: string | null = null;
+		let writtenWhilePaused: string[] = [];
 		onEverySleep((n) => {
 			if (n === 1) {
 				updateProfile("receiver", { allow: [...pair.named, JUNK] });
@@ -552,14 +573,14 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 				MessageStore.spool(profileDir("receiver"), { kind: "decision", action: "ignore", npub: decided });
 			}
 			if (n === 5) {
-				statusWhilePaused = receiverStore().heldStatus(decided);
+				writtenWhilePaused = sendersOnDisk();
 				waiting.controller.abort();
 			}
 		});
 
 		await waiting.done;
 
-		expect(statusWhilePaused).toBe("ignored");
+		expect(writtenWhilePaused).toContain(decided);
 	});
 
 	it("resumes from the cursor it had when it was paused from the first turn", async () => {
