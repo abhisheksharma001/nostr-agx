@@ -494,6 +494,29 @@ describe("agx wait while the saved allowlist cannot be read", () => {
 		expect.soft(summary(run)).toMatchObject({ timedOut: true, truncated: false });
 	});
 
+	it("judges what waited by the list as repaired, not as it was: a peer taken off meanwhile is held, not returned", async () => {
+		const pair = await allowedPair();
+		onEverySleep(async (n) => {
+			if (n === 1) {
+				updateProfile("receiver", { allow: [...pair.named, JUNK] });
+				await publish("sender", pair.receiver, "sent by a peer taken off the list");
+			}
+			if (n === 4) {
+				// Repaired, but the sender is no longer on it.
+				updateProfile("receiver", { allow: [] });
+			}
+		});
+
+		const run = await startWait({ profile: "receiver", timeout: "30" }).done;
+
+		// What woke the wait is held activity, and nothing is returned as a message.
+		expect.soft(run.code).toBe(EXIT.ok);
+		expect.soft(report(run)).toMatchObject({ timedOut: false, truncated: false, messages: [] });
+		expect.soft(report(run).held.map((h) => h.count)).toEqual([1]);
+		expect.soft(receiverStore().listMessages({ direction: "in" })).toEqual([]);
+		expect.soft(receiverStore().listHeld().flatMap((h) => h.messages.map((m) => m.text))).toEqual(["sent by a peer taken off the list"]);
+	});
+
 	it("resumes from the cursor it had when it was paused from the first turn", async () => {
 		const pair = await allowedPair();
 		updateState("receiver", { cursor: STALE_CURSOR });

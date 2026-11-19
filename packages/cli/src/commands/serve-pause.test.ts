@@ -5,24 +5,30 @@ import { hexToBytes, localSigner, NostrTransport } from "@nostr-agx/nostr";
 import kleur from "kleur";
 import { nip19 } from "nostr-tools";
 import WebSocket from "ws";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getProfile, updateProfile } from "../lib/config.js";
 import { createIdentity, type IdentityFile, saveIdentity } from "../lib/identity.js";
 import { profileDir, seenPath } from "../lib/paths.js";
 import { loadState, updateState } from "../lib/state.js";
 import { MAX_NEW_SENDERS_PER_HOUR, MessageStore } from "../lib/store/message-store.js";
+import { runCli } from "../program.js";
 import { type RelayOptions, type RunningRelay, startRelay } from "../relay/server.js";
 import { agx, sandbox } from "../test/helpers.js";
 
 // While the saved allowlist cannot be read, `agx serve` authorises nobody and pauses: it asks the
 // relays for nothing, so nothing is stored, held, marked seen, answered or run, and its place in the
 // inbox stays where it was. What arrived meanwhile is read once the list reads cleanly again.
-// Real `serve --once` runs over an in-process relay on a free port, with throwaway identities.
+// Real `serve --once` runs over an in-process relay on a free port, with throwaway identities. A serve
+// that is left running (a poll every 50 ms) is run in this process too, and stopped by calling the
+// SIGINT listener it added, so that its pause, its repair and its first poll afterwards are tested
+// where the unit tests run, not only by the built-CLI test.
 
 /** Not a key: what a hand edit gone wrong leaves in the list. Distinctive, so a test can see whether it is printed. */
 const JUNK = "pasted-entry-MARKER-7f3a";
 /** What the fixed warning says about the pause. */
 const PAUSED = "polling is paused";
+const RESUMED = "The allowlist can be read again";
+const WARNING = "The allowlist cannot be read";
 /** NIP-59 gift wrap: what a serve or wait loop asks a relay for, once per poll. */
 const GIFT_WRAP_KIND = 1059;
 /** The last poll was an hour ago. A poll that runs moves this to now; a pause leaves it. */
@@ -38,6 +44,8 @@ let stranger: IdentityFile;
 const requests: Filters[] = [];
 
 const relayUrl = () => `ws://127.0.0.1:${relay.port}`;
+/** Serves a test started and has not stopped yet. */
+const running: Array<{ stop: () => Promise<void> }> = [];
 
 beforeAll(() => {
 	kleur.enabled = false;
@@ -61,6 +69,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	await Promise.all(running.splice(0).map((serve) => serve.stop()));
 	await relay.close();
 	box.restore();
 });
@@ -176,6 +185,81 @@ async function serveOnce(...flags: string[]) {
 	expect(run.code, run.stderr).toBe(0);
 	return run.stdout;
 }
+
+/** What a running serve has printed so far, and how to stop it. */
+interface RunningServe {
+	output: () => string;
+	stop: () => Promise<void>;
+	/** Rejects, with what serve printed, if `condition` does not hold within `ms`, or if serve ends first. */
+	until: (what: string, condition: () => boolean, ms?: number) => Promise<void>;
+}
+
+/**
+ * `agx serve` with no `--once`, running in this process: it polls every 50 ms until `stop()`. Its output
+ * is readable while it runs. Ctrl-C is the SIGINT listener serve adds, called by hand (`process.emit`
+ * would reach every listener the test runner has as well), and `process.exit`, which that handler ends
+ * with, is held back so that the run can finish and the test go on.
+ */
+function startServe(...flags: string[]): RunningServe {
+	const lines: string[] = [];
+	const record = (...args: unknown[]) => {
+		lines.push(args.map(String).join(" "));
+	};
+	const spies = [vi.spyOn(console, "log").mockImplementation(record), vi.spyOn(console, "error").mockImplementation(record)];
+	let exited: () => void = () => undefined;
+	const exit = new Promise<void>((resolve) => {
+		exited = resolve;
+	});
+	spies.push(
+		vi.spyOn(process, "exit").mockImplementation((() => {
+			exited();
+		}) as never),
+	);
+	const before = process.listeners("SIGINT");
+	let finished = false;
+	const done = runCli(["serve", "--no-reply", "--poll-interval", "50", ...flags]).then(() => {
+		finished = true;
+	});
+	const output = () => lines.join("\n");
+	const tail = () => output().split("\n").slice(-25).join("\n");
+	let stopping: Promise<void> | undefined;
+	const serve: RunningServe = {
+		output,
+		stop: () => {
+			stopping ??= (async () => {
+				if (!finished) {
+					for (const listener of process.listeners("SIGINT")) {
+						if (!before.includes(listener)) {
+							listener("SIGINT");
+						}
+					}
+					await exit;
+				}
+				await done;
+				for (const spy of spies) {
+					spy.mockRestore();
+				}
+			})();
+			return stopping;
+		},
+		until: async (what, condition, ms = 15_000) => {
+			const deadline = Date.now() + ms;
+			while (!condition()) {
+				if (finished) {
+					throw new Error(`serve ended before ${what}. Its output:\n${tail()}`);
+				}
+				if (Date.now() > deadline) {
+					throw new Error(`gave up waiting for ${what}. serve's output:\n${tail()}`);
+				}
+				await sleepFor(20);
+			}
+		},
+	};
+	running.push(serve);
+	return serve;
+}
+
+const sleepFor = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const stored = () => new MessageStore(profileDir("default"));
 const inboxTexts = () => stored().listMessages({ direction: "in" }).map((m) => m.text);
@@ -376,6 +460,46 @@ describe("agx serve while the saved allowlist cannot be read", () => {
 
 		expect(inboxTexts().sort()).toEqual(senders.map((_, i) => `from sender ${i}`).sort());
 	});
+});
+
+describe("a running agx serve whose saved allowlist breaks and is repaired", () => {
+	it("reads what waited once the list is repaired, in the same process, and says so once", async () => {
+		const serve = startServe();
+		await serve.until("serve to start", () => serve.output().includes("watching for messages"));
+
+		updateProfile("default", { allow: [ally.publicKey, JUNK] });
+		await serve.until("the pause", () => serve.output().includes(PAUSED));
+		await sendMessage(ally, "sent while paused");
+		updateProfile("default", { allow: [ally.publicKey] });
+		await serve.until("the message that waited", () => inboxTexts().includes("sent while paused"));
+		// It goes on polling afterwards: a message sent after the repair arrives too.
+		await sendMessage(ally, "sent after the repair");
+		await serve.until("the message sent after the repair", () => inboxTexts().includes("sent after the repair"));
+		await serve.stop();
+
+		expect.soft(inboxTexts().sort()).toEqual(["sent after the repair", "sent while paused"]);
+		expect.soft(times(serve.output(), WARNING)).toBe(1);
+		expect.soft(times(serve.output(), RESUMED)).toBe(1);
+		expect.soft(stored().listHeld()).toEqual([]);
+	});
+
+	it("judges what waited by the list as repaired, not as it was: a peer taken off meanwhile is held, not delivered", async () => {
+		const serve = startServe();
+		await serve.until("serve to start", () => serve.output().includes("watching for messages"));
+
+		updateProfile("default", { allow: [ally.publicKey, JUNK] });
+		await serve.until("the pause", () => serve.output().includes(PAUSED));
+		await sendMessage(ally, "sent by a peer taken off the list");
+		// Repaired, but the ally is no longer on it.
+		updateProfile("default", { allow: [stranger.publicKey] });
+		await serve.until("the message to be held or delivered", () => heldFrom(ally) !== undefined || inboxTexts().length > 0);
+		await serve.stop();
+
+		expect.soft(inboxTexts()).toEqual([]);
+		expect.soft(heldFrom(ally)?.messages.map((m) => m.text)).toEqual(["sent by a peer taken off the list"]);
+		expect.soft(times(serve.output(), RESUMED)).toBe(1);
+	});
+
 });
 
 describe("agx serve when the saved allowlist reads cleanly", () => {
