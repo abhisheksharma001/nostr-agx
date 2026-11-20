@@ -22,7 +22,7 @@ import { profileDir } from "../paths.js";
 import { toHexPubkey } from "../peer.js";
 import { FileSeenStore, loadState, updateState } from "../state.js";
 import { MessageStore } from "../store/message-store.js";
-import { createTransport } from "../transport.js";
+import { createTransport, HANDSHAKE_TIMEOUT_MS, withHandshakeTimeout } from "../transport.js";
 import { AGX_CLI_VERSION } from "../version.js";
 import { DeliveryQueue, deliver } from "./delivery.js";
 import { messageEvent, receiptEvent, taskEvent } from "./events.js";
@@ -179,6 +179,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			relays: profile.relays,
 			signer: identity.signer,
 			transport,
+			ws: withHandshakeTimeout(HANDSHAKE_TIMEOUT_MS),
 			requester,
 			guard: new AutoReplyGuard(),
 			recordSent: (message) => {
