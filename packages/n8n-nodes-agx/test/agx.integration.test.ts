@@ -1,6 +1,5 @@
 import { AgxPublicError } from "@nostr-agx/core";
 import { localSigner, MAX_WRAP_BACKDATE_SEC, NostrTransport, toNpub } from "@nostr-agx/nostr";
-import { useWebSocketImplementation } from "nostr-tools/relay";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Agx } from "../nodes/Agx/Agx.node";
 import { testAgxCredential } from "../nodes/shared/credential-test";
@@ -463,11 +462,10 @@ describe("AGX node: Agent", () => {
 		peer.handle("x.y", () => ({}));
 		await peer.start({ pollIntervalMs: 0 });
 		await peer.stop();
-		// Node.js 20 in a fresh process: no global WebSocket, and nothing has
-		// pointed nostr-tools at `ws` yet.
+		// Node.js 20 in a fresh process: no global WebSocket. Each AGX call
+		// injects its own `ws` implementation, so no global setup is needed.
 		const global = globalThis as { WebSocket?: unknown };
 		const original = global.WebSocket;
-		useWebSocketImplementation(undefined);
 		delete global.WebSocket;
 		try {
 			const ctx = executeContext({
