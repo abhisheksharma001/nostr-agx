@@ -1,5 +1,6 @@
 import { AgxPublicError } from "@nostr-agx/core";
 import { localSigner, MAX_WRAP_BACKDATE_SEC, NostrTransport, toNpub } from "@nostr-agx/nostr";
+import WebSocket from "ws";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Agx } from "../nodes/Agx/Agx.node";
 import { testAgxCredential } from "../nodes/shared/credential-test";
@@ -268,6 +269,7 @@ describe("AGX node: Message → Send", () => {
 		const transport = await NostrTransport.create({
 			signer: localSigner(reader.secretKey),
 			relays: [relayUrl(relay)],
+			ws: WebSocket,
 		});
 		const msg = await waitFor(async () => {
 			const res = await transport.poll({ since: 0 });
