@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 )
 
@@ -72,5 +75,26 @@ func TestStateDirectory(t *testing.T) {
 	}
 	if fi.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("state directory mode = %v", fi.Mode().Perm())
+	}
+}
+
+func TestSocks5Logger(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	var shuttingDown atomic.Bool
+	logf := socks5Logger(shuttingDown.Load)
+
+	logf("client connection failed: %v", "read tcp: boom")
+	if !bytes.Contains(buf.Bytes(), []byte("socks5: client connection failed")) {
+		t.Fatalf("log while running = %q; want the socks5 line", buf.String())
+	}
+
+	shuttingDown.Store(true)
+	buf.Reset()
+	logf("client connection failed: %v", "read tcp: aborted")
+	if buf.Len() != 0 {
+		t.Fatalf("log while shutting down = %q; want silence", buf.String())
 	}
 }

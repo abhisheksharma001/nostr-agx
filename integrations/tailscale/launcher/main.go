@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -132,6 +133,7 @@ func run() error {
 	}
 	fmt.Println(socksProxyURL(ln.Addr().String(), username, password))
 
+	var shuttingDown atomic.Bool
 	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, _, err := net.SplitHostPort(address)
 		if err == nil && net.ParseIP(host) == nil && strings.HasSuffix(canonicalName(host), ".ts.net") &&
@@ -145,21 +147,36 @@ func run() error {
 		Dialer:   dial,
 		Username: username,
 		Password: password,
-		Logf: func(format string, args ...any) {
-			log.Printf("socks5: "+format, args...)
-		},
+		Logf:     socks5Logger(shuttingDown.Load),
 	}
 	done := make(chan error, 1)
 	go func() { done <- proxy.Serve(ln) }()
 
 	select {
 	case <-ctx.Done():
+		// The deferred srv.Close() aborts the connections the socks5 server is
+		// still relaying; mark the shutdown before returning so those aborted
+		// reads are not logged as failures.
+		shuttingDown.Store(true)
 		return nil
 	case err := <-done:
 		if errors.Is(err, net.ErrClosed) {
 			return nil
 		}
 		return fmt.Errorf("socks5 server: %w", err)
+	}
+}
+
+// socks5Logger returns the Logf for the SOCKS5 server. It drops diagnostics
+// once shutdown has begun: srv.Close() aborts every in-flight relay connection
+// and the socks5 package logs each aborted read ("operation aborted" and
+// friends) even on a clean stop, which reads like a failure to the operator.
+func socks5Logger(shuttingDown func() bool) func(string, ...any) {
+	return func(format string, args ...any) {
+		if shuttingDown() {
+			return
+		}
+		log.Printf("socks5: "+format, args...)
 	}
 }
 
