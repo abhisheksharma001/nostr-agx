@@ -255,6 +255,16 @@ export class NostrTransport implements AgxTransport {
 		return this.relayProxy?.url;
 	}
 
+	/** The WebSocket implementation this transport dials through — the
+	 * proxy-wrapped one when a relay proxy is configured. Hosts making DIRECT
+	 * discovery calls outside the transport (the gateway's agent-card lookups)
+	 * must pass this, not the bare class they injected: a raw `ws` subclass
+	 * receives no SOCKS agent, so with Tailscale on those lookups dial the
+	 * relay directly and fail on names only the proxy's DNS can resolve. */
+	get webSocket(): WebSocketImpl | undefined {
+		return this.ws;
+	}
+
 	whoami(): string {
 		return this.publicKey;
 	}

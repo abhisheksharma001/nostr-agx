@@ -118,6 +118,29 @@ describe("WebSocket injection", () => {
 		expect(listenEvents.mock.calls[1]?.[2]).toMatchObject({ ws: WsB });
 		expect(useWebSocketImplementation).not.toHaveBeenCalled();
 	});
+
+	it("exposes the implementation it dials through, proxy-wrapped when a proxy is set", async () => {
+		class FakeWebSocket {}
+		const plain = await NostrTransport.create({
+			signer: localSigner(generateSecretKey()),
+			relays: [OURS],
+			ws: FakeWebSocket,
+		});
+		expect(plain.webSocket).toBe(FakeWebSocket);
+
+		// A host making DIRECT discovery calls outside the transport (the
+		// gateway's agent-card lookups) must pass `webSocket`, not the bare
+		// class: without the wrapper the dials carry no SOCKS agent and bypass
+		// the proxy entirely.
+		const proxied = await NostrTransport.create({
+			signer: localSigner(generateSecretKey()),
+			relays: [OURS],
+			ws: FakeWebSocket,
+			relayProxy: "socks5://127.0.0.1:1080",
+		});
+		expect(proxied.webSocket).not.toBe(FakeWebSocket);
+		expect(proxied.relayProxyUrl).toBe("socks5://127.0.0.1:1080");
+	});
 });
 
 describe("transport lifecycle", () => {
