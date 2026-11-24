@@ -261,6 +261,21 @@ type WebSocketConstructor = new (
  * Extend a WebSocket implementation with extra constructor options. Exported so
  * callers can compose other `ws` options (handshake timeouts, TLS settings)
  * with a proxy without having to know the subclass chain.
+ *
+ * Two invariants hold here, because a proxy that silently isn't used is the
+ * worst possible outcome (traffic leaves the host DIRECTLY while the transport
+ * still reports `relayProxyUrl`):
+ *
+ * 1. The wrapper accepts a third constructor argument and merges it under its
+ *    own options, so wrapping a wrapped class keeps every option alive. A base
+ *    that ignores the argument is caught below instead of trusted.
+ * 2. If the base is `ws`-derived, the agent's arrival is VERIFIED:
+ *    `ws` builds its HTTP request synchronously in the constructor and records
+ *    it on `this._req`, so the moment `super()` returns we can tell whether the
+ *    options were forwarded. A subclass that dropped them (e.g. a constructor
+ *    that calls `super(address, protocols)` with its own options) gets its
+ *    direct connection destroyed and a {@link RelayProxyError} thrown — fail
+ *    closed, not fail open.
  */
 export function wrapWebSocket(
 	base: WebSocketImpl | undefined,
@@ -276,9 +291,38 @@ export function wrapWebSocket(
 			"Pass `ws` (the npm package) as `ws` in the transport config, or use a runtime with a global WebSocket.",
 		);
 	}
+	const agent = options.agent;
 	return class extends (Base as WebSocketConstructor) {
-		constructor(address: string | URL, protocols?: string | string[]) {
-			super(address, protocols, options);
+		constructor(
+			address: string | URL,
+			protocols?: string | string[],
+			more?: Record<string, unknown>,
+		) {
+			super(address, protocols, { ...more, ...options });
+			if (agent === undefined) {
+				return;
+			}
+			// Only a `ws`-derived implementation records its request; anything
+			// else (test doubles, a global WebSocket) gives us nothing to check.
+			const req = (
+				this as { _req?: { agent?: unknown; destroy(cause?: Error): void } }
+			)._req;
+			if (!req || req.agent === agent) {
+				return;
+			}
+			// The base already started dialing DIRECTLY. Destroy that request
+			// before throwing — and quiet `ws`'s own error emission on this
+			// instance first, or the discarded EventEmitter crashes the process
+			// with an unhandled 'error' event.
+			(this as unknown as { on(event: string, listener: () => void): void }).on(
+				"error",
+				() => {},
+			);
+			req.destroy();
+			throw new RelayProxyError(
+				"The WebSocket implementation ignored the proxy agent.",
+				"The WebSocket constructor must forward its third argument (the options) to super — see withHandshakeTimeout in @nostr-agx/cli for the shape to copy.",
+			);
 		}
 	} as WebSocketImpl;
 }

@@ -7,12 +7,16 @@ import {
 	wrapWebSocket,
 } from "./relay-proxy";
 
-const { agentUrls } = vi.hoisted(() => ({ agentUrls: [] as string[] }));
+const { agentUrls, agents } = vi.hoisted(() => ({
+	agentUrls: [] as string[],
+	agents: [] as unknown[],
+}));
 
 vi.mock("socks-proxy-agent", () => ({
 	SocksProxyAgent: class {
 		constructor(url: string) {
 			agentUrls.push(url);
+			agents.push(this);
 		}
 	},
 }));
@@ -105,6 +109,69 @@ describe("proxy WebSocket wrapping", () => {
 			lookup: vi.fn(),
 		});
 		expect(agentUrls.at(-1)).toBe("socks5://user:pass@127.0.0.1:1080");
+	});
+
+	it("keeps a caller's own options when composed over another wrapper", () => {
+		// wrapWebSocket over wrapWebSocket: the outer wrapper receives the
+		// inner one's options as its third constructor argument and must merge
+		// them, not replace them — the agent would otherwise be dropped again,
+		// one layer up.
+		const Outer = wrapWebSocket(FakeWebSocket, { handshakeTimeout: 1000 });
+		const Inner = wrapWebSocket(Outer, { agent: "agent" });
+		const socket = new (Inner as unknown as typeof FakeWebSocket)(
+			"wss://relay.example",
+		);
+		expect(socket.args).toEqual([
+			"wss://relay.example",
+			undefined,
+			{ agent: "agent", handshakeTimeout: 1000 },
+		]);
+	});
+
+	it("fails closed when a ws subclass drops the constructor options", async () => {
+		// The shape that fails open in production: a subclass whose constructor
+		// doesn't pass the third argument on. `ws` records its request (with
+		// the agent it was given) on `this._req` synchronously, so the wrapper
+		// sees the drop the moment super() returns — and must destroy the
+		// direct connection it already started rather than let it run.
+		const destroy = vi.fn();
+		class Dropping extends FakeWebSocket {
+			_req = { agent: "global", destroy };
+			on(): void {}
+		}
+		const Wrapped = await createProxyWebSocket(
+			"socks5://127.0.0.1:1080",
+			Dropping,
+		);
+		expect(
+			() =>
+				new (Wrapped as unknown as typeof Dropping)("wss://relay.example"),
+		).toThrow(RelayProxyError);
+		expect(destroy).toHaveBeenCalledOnce();
+	});
+
+	it("passes when the implementation actually records the agent", async () => {
+		// The other side of the check: options forwarded, `_req.agent` is the
+		// very agent instance the wrapper built — no false failure.
+		class Forwarding extends FakeWebSocket {
+			_req: { agent?: unknown; destroy(): void };
+			on(): void {}
+			constructor(...args: unknown[]) {
+				super(...args);
+				this._req = {
+					agent: (args[2] as { agent?: unknown } | undefined)?.agent,
+					destroy: () => {},
+				};
+			}
+		}
+		const Wrapped = await createProxyWebSocket(
+			"socks5://127.0.0.1:1080",
+			Forwarding,
+		);
+		const socket = new (Wrapped as unknown as typeof Forwarding)(
+			"wss://relay.example",
+		);
+		expect(socket._req.agent).toBe(agents.at(-1));
 	});
 
 	it("fails clearly when no WebSocket implementation exists", () => {
