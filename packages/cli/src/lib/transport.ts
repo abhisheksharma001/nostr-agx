@@ -14,11 +14,22 @@ export const HANDSHAKE_TIMEOUT_MS = 7_000;
  * stops waiting without closing the socket, so such a relay would hold one
  * more socket on every poll, until a long-running `agx serve` or `agx gateway`
  * ran out of file descriptors.
+ *
+ * The third constructor argument MUST be forwarded: `createProxyWebSocket`
+ * passes its SOCKS agent in as the third argument, and a subclass that drops
+ * it would dial relays DIRECTLY while the transport still reported the proxy
+ * — the fail-open case `wrapWebSocket` exists to prevent. Its fail-closed
+ * check catches a drop at dial time; forwarding here is what makes the
+ * proxied path actually work.
  */
 export function withHandshakeTimeout(timeoutMs: number) {
 	return class extends WebSocket {
-		constructor(address: string | URL, protocols?: string | string[]) {
-			super(address, protocols, { handshakeTimeout: timeoutMs });
+		constructor(
+			address: string | URL,
+			protocols?: string | string[],
+			options?: WebSocket.ClientOptions,
+		) {
+			super(address, protocols, { ...options, handshakeTimeout: timeoutMs });
 		}
 	};
 }

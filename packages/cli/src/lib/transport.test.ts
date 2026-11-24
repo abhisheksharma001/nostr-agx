@@ -1,4 +1,5 @@
 import { createServer, type Socket } from "node:net";
+import { Agent } from "node:http";
 import { describe, expect, it } from "vitest";
 import { withHandshakeTimeout } from "./transport.js";
 
@@ -24,6 +25,25 @@ describe("withHandshakeTimeout", () => {
 				socket.destroy();
 			}
 			relay.close();
+		}
+	});
+
+	it("forwards the proxy wrapper's constructor options instead of dropping them", () => {
+		// createProxyWebSocket passes its SOCKS agent in as the THIRD
+		// constructor argument. A subclass that dropped it made zero proxy
+		// connections while relayProxyUrl still reported the proxy — traffic
+		// left directly. `ws` records its request synchronously on `_req`, so
+		// the agent's arrival is assertable without opening a real socket.
+		const agent = new Agent();
+		const Timed = withHandshakeTimeout(200);
+		const socket = new Timed("ws://127.0.0.1:1", undefined, { agent });
+		socket.on("error", () => {});
+		try {
+			expect(
+				(socket as { _req?: { agent?: unknown } })._req?.agent,
+			).toBe(agent);
+		} finally {
+			socket.terminate();
 		}
 	});
 });
