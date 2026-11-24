@@ -1,10 +1,10 @@
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { bundledBinaryPath, startBundledTailscale } from "./launcher";
+import { bundledBinaryPath, ensureExecutable, startBundledTailscale } from "./launcher";
 
 const posix = process.platform !== "win32";
 const supportedPlatforms = new Set([
@@ -34,6 +34,32 @@ describe("bundledBinaryPath", () => {
 		const binary = bundledBinaryPath();
 		expect(binary).toContain(join("bin", platform));
 		expect(binary).toMatch(/agx-tailscale(\.exe)?$/);
+	});
+});
+
+describe("ensureExecutable", () => {
+	it.skipIf(!posix)("restores the executable bit a packed launcher lost", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-test-"));
+		try {
+			const path = join(dir, "agx-tailscale");
+			await writeFile(path, "#!/bin/sh\n", { mode: 0o644 });
+			await chmod(path, 0o644);
+			ensureExecutable(path);
+			expect((await stat(path)).mode & 0o777).toBe(0o755);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("leaves an executable launcher as it is", async () => {
+		const { dir, path } = await fakeBinary("#!/bin/sh\n");
+		try {
+			await chmod(path, 0o700);
+			ensureExecutable(path);
+			expect((await stat(path)).mode & 0o777).toBe(0o700);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 
