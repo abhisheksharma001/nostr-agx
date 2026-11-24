@@ -1,6 +1,6 @@
 {
 	"name": "@nostr-agx/tailscale",
-	"version": "0.7.0",
+	"version": "0.7.1",
 	"description": "Opt-in Tailscale private-relay support for @nostr-agx/nostr: composable auth keys and a local tsnet SOCKS5 relay proxy.",
 	"license": "MIT",
 	"author": "Ellavox AI",

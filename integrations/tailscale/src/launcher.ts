@@ -7,7 +7,7 @@
  * `make -C launcher stage`.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
@@ -280,7 +280,36 @@ export function bundledBinaryPath(): string {
 				`Rebuild it with "make -C launcher stage", or set AGX_TAILSCALE_BINARY to a local build.`,
 		);
 	}
+	ensureExecutable(path);
 	return path;
+}
+
+/**
+ * Give a bundled launcher back its executable bit if the install lost it.
+ *
+ * `@nostr-agx/tailscale@0.7.0` was packed without it (pnpm only marks a
+ * manifest's `bin` entries executable), so every POSIX spawn failed with
+ * EACCES. The tarball is fixed, but an install that copied files without their
+ * mode would fail the same way. Windows has no executable bit.
+ */
+export function ensureExecutable(path: string): void {
+	if (process.platform === "win32") return;
+	try {
+		accessSync(path, constants.X_OK);
+		return;
+	} catch {
+		// Not executable for this user: try to fix it below.
+	}
+	try {
+		chmodSync(path, 0o755);
+		accessSync(path, constants.X_OK);
+	} catch (cause) {
+		throw new Error(
+			`The bundled agx-tailscale launcher at ${path} is not executable and could not be made so. ` +
+				`Run "chmod +x ${path}" as the user who installed it, or set AGX_TAILSCALE_BINARY to a local build.`,
+			{ cause },
+		);
+	}
 }
 
 function resolveBinary(): string {

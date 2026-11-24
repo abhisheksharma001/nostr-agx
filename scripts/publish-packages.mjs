@@ -16,9 +16,10 @@
  * again.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { packPackage } from "./lib/pack.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 /** `nostr` depends on `core`, and `tailscale` has `nostr` as a peer; the CLI
@@ -82,14 +83,8 @@ try {
 			console.log(`${label}: already on npm, skipped`);
 			continue;
 		}
-		const before = new Set(readdirSync(out));
-		run("pnpm", ["pack", "--pack-destination", out], {
-			cwd: join(root, pkg.dir),
-		});
-		const tarball = readdirSync(out).find((file) => !before.has(file));
-		if (!tarball) {
-			throw new Error(`pnpm pack wrote no tarball for ${label}`);
-		}
+		// pnpm pack, with each file's executable bit restored (scripts/lib/pack.mjs).
+		const tarball = packPackage(join(root, pkg.dir), out);
 		const publishArgs = ["publish", join(out, tarball), "--access", "public"];
 		// Provenance is attested by the CI provider, so only a real CI publish
 		// can ask for it.

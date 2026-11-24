@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1
+
+Released with `@nostr-agx/core`, `@nostr-agx/nostr` and `@nostr-agx/tailscale` 0.7.1. Only `@nostr-agx/tailscale` changes; the others are released at the same version, as always.
+
+### Fixed
+
+- `@nostr-agx/tailscale` 0.7.0 shipped its macOS and Linux launchers without the executable bit, so `agx tailscale enable`, `serve --tailscale` and `gateway --tailscale` failed with `spawn … EACCES`. The launchers are packed `0755` again, `check:packages` refuses a tarball where they are not, and the package restores the bit itself if an install lost it. Upgrade both packages: `npm install -g @nostr-agx/cli@0.7.1 @nostr-agx/tailscale@0.7.1`.
+
 ## 0.7.0
 
 Released with `@nostr-agx/core` and `@nostr-agx/nostr` 0.7.0 and the first release of `@nostr-agx/tailscale`. `NostrTransport` can dial relays through a SOCKS5 proxy (`relayProxy`; see "Private relays" in the nostr `README.md`), and `@nostr-agx/tailscale` supplies one from a bundled tsnet node, so agents can exchange tasks over a private relay on a tailnet without exposing anything publicly. `AgxClient` takes an optional `pendingRequests` store (`PendingRequestStore`), so a requester that restarts can still accept the result of a task it already sent.
