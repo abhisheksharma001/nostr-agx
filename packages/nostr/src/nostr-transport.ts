@@ -170,8 +170,11 @@ export class NostrTransport implements AgxTransport {
 	/** Same proxy, but with local-DNS SOCKS semantics and a vetted-address
 	 * lookup. Used only for peer-advertised relays. */
 	private readonly pinnedWs?: WebSocketImpl;
-	/** hostname → public addresses vetted by the peer-relay SSRF guard. */
-	private readonly peerDnsPins = new Map<string, string[]>();
+	/** hostname → public addresses vetted by the peer-relay SSRF guard. This is
+	 * the SAME map the pinned lookup in `create()` closes over — `recordPeerPins`
+	 * writes it and the lookup reads it at dial time, so the constructor must
+	 * keep the map itself, never copy it. */
+	private readonly peerDnsPins: Map<string, string[]>;
 	/** The proxy this transport dials through, when one is configured. */
 	private relayProxy?: RelayProxyHandle;
 	/** Set once `stop()` has released the proxy, so a restart fails clearly. */
@@ -200,6 +203,12 @@ export class NostrTransport implements AgxTransport {
 			const ws = proxy
 				? await createProxyWebSocket(proxy.url, config.ws)
 				: config.ws;
+			// The pinned lookup below closes over THIS map, and the constructor
+			// keeps it as `this.peerDnsPins` — not a copy of it. `recordPeerPins`
+			// fills it as peer relays are vetted, and the lookup must read those
+			// entries at dial time. Binding the lookup to a throwaway local map
+			// instead made every pinned lookup fail with "No vetted address", so
+			// a proxied transport could not reach ANY relay a peer advertised.
 			const peerDnsPins = new Map<string, string[]>();
 			const pinnedWs = proxy
 				? await createProxyWebSocket(proxy.url, config.ws, {
@@ -235,9 +244,9 @@ export class NostrTransport implements AgxTransport {
 		this.logger = config.logger;
 		this.ws = ws;
 		this.pinnedWs = pinnedWs;
-		for (const [host, addresses] of peerDnsPins) {
-			this.peerDnsPins.set(host, addresses);
-		}
+		// Shared, not copied: the pinned lookup closes over this exact map, so
+		// entries `recordPeerPins` adds later have to be visible to it.
+		this.peerDnsPins = peerDnsPins;
 		this.relayProxy = proxy;
 	}
 

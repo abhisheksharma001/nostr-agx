@@ -49,6 +49,14 @@ const OURS = "wss://ours.example";
 const THEIRS = "wss://theirs.example";
 const SHARED = "wss://shared.example";
 
+/** The pinned-DNS lookup carried in the wrapped WebSocket's constructor
+ * options — same shape as `DnsLookup` in ./relay-proxy. */
+type PinnedLookup = (
+	hostname: string,
+	opts: unknown,
+	callback: (error: Error | null, address?: string, family?: number) => void,
+) => void;
+
 const peerSecret = generateSecretKey();
 const PEER = getPublicKey(peerSecret);
 
@@ -165,7 +173,12 @@ describe("transport lifecycle", () => {
 
 describe("publishMessage derives deliveredToPeer", () => {
 	it("uses pinned DNS for peer relays and normal DNS for own relays", async () => {
-		class FakeWebSocket {}
+		class FakeWebSocket {
+			readonly args: unknown[];
+			constructor(...args: unknown[]) {
+				this.args = args;
+			}
+		}
 		peerPins.set("theirs.example", ["1.1.1.1"]);
 		resolvePeerRelays.mockResolvedValue([THEIRS]);
 		publishToRelays.mockImplementation(async (targets: string[]) =>
@@ -187,6 +200,38 @@ describe("publishMessage derives deliveredToPeer", () => {
 		expect(selector?.(OURS)).toBeUndefined();
 		expect(selector?.(THEIRS)).toBeDefined();
 		expect(selector?.(THEIRS)).not.toBe(FakeWebSocket);
+
+		// Selection is not enough: the pinned WebSocket has to actually RESOLVE.
+		// Its lookup closes over the transport's pins map, which
+		// `recordPeerPins` filled during the resolution above — when that map
+		// was a local copy instead, every lookup failed with "No vetted
+		// address" and peer relays never connected through the proxy.
+		const pinned = selector?.(THEIRS) as
+			| (new (url: string) => { args: unknown[] })
+			| undefined;
+		const Pinned = pinned!;
+		const socket = new Pinned(THEIRS);
+		const options = socket.args[2] as { lookup?: PinnedLookup };
+		const lookup = options.lookup!;
+		expect(lookup).toBeTypeOf("function");
+		const vetted = await new Promise<{
+			address?: string;
+			family?: number;
+		}>((resolve, reject) =>
+			lookup("theirs.example", {}, (error, address, family) =>
+				error ? reject(error) : resolve({ address, family }),
+			),
+		);
+		expect(vetted).toEqual({ address: "1.1.1.1", family: 4 });
+
+		// And it fails closed for a host no SSRF check ever vetted.
+		await expect(
+			new Promise<never>((_resolve, reject) =>
+				lookup("not-vetted.example", {}, (error) =>
+					reject(error ?? new Error("expected an error")),
+				),
+			),
+		).rejects.toThrow(/No vetted address for peer relay host/);
 	});
 
 	it("is FALSE, and ok is false, when every relay the peer advertises refused", async () => {
