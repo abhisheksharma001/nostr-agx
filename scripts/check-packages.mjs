@@ -9,7 +9,7 @@
  * license), a `workspace:` version left in a published manifest (only
  * `pnpm publish` / `pnpm pack` rewrite those; `npm publish` does not), and an
  * n8n package that does not ship a node or credential its manifest tells n8n
- * to load.
+ * to load, or a Tailscale package without the launcher binaries it starts.
  */
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -17,12 +17,26 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
+/** Paths are relative to the repository root. */
 const REQUIRED = {
-	core: ["package.json", "README.md", "LICENSE", "LICENSE-SPEC", "SPEC.md"],
-	nostr: ["package.json", "README.md", "LICENSE"],
-	cli: ["package.json", "README.md", "LICENSE"],
-	"n8n-nodes-agx": ["package.json", "README.md", "LICENSE"],
-	"n8n-nodes-agx-gateway": ["package.json", "README.md", "LICENSE"],
+	"packages/core": ["package.json", "README.md", "LICENSE", "LICENSE-SPEC", "SPEC.md"],
+	"packages/nostr": ["package.json", "README.md", "LICENSE"],
+	// bin/ is not checked in: `make -C integrations/tailscale/launcher stage`
+	// builds it, and the package cannot start a tailnet node without it.
+	"integrations/tailscale": [
+		"package.json",
+		"README.md",
+		"LICENSE",
+		"THIRD_PARTY_NOTICES.md",
+		"bin/darwin-arm64/agx-tailscale",
+		"bin/darwin-x64/agx-tailscale",
+		"bin/linux-arm64/agx-tailscale",
+		"bin/linux-x64/agx-tailscale",
+		"bin/win32-x64/agx-tailscale.exe",
+	],
+	"packages/cli": ["package.json", "README.md", "LICENSE"],
+	"packages/n8n-nodes-agx": ["package.json", "README.md", "LICENSE"],
+	"packages/n8n-nodes-agx-gateway": ["package.json", "README.md", "LICENSE"],
 };
 
 const out = mkdtempSync(join(tmpdir(), "check-packages-"));
@@ -31,7 +45,7 @@ try {
 	for (const [dir, required] of Object.entries(REQUIRED)) {
 		const before = new Set(readdirSync(out));
 		const packed = spawnSync("pnpm", ["pack", "--pack-destination", out], {
-			cwd: join(root, "packages", dir),
+			cwd: join(root, dir),
 			encoding: "utf8",
 		});
 		if (packed.status !== 0) {

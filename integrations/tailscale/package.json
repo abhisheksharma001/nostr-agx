@@ -1,6 +1,6 @@
 {
 	"name": "@nostr-agx/tailscale",
-	"version": "0.6.0",
+	"version": "0.7.0",
 	"description": "Opt-in Tailscale private-relay support for @nostr-agx/nostr: composable auth keys and a local tsnet SOCKS5 relay proxy.",
 	"license": "MIT",
 	"author": "Ellavox AI",
@@ -57,7 +57,7 @@
 		"dummy-oauth:client": "tsx examples/dummy-oauth-client.ts"
 	},
 	"peerDependencies": {
-		"@nostr-agx/nostr": "^0.6.0"
+		"@nostr-agx/nostr": "^0.7.0"
 	},
 	"devDependencies": {
 		"@nostr-agx/core": "workspace:*",
