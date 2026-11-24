@@ -22,7 +22,7 @@ import { profileDir } from "../paths.js";
 import { toHexPubkey } from "../peer.js";
 import { FileSeenStore, loadState, updateState } from "../state.js";
 import { MessageStore } from "../store/message-store.js";
-import { createTransport, HANDSHAKE_TIMEOUT_MS, withHandshakeTimeout } from "../transport.js";
+import { createTransport } from "../transport.js";
 import { AGX_CLI_VERSION } from "../version.js";
 import { DeliveryQueue, deliver } from "./delivery.js";
 import { messageEvent, receiptEvent, taskEvent } from "./events.js";
@@ -199,7 +199,10 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			relays: profile.relays,
 			signer: identity.signer,
 			transport,
-			ws: withHandshakeTimeout(HANDSHAKE_TIMEOUT_MS),
+			// The transport's own implementation, not a fresh class: a bare
+			// `withHandshakeTimeout` carries no SOCKS agent, so with Tailscale on
+			// the gateway's agent-card lookups would dial the relay directly.
+			ws: transport.webSocket,
 			requester,
 			guard: new AutoReplyGuard(),
 			recordSent: (message) => {
