@@ -555,6 +555,11 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 		// handlers keep their right to publish — but only if the process is
 		// still alive when they finish. The 10s timer above bounds the wait.
 		await client.tasksSettled().catch(() => undefined);
+		// `liveDispatch: false` means client.stop() does NOT own the transport:
+		// without this, the Tailscale launcher (unref'd, but holding stdio
+		// pipes) keeps the process alive, and its per-run state directory —
+		// which holds the node's private key — is never removed.
+		await transport.stop().catch(() => undefined);
 		clearTimeout(timer);
 		persist();
 		releaseLock();
@@ -597,6 +602,10 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 		await client.stop().catch(() => undefined);
 		// Same drain as Ctrl-C: publish what in-flight handlers produced.
 		await client.tasksSettled().catch(() => undefined);
+		// Same reason as shutdown(): with `liveDispatch: false` only an explicit
+		// stop releases the transport, and the unref'd Tailscale launcher's
+		// stdio pipes keep this one-shot process alive until it happens.
+		await transport.stop().catch(() => undefined);
 		persist();
 		releaseLock();
 	}

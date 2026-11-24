@@ -175,6 +175,23 @@ async function agx(...args: string[]): Promise<Run> {
 	return start(...args).done;
 }
 
+/** Every command started the launcher with a per-run state dir under AGX_HOME
+ * and stopped its transport on shutdown, which removes the dir again. */
+function expectTailscaleRunWasPerRunAndCleanedUp(): void {
+	const args = readFileSync(join(home, "launcher-args"), "utf8")
+		.trim()
+		.split("\n");
+	const stateFlag = args.indexOf("--state-dir");
+	expect(stateFlag).toBeGreaterThanOrEqual(0);
+	const stateDir = args[stateFlag + 1]!;
+	expect(stateDir.startsWith(join(home, "tailscale-runs") + sep)).toBe(true);
+	expect(
+		existsSync(stateDir),
+		`state dir survived: ${stateDir}; args: ${JSON.stringify(args)}`,
+	).toBe(false);
+	expect(readdirSync(join(home, "tailscale-runs"))).toEqual([]);
+}
+
 describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 	beforeEach(async () => {
 		expect(existsSync(AGX), "run pnpm build before the built-CLI test").toBe(true);
@@ -214,17 +231,22 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		expect(run.stderr).not.toMatch(/Dynamic require/);
 
 		// The state dir really was per-run, under AGX_HOME, and removed on stop.
-		const args = readFileSync(join(home, "launcher-args"), "utf8")
-			.trim()
-			.split("\n");
-		const stateFlag = args.indexOf("--state-dir");
-		expect(stateFlag).toBeGreaterThanOrEqual(0);
-		const stateDir = args[stateFlag + 1]!;
-		expect(stateDir.startsWith(join(home, "tailscale-runs") + sep)).toBe(true);
-		expect(
-			existsSync(stateDir),
-			`state dir survived: ${stateDir}; args: ${JSON.stringify(args)}`,
-		).toBe(false);
-		expect(readdirSync(join(home, "tailscale-runs"))).toEqual([]);
+		expectTailscaleRunWasPerRunAndCleanedUp();
 	}, 20_000);
+
+	it("serve --once exits on its own and removes the run's state dir", async () => {
+		// One-shot serve used to hang: `liveDispatch: false` meant client.stop()
+		// never stopped the transport, so the unref'd launcher (holding stdio
+		// pipes) kept the process alive, and the state directory — which holds
+		// the node's private key — was left behind.
+		const run = await agx("serve", "--once", "--no-reply", "--no-tasks");
+		expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+		expectTailscaleRunWasPerRunAndCleanedUp();
+	}, 30_000);
+
+	it("inbox exits on its own and removes the run's state dir", async () => {
+		const run = await agx("inbox", "--json", "--wait", "2");
+		expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+		expectTailscaleRunWasPerRunAndCleanedUp();
+	}, 30_000);
 });

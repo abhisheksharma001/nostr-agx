@@ -139,6 +139,11 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 	const releaseLock = acquireLock(name);
 	let closed = false;
 	let stopGateway: (() => Promise<void>) | undefined;
+	/** Stops the transport (and with it, the run's Tailscale launcher and its
+	 * state directory). Idempotent; a no-op until the transport exists. Set up
+	 * separately from `stopGateway` so a failure during gateway construction —
+	 * before `stopGateway` is assigned — cannot orphan the launcher. */
+	let stopTransport: () => Promise<void> = async () => {};
 	try {
 		const state = loadState(name);
 		const transport = await createTransport(profile, identity, options.logger, {
@@ -146,6 +151,14 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			tailscale: options.tailscale,
 			withoutTailscale: options.withoutTailscale,
 		});
+		let transportStopped: Promise<void> | undefined;
+		stopTransport = () => {
+			// `liveDispatch: false` means client.stop() does NOT own the
+			// transport: only this explicit stop ends the Tailscale launcher and
+			// removes its per-run state directory.
+			transportStopped ??= transport.stop().catch(() => undefined);
+			return transportStopped;
+		};
 		const seen = new FileSeenStore(name);
 		// The newest messages only: the gateway runs for months.
 		const store = new MessageStore(profileDir(name), undefined, { claimSpool: true, maxMessages: MAX_HISTORY_MESSAGES });
@@ -681,6 +694,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				log(`DROP  ${queue.pending()} message and receipt deliveries not made before stopping (they are in agx inbox)`);
 			}
 			await client.stop().catch(() => undefined);
+			await stopTransport();
 		};
 
 		const host = options.host ?? "127.0.0.1";
@@ -733,6 +747,10 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 		};
 	} catch (error) {
 		await stopGateway?.().catch(() => undefined);
+		// Covers a failure between the transport's creation and `stopGateway`'s
+		// assignment (a state store that cannot be created, say): without this
+		// the Tailscale launcher outlives the failed start and leaks its state.
+		await stopTransport();
 		releaseLock();
 		throw error;
 	}
