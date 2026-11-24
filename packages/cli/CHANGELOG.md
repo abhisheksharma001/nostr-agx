@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0
+
+Released with `@nostr-agx/core` and `@nostr-agx/nostr` 0.7.0 and the first release of `@nostr-agx/tailscale`. `NostrTransport` can dial relays through a SOCKS5 proxy (`relayProxy`; see "Private relays" in the nostr `README.md`), and `@nostr-agx/tailscale` supplies one from a bundled tsnet node, so agents can exchange tasks over a private relay on a tailnet without exposing anything publicly. `AgxClient` takes an optional `pendingRequests` store (`PendingRequestStore`), so a requester that restarts can still accept the result of a task it already sent.
+
+### Added
+
+- `agx tailscale enable | up | status | disable`: opt a profile into routing its relay WebSockets over Tailscale, with an auth key (`--auth-key-stdin`) or an OAuth client. `serve` and `gateway` start and own their own proxy, and take `--tailscale` / `--without-tailscale` to override the opt-in for one run. Install `@nostr-agx/tailscale` alongside the CLI to use it (`npm install -g @nostr-agx/cli @nostr-agx/tailscale`); it is an optional peer, and nothing changes without it. Secrets live in `tailscale.json` (mode `0600`), are never printed, and reach the launcher through its environment, not argv.
+- `agx wait [--timeout <seconds>] [--summary]`: return unread allowed mail, or wait for one batch of inbox activity, print it and exit. It never replies or runs tasks. A quiet timeout exits `0` (`timedOut: true` in JSON); no relay answering for the whole wait exits `5`.
+- `agx doctor --local`: check only what a local exchange needs (file permissions, identity, a real round trip to each relay, the allowlist), without the hosted index or a login. JSON adds a `skipped` list.
+- `agx gateway`: a background or idempotent task that was waiting during a planned restart accepts its genuine result before its original deadline, without publishing the task again. One interrupted while publishing still gets `409 result_unknown`.
+
+### Changed
+
+- `inbox` exits `5` when no relay answered.
+
+### Fixed
+
+- A secret key (`nsec1…`, hex, or encrypted `ncryptsec1…`) given where a peer, agent or path belongs is refused without being printed, repeated in a gateway error, stored or sent to the index. `identity import` and command-parser errors no longer echo a mistyped key.
+- `--json` output escapes C1 control characters and the Unicode line and paragraph separators.
+- `serve --allowed-only` no longer prints a stranger's receipt.
+- The gateway's shutdown counts the requester's stop in its budget and survives a failing stop; a store problem before new work is reported as the gateway's; the requester's idle clock resets after it replaces its relay client, so a stale record is not reported as the peer's failure; full waiting capacity is restored after recovery.
+- A request's timeout could be lost to garbage collection when combined with another abort signal.
+- n8n nodes and the gateway's discovery calls pass their WebSocket implementation to each transport instead of relying on a global one.
+
 ## 0.6.0
 
 Released with `@nostr-agx/core` and `@nostr-agx/nostr` 0.6.0, which add interactive input to tasks: a handler can call `ctx.requestInput(...)` to ask its requester a question, and a requester that opts in through `streamRequest()` answers it (see "Task lifecycle" in the core `SPEC.md`). `NostrTransport` can also receive over live relay subscriptions instead of only polling.

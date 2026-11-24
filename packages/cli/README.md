@@ -251,12 +251,12 @@ Routing is all-or-nothing for the profile's transport: with Tailscale enabled,
 its relays and peer-advertised NIP-65 relays are dialed through tsnet. Public
 relays/peers are not guaranteed to be reachable that way, so keep them in a
 profile without Tailscale unless you intentionally route public traffic through
-an exit node. See [docs/tailscale.md](../../docs/tailscale.md).
+an exit node. See [docs/tailscale.md](../../integrations/tailscale/docs/tailscale.md).
 
-See [docs/tailscale.md](../../docs/tailscale.md) for prerequisites, ACL example,
+See [docs/tailscale.md](../../integrations/tailscale/docs/tailscale.md) for prerequisites, ACL example,
 the full command reference, and troubleshooting. For applications that create
 their own `NostrTransport` instead of using the CLI,
-[`@nostr-agx/tailscale`](../tailscale/README.md) provides the same programmatic
+[`@nostr-agx/tailscale`](../../integrations/tailscale/README.md) provides the same programmatic
 tsnet SOCKS5 `relayProxy`.
 
 ---

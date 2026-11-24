@@ -43,9 +43,18 @@ jobs:
           node-version: 24
           cache: pnpm
           registry-url: https://registry.npmjs.org
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: integrations/tailscale/launcher/go.mod
+          cache-dependency-path: integrations/tailscale/launcher/go.sum
       # Trusted Publishing needs npm 11.5.1 or later.
       - run: npm install -g npm@^11.5.1
       - run: pnpm install --frozen-lockfile
+      # bin/ is not checked in: @nostr-agx/tailscale ships these launchers, and
+      # its tests and check-packages need them. Built from the tag, so each
+      # launcher reports the release version.
+      - name: Stage bundled Tailscale launchers
+        run: make -C integrations/tailscale/launcher stage
       - run: pnpm build
       - run: pnpm type-check
       - run: pnpm test
