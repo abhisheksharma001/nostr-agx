@@ -1,5 +1,6 @@
 import { normalizePubkey, toNpub } from "@nostr-agx/nostr";
 import { usageError } from "./errors.js";
+import { loadIdentityFile } from "./identity.js";
 import { holdsSecretKey } from "./secrets.js";
 
 /** True when a value looks like a pasted secret key, which must never be shown back to anyone.
@@ -13,6 +14,32 @@ export function refuseSecretKey(input: string, label = "identity"): void {
 	if (isPastedSecretKey(input)) {
 		throw usageError(
 			`The ${label} you gave is a secret key (nsec1…), not a public one, so it is not shown here. Expected an npub1… or a 64-character hex pubkey.`,
+		);
+	}
+}
+
+/**
+ * Refuse this profile's own secret key given as a peer, without showing it. A secret key is also 64 hex
+ * characters, or an npub that carries the same bytes, so by its shape it passes for a public key and would be
+ * stored, printed back as an npub or sent to a relay. Only the profile's own key can be told apart, by
+ * comparing it with the identity file; another agent's secret key still passes, and that cannot be helped.
+ * A profile with no identity file, or one that cannot be read, has no key to compare with.
+ */
+export function refuseOwnSecretKey(input: string, profileName: string, label = "peer"): void {
+	const hex = normalizePubkey(input.trim());
+	if (hex === null) {
+		return;
+	}
+	let own: string;
+	try {
+		// The key is only compared here, never used, so loose file permissions do not matter.
+		own = loadIdentityFile(profileName, { allowInsecurePerms: true }).secretKeyHex.toLowerCase();
+	} catch {
+		return;
+	}
+	if (hex === own) {
+		throw usageError(
+			`The ${label} you gave is this profile's own secret key, not a public one, so it is not shown here. Expected the npub1… or 64-character hex pubkey of another agent.`,
 		);
 	}
 }

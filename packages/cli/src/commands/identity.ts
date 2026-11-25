@@ -18,7 +18,7 @@ import {
 } from "../lib/identity.js";
 import { heading, info, json, kv, ok, say, warn } from "../lib/output.js";
 import { identityPath } from "../lib/paths.js";
-import { toDisplayNpub, toHexPubkey } from "../lib/peer.js";
+import { refuseOwnSecretKey, toDisplayNpub, toHexPubkey } from "../lib/peer.js";
 import { signNonceEvent } from "../lib/proof.js";
 import { readStdin } from "../lib/stdin.js";
 
@@ -173,6 +173,7 @@ export function identityAllowCommand(
 	const profile = getProfile(profileName);
 	const next = new Set(profile.allow);
 	for (const peer of peers) {
+		refuseOwnSecretKey(peer, profileName);
 		next.add(toHexPubkey(peer, "peer"));
 	}
 	updateProfile(profileName, { allow: [...next] });

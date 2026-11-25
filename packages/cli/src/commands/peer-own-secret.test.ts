@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { effectiveProfile, getProfile, updateProfile } from "../lib/config.js";
 import { createIdentity, saveIdentity } from "../lib/identity.js";
 import { identityPath } from "../lib/paths.js";
+import { refuseOwnSecretKey } from "../lib/peer.js";
 import { agx, sandbox } from "../test/helpers.js";
 
 // A secret key is also 64 hex characters, so `agx` cannot tell one from a public key by its shape. The one
@@ -203,5 +204,35 @@ describe("input that is still accepted", () => {
 		const run = await agx("--profile", "broken", "identity", "allow", friend.publicKey);
 		expect(run.code).toBe(0);
 		expect(effectiveProfile("broken").allow).toEqual([friend.publicKey]);
+	});
+});
+
+describe("refuseOwnSecretKey", () => {
+	it("throws a usage error that does not contain the key, in any written form", () => {
+		for (const form of formsOf(mine.secretKeyHex)) {
+			if (form.startsWith("nsec1")) {
+				continue;
+			}
+			let message = "";
+			try {
+				refuseOwnSecretKey(form, "default", "peer");
+			} catch (error) {
+				message = error instanceof Error ? error.message : String(error);
+			}
+			expect(message, form).toMatch(/^The peer you gave is this profile's own secret key/);
+			expect(leakedPart(message, mine.secretKeyHex)).toBeNull();
+		}
+	});
+
+	it("takes its wording from the label it is given", () => {
+		expect(() => refuseOwnSecretKey(mine.secretKeyHex, "default", "recipient")).toThrow(/^The recipient you gave/);
+	});
+
+	it("returns for anything that is not this profile's secret key", () => {
+		for (const input of [friend.publicKey, friend.npub, mine.publicKey, mine.npub, "hello", "", "nostr:npub1abc"]) {
+			expect(() => refuseOwnSecretKey(input, "default")).not.toThrow();
+		}
+		expect(() => refuseOwnSecretKey(mine.secretKeyHex, "other")).not.toThrow();
+		expect(() => refuseOwnSecretKey(mine.secretKeyHex, "profile-without-identity")).not.toThrow();
 	});
 });
