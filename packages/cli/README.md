@@ -248,10 +248,15 @@ Each run uses a fresh ephemeral tsnet state dir so a one-off key's tags are
 applied. Use `--state-dir <path>` to keep state across runs.
 
 Routing is all-or-nothing for the profile's transport: with Tailscale enabled,
-its relays and peer-advertised NIP-65 relays are dialed through tsnet. Public
-relays/peers are not guaranteed to be reachable that way, so keep them in a
-profile without Tailscale unless you intentionally route public traffic through
-an exit node. See [docs/tailscale.md](../../integrations/tailscale/docs/tailscale.md).
+its relays and peer-advertised NIP-65 relays are all handed to the local tsnet
+proxy. Only addresses of nodes on your tailnet then travel over the tailnet. Any
+other address (a public relay, a peer's relay, `127.0.0.1`, your local network)
+is dialed from this machine's own network connection, so public relays stay
+reachable but the tailnet does not hide this machine's IP address from them.
+There is no exit-node option. By default the bundled node also uploads Tailscale
+client logs to `log.tailscale.com`; see
+[Routing scope](../../integrations/tailscale/docs/tailscale.md#routing-scope) and
+[Tailscale log upload](../../integrations/tailscale/docs/tailscale.md#tailscale-log-upload).
 
 See [docs/tailscale.md](../../integrations/tailscale/docs/tailscale.md) for prerequisites, ACL example,
 the full command reference, and troubleshooting. For applications that create

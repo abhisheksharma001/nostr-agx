@@ -90,11 +90,40 @@ malformed key fails loudly instead of falling through.
 ## Routing scope
 
 Tailscale routing is **all-or-nothing** for a transport: every relay
-WebSocket—operator relays and peer-advertised NIP-65 relays—is dialed through
-the tsnet proxy. Public relays are outside the tailnet, so unless you configure
-the tsnet node's exit node, they will not be reachable over that path. Use this
-integration for a tailnet-only transport, or split public and tailnet relays
-across separate transports/profiles.
+WebSocket—operator relays and peer-advertised NIP-65 relays—is handed to the
+local tsnet proxy. That does not mean every connection travels over the tailnet.
+The proxy dials each destination with tsnet's `Dial`, and where the connection
+leaves this machine depends on the address:
+
+| Destination | Where the connection goes |
+|---|---|
+| A node on your tailnet (its tailnet address or MagicDNS name) | Over the tailnet. |
+| Anything else: a public relay, a peer-advertised relay, `127.0.0.1`, an address on your local network | Out of this machine's own network connection, as if Tailscale were off. The destination sees this machine's IP address, and a hostname that is not a tailnet name is looked up with this machine's DNS resolver. |
+
+So public relays are **reachable** (if this machine can reach them), but they
+are **not hidden**: the tailnet does not protect this machine's IP address from
+them.
+
+- tsnet can send non-tailnet addresses through an exit node when one is
+  selected on the node. The launcher never selects one, and neither the SDK nor
+  the CLI has an option for it, so the second row above does not change.
+- Peer-advertised relays are dialed the same way. `@nostr-agx/nostr` only
+  accepts a peer's relay if it is a `wss://` URL that resolves to a public
+  address, so a peer-advertised relay is never a tailnet address.
+- The proxy does not limit where it dials. A relay URL you configure that points
+  at `127.0.0.1` or a local-network address is dialed from this machine like any
+  other. `agx` only asks the proxy to dial relay WebSockets: the relays you
+  configured, and peer relays that pass the public-address check. The launcher
+  itself accepts any destination from a client that has its per-run SOCKS5
+  credentials.
+
+Use this integration for relays that live on your tailnet. Do not count on it to
+hide this machine's IP address from public relays or from a peer's advertised
+relays.
+
+This describes tsnet v1.104.7, the version pinned in `launcher/go.mod`
+(`net/tsdial` `dialOneUser`, and `tsnet` `UseNetstackForIP`). Check it again
+when you upgrade tsnet.
 
 ## Tailnet ACLs for agent nodes
 
@@ -146,6 +175,37 @@ pnpm build:launcher
 `make -C launcher build-all` cross-compiles to `launcher/dist/<platform>/`,
 then `scripts/stage-binaries.mjs` copies those files into `bin/`. Those
 binaries are generated and are not checked in; stage them locally when testing.
+
+## Tailscale log upload
+
+By default the bundled tsnet node uploads Tailscale's client logs to Tailscale's
+logging service, `log.tailscale.com`, and the launcher does not turn that off.
+Tailscale describes these logs as information about the client's own operation
+and its attempts to contact other nodes; its
+[logging overview](https://tailscale.com/docs/features/logging) and privacy
+policy say what is collected and how it is used.
+
+To opt out, `TS_NO_LOGS_NO_SUPPORT=true` has to be in the environment of the
+launcher process. Tailscale's documentation says this also opts the device out
+of any support that would need those logs.
+
+Today that variable does not reach the launcher on its own: the SDK starts it
+with only `HOME` and the auth key, so setting `TS_NO_LOGS_NO_SUPPORT` in your
+shell has no effect. There is no `agx` or SDK option for it. What works today is
+a small wrapper script that you start in place of the bundled launcher by
+setting `AGX_TAILSCALE_BINARY` (or the SDK's `binary` option) to its path:
+
+```sh
+#!/bin/sh
+export TS_NO_LOGS_NO_SUPPORT=true
+exec /path/to/bin/<platform>/agx-tailscale "$@"
+```
+
+Make it executable. `<platform>` is the folder for your system under the
+package's `bin/`, such as `darwin-arm64` or `linux-x64`. This was checked on
+macOS by watching the bundled launcher's network connections: without the
+variable it tried to reach `log.tailscale.com`, and with it it did not. The
+wrapper is a shell script, so it has not been tried on Windows.
 
 ## Troubleshooting
 
