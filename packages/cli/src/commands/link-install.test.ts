@@ -139,7 +139,7 @@ function tree(root: string): string[] {
 				rows.push(`${name}/ dir ${mode}`);
 				walk(full);
 			} else {
-				rows.push(`${name} file ${mode} ${stat.size} ${createHash("sha256").update(readFileSync(full)).digest("hex")}`);
+				rows.push(`${name} file ${mode} ${stat.size} ${stat.mtimeMs} ${createHash("sha256").update(readFileSync(full)).digest("hex")}`);
 			}
 		}
 	};
@@ -397,6 +397,24 @@ describe("agx link install: an existing file", () => {
 		expect(lstatSync(path(FILE.claude)).isSymbolicLink()).toBe(true);
 		expect(readlinkSync(path(FILE.claude))).toBe(path("dotfiles/claude-settings.json"));
 		expect((readJson("dotfiles/claude-settings.json") as { hooks: Record<string, unknown> }).hooks.SessionStart).toBeDefined();
+	});
+
+	it("leaves the old file and no temporary file when the folder cannot be written", async () => {
+		put(FILE.claude, CLAUDE_BEFORE);
+		const before = tree(userHome);
+		chmodSync(path(".claude"), 0o555);
+		try {
+			if (process.getuid?.() === 0) {
+				return;
+			}
+			const run = await install("claude");
+			expect(run.code).toBe(EXIT.generic);
+			expect(run.stderr).toContain(path(FILE.claude));
+			expect(run.stderr.toLowerCase()).toContain("not replaced");
+		} finally {
+			chmodSync(path(".claude"), 0o755);
+		}
+		expect(tree(userHome).map((row) => row.replace(/ dir \d+$/, " dir"))).toEqual(before.map((row) => row.replace(/ dir \d+$/, " dir")));
 	});
 
 	it("refuses a symbolic link that points nowhere, and creates nothing", async () => {
