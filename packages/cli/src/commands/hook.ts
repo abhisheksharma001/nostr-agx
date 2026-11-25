@@ -29,11 +29,6 @@ export interface HookDeps {
 	capMs?: number;
 }
 
-/** Set once the time cap has passed, so work that was still waiting changes nothing. */
-interface Expiry {
-	expired: boolean;
-}
-
 /**
  * The host's own input, when the hook has to read it: Cursor's `stop` input says whether
  * the turn finished. Null when there is no input, it is too large, or it is not a JSON object.
@@ -64,7 +59,7 @@ async function readHookInput(stream: Readable): Promise<Record<string, unknown> 
 }
 
 /** What to print for this hook call, or null for nothing. Throws on any failure: the caller turns that into silence. */
-async function decide(event: HookEvent, options: HookOptions, input: Readable | undefined, expiry: Expiry): Promise<Record<string, unknown> | null> {
+async function decide(event: HookEvent, options: HookOptions, input: Readable | undefined): Promise<Record<string, unknown> | null> {
 	if (!hookSupports(options.host, event)) {
 		return null;
 	}
@@ -72,7 +67,7 @@ async function decide(event: HookEvent, options: HookOptions, input: Readable | 
 		// Cursor runs `stop` after a turn the user stopped or that failed as well. Only a
 		// finished turn is told anything: a follow-up would override the user's stop.
 		const hostInput = stdinIsTTY() && input === stdinStream() ? null : await readHookInput(input);
-		if (expiry.expired || hostInput === null || hostInput.status !== "completed") {
+		if (hostInput === null || hostInput.status !== "completed") {
 			return null;
 		}
 	}
@@ -88,7 +83,7 @@ async function decide(event: HookEvent, options: HookOptions, input: Readable | 
 	// A new session has no memory of an earlier nudge, so it hears about all unread mail.
 	const announced = event === "session-start" ? new Set<string>() : readNudgeMarks(path);
 	const nudge = buildNudge(unread, announced, profile);
-	if (nudge === null || expiry.expired) {
+	if (nudge === null) {
 		return null;
 	}
 	const payload = renderForHost(options.host, event, nudge.text);
@@ -108,27 +103,24 @@ async function decide(event: HookEvent, options: HookOptions, input: Readable | 
  * exit 0. (Exit 2 would tell Claude Code, Cursor and Codex to block, so nothing here sets it.)
  */
 export async function hookCommand(event: HookEvent, options: HookOptions, deps: HookDeps = {}): Promise<void> {
-	const expiry: Expiry = { expired: false };
 	// Only Cursor's `stop` input is read; Claude Code and Codex hooks need nothing from it.
 	const input = event === "stop" && options.host === "cursor" ? (deps.stdin ?? stdinStream()) : undefined;
 	let timer: NodeJS.Timeout | undefined;
 	const capped = new Promise<null>((resolve) => {
-		timer = setTimeout(() => {
-			expiry.expired = true;
-			resolve(null);
-		}, deps.capMs ?? HOOK_TIME_CAP_MS);
+		timer = setTimeout(() => resolve(null), deps.capMs ?? HOOK_TIME_CAP_MS);
 	});
 	let payload: Record<string, unknown> | null = null;
 	try {
-		payload = await Promise.race([decide(event, options, input, expiry), capped]);
+		payload = await Promise.race([decide(event, options, input), capped]);
 	} catch {
 		payload = null;
 	} finally {
 		clearTimeout(timer);
-		// Stop listening: an open pipe would keep this process alive past the cap.
+		// Stop listening: an open pipe would keep this process alive past the cap, and a read
+		// that is still waiting ends here, so it cannot finish later and save a mark.
 		input?.destroy();
 	}
-	if (payload !== null && !expiry.expired) {
+	if (payload !== null) {
 		emitStdoutJson(payload);
 	}
 }

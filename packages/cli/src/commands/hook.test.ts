@@ -430,6 +430,14 @@ describe("agx hook: one nudge per new message", () => {
 		expectSilent(await hook("stop", "claude"));
 	});
 
+	it("records what a new session was told, so the first turn end stays silent", async () => {
+		expect(onlyDocument(await hook("session-start", "claude"))).toEqual({
+			hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: ALL_UNREAD },
+		});
+		expectSilent(await hook("stop", "claude"));
+		expectSilent(await hook("prompt", "claude"));
+	});
+
 	it("forgets a message once it is read, and counts only what arrived since", async () => {
 		expect(onlyDocument(await hook("stop", "claude"))).toEqual({ decision: "block", reason: ALL_UNREAD });
 		expect((await agx("thread", "thread-a", "--mark-read")).code).toBe(EXIT.ok);
