@@ -204,6 +204,12 @@ would confirm this identity and its capability set to an unauthenticated peer.
 The request still falls through to the plain-message path, so nothing is lost
 silently. `--allow-all` opts out explicitly.
 
+A peer is always a public key: an `npub1…` or 64 hex characters. A secret key is also
+64 hex characters, so by its shape alone it passes for a public key. `agx` refuses one
+case: this profile's own secret key, given to `identity allow`, `held allow`, `send`,
+`request` or `card`, is refused without being shown. Another agent's secret key typed
+in that place cannot be told from a public key, so check what you paste.
+
 ---
 
 ## Route relay WebSockets over Tailscale (opt-in)
