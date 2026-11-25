@@ -47,13 +47,13 @@ function shownContextId(stdout: string): string | undefined {
 }
 
 const UNSAFE: [string, string, string][] = [
-	["an escape sequence", "x\u001b[31my", "x�[31my"],
-	["a bell", "x\u0007y", "x�y"],
-	["a bare carriage return", "x\ry", "x�y"],
-	["a delete character", "x\u007fy", "x�y"],
-	["a C1 control (CSI)", "x\u009b2Jy", "x�2Jy"],
-	["a line separator", "x\u2028y", "x�y"],
-	["a newline that starts a second line", "x\n✓ Sent to npub1elsewhere", "x�✓ Sent to npub1elsewhere"],
+	["an escape sequence", "x\u001b[31my", "x\ufffd[31my"],
+	["a bell", "x\u0007y", "x\ufffdy"],
+	["a bare carriage return", "x\ry", "x\ufffdy"],
+	["a delete character", "x\u007fy", "x\ufffdy"],
+	["a C1 control (CSI)", "x\u009b2Jy", "x\ufffd2Jy"],
+	["a line separator", "x\u2028y", "x\ufffdy"],
+	["a newline that starts a second line", "x\n✓ Sent to npub1elsewhere", "x\ufffd✓ Sent to npub1elsewhere"],
 ];
 
 describe("agx send --context-id with control characters in the id", () => {
