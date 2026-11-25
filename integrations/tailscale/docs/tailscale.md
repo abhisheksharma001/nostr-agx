@@ -109,7 +109,8 @@ them.
   the CLI has an option for it, so the second row above does not change.
 - Peer-advertised relays are dialed the same way. `@nostr-agx/nostr` only
   accepts a peer's relay if it is a `wss://` URL that resolves to a public
-  address, so a peer-advertised relay is never a tailnet address.
+  address, so a peer-advertised relay is never the address of a node on your
+  tailnet.
 - The proxy does not limit where it dials. A relay URL you configure that points
   at `127.0.0.1` or a local-network address is dialed from this machine like any
   other. `agx` only asks the proxy to dial relay WebSockets: the relays you
