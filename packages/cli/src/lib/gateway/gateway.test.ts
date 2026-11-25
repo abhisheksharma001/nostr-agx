@@ -1,20 +1,24 @@
 import { createHmac } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
+import { readdirSync, statSync } from "node:fs";
 import type { AddressInfo } from "node:net";
-import { AgxClient, AgxPublicError, DEFAULT_CONTENT_TYPE } from "@nostr-agx/core";
+import { AgxClient, AgxPublicError, DEFAULT_CONTENT_TYPE, TASK_CONTENT_TYPE } from "@nostr-agx/core";
 import { generateKeypair, localSigner, NostrTransport, toNpub } from "@nostr-agx/nostr";
+import { nip19 } from "nostr-tools";
+import { encrypt } from "nostr-tools/nip49";
 import WebSocket from "ws";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { type RunningRelay, startRelay } from "../../relay/server.js";
 import { agx, sandbox } from "../../test/helpers.js";
 import { resolveProfileName } from "../config.js";
 import { loadIdentity } from "../identity.js";
-import { profileDir, seenPath } from "../paths.js";
+import { gatewayTaskOperationsPath, profileDir, seenPath } from "../paths.js";
 import { MESSAGES_FILE } from "../store/message-store.js";
 import { AGX_CLI_VERSION } from "../version.js";
 import { type RunningGateway, startGateway } from "./gateway.js";
+import { TaskOperationStore } from "./idempotency.js";
 import { createGatewayKey } from "./keys.js";
 
 /**
@@ -105,6 +109,18 @@ function api(path: string, init: RequestInit & { key?: string | null } = {}) {
 	});
 }
 
+/** True when `text` holds any 10-character stretch of the key's data part (not the constant `nsec1`), in any case. */
+function leaksKey(text: string, key: string): boolean {
+	const data = key.toLowerCase().slice(5);
+	const lower = text.toLowerCase();
+	for (let i = 0; i + 10 <= data.length; i++) {
+		if (lower.includes(data.slice(i, i + 10))) {
+			return true;
+		}
+	}
+	return false;
+}
+
 async function json(res: Response): Promise<Record<string, unknown>> {
 	return (await res.json()) as Record<string, unknown>;
 }
@@ -122,6 +138,11 @@ async function pumping<T>(promise: Promise<T>, client: AgxClient): Promise<T> {
 	}
 	return watched;
 }
+
+/** What the slowest tests may wait for the relay, the gateway and a webhook in
+ * turn. The 20 s `waitFor` default and a 25 s request limit ran out when other
+ * work held the CPU: one request has to outlast a whole test script. */
+const SHARED_MACHINE_MS = 60_000;
 
 async function waitFor<T>(check: () => T | undefined | false, timeoutMs = 20_000): Promise<T> {
 	const deadline = Date.now() + timeoutMs;
@@ -301,6 +322,128 @@ describe("agx gateway: outbound", () => {
 		expect(body.error).toMatchObject({ code: "timeout" });
 		expect(String((body.error as { description: string }).description)).toContain("allowed this one");
 	}, 15_000);
+
+	it("refuses a secret key given as the agent, and neither repeats nor stores it", async () => {
+		const nsec = nip19.nsecEncode(generateKeypair().secretKey);
+		const leaks = (text: string) => leaksKey(text, nsec);
+		const calls = [
+			api("/v1/tasks", { method: "POST", body: JSON.stringify({ peer: nsec, capability: "x.y" }) }),
+			api("/v1/tasks", {
+				method: "POST",
+				headers: { "idempotency-key": "secret-as-agent" },
+				body: JSON.stringify({ peer: nsec, capability: "x.y", background: true }),
+			}),
+			api("/v1/messages", { method: "POST", body: JSON.stringify({ peer: nsec, text: "hello" }) }),
+			api(`/v1/agents/${nsec}`),
+		];
+		for (const res of await Promise.all(calls)) {
+			expect(res.status).toBe(400);
+			const text = await res.text();
+			expect(text).toContain("invalid_peer");
+			expect(leaks(text)).toBe(false);
+		}
+		// Nothing the gateway wrote to its profile holds the key either.
+		let scanned = 0;
+		for (const entry of readdirSync(box.home, { recursive: true, encoding: "utf8" })) {
+			const file = join(box.home, entry);
+			let content: string;
+			try {
+				if (!statSync(file).isFile()) {
+					continue;
+				}
+				content = readFileSync(file, "utf8");
+			} catch (error) {
+				// A temporary file the gateway renamed away between the listing and the read.
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					continue;
+				}
+				throw error;
+			}
+			scanned += 1;
+			expect(leaks(content), file).toBe(false);
+		}
+		expect(scanned).toBeGreaterThan(0);
+	});
+
+	it("does not repeat a secret key found in a request path, in an answer or in the gateway's log", async () => {
+		const nsec = nip19.nsecEncode(generateKeypair().secretKey);
+		const lines: string[] = [];
+		await gateway.close();
+		gateway = await startGateway({ ...gatewayOptions(), log: (line: string) => lines.push(line) });
+		try {
+			const calls = [
+				api(`/v1/agents/${nsec}`, { method: "POST" }), // the wrong method for that route
+				api(`/v1/agent/${nsec}`), // a typo in the route
+				api(`/agents/${nsec}`, { key: null }), // outside /v1/, answered before any key is checked
+				api(`/v1/subscriptions/${nsec}`),
+				api(`/v1/subscriptions/${nsec}`, { method: "DELETE" }),
+				api(`/v1/agents/${nsec}%zz`), // a bad percent escape: decoding it throws
+				api(`/v1/agents/${nsec}`), // the route that is handled
+			];
+			for (const res of await Promise.all(calls)) {
+				expect(res.status).toBeGreaterThanOrEqual(400);
+				expect(leaksKey(await res.text(), nsec)).toBe(false);
+			}
+			// The log sink is live: the bad escape is the one answer the gateway writes to its log.
+			expect(lines.some((line) => line.startsWith("API error"))).toBe(true);
+			expect(leaksKey(lines.join("\n"), nsec)).toBe(false);
+		} finally {
+			await gateway.close();
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 30_000);
+
+	it("does not repeat an encrypted secret key (ncryptsec1…) given as the agent or found in a request path, in an answer, in the gateway's log or in its files", async () => {
+		// A NIP-49 string made from a throwaway key (scrypt cost 2^4: fast, and no more real than the key).
+		const ncryptsec = encrypt(generateKeypair().secretKey, "throwaway-password", 4);
+		const lines: string[] = [];
+		await gateway.close();
+		gateway = await startGateway({ ...gatewayOptions(), log: (line: string) => lines.push(line) });
+		try {
+			const calls = [
+				api("/v1/tasks", { method: "POST", body: JSON.stringify({ peer: ncryptsec, capability: "x.y" }) }),
+				api("/v1/messages", { method: "POST", body: JSON.stringify({ peer: ncryptsec, text: "hello" }) }),
+				api(`/v1/agents/${ncryptsec}`), // the route that is handled: 400 invalid_peer
+				api(`/v1/agents/${ncryptsec}`, { method: "POST" }), // the wrong method for that route
+				api(`/v1/agent/${ncryptsec}`), // a typo in the route
+				api(`/agents/${ncryptsec}`, { key: null }), // outside /v1/, answered before any key is checked
+				api(`/v1/subscriptions/${ncryptsec}`),
+				api(`/v1/subscriptions/${ncryptsec}`, { method: "DELETE" }),
+				api(`/v1/agents/${ncryptsec}%zz`), // a bad percent escape: decoding it throws
+			];
+			for (const res of await Promise.all(calls)) {
+				expect(res.status).toBeGreaterThanOrEqual(400);
+				expect(leaksKey(await res.text(), ncryptsec)).toBe(false);
+			}
+			// The log sink is live: the bad escape is the one answer the gateway writes to its log.
+			expect(lines.some((line) => line.startsWith("API error"))).toBe(true);
+			expect(leaksKey(lines.join("\n"), ncryptsec)).toBe(false);
+			// Nothing the gateway wrote to its profile holds the key either.
+			let scanned = 0;
+			for (const entry of readdirSync(box.home, { recursive: true, encoding: "utf8" })) {
+				const file = join(box.home, entry);
+				let content: string;
+				try {
+					if (!statSync(file).isFile()) {
+						continue;
+					}
+					content = readFileSync(file, "utf8");
+				} catch (error) {
+					// A temporary file the gateway renamed away between the listing and the read.
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+						continue;
+					}
+					throw error;
+				}
+				scanned += 1;
+				expect(leaksKey(content, ncryptsec), file).toBe(false);
+			}
+			expect(scanned).toBeGreaterThan(0);
+		} finally {
+			await gateway.close();
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 30_000);
 
 	it("sends a message the peer can read, and bounds automated replies", async () => {
 		const reader = await peer();
@@ -569,7 +712,7 @@ describe("agx gateway: outbound", () => {
 		}
 	}, 30_000);
 
-	it("restores completed idempotent results and reports unresolved work after restart", async () => {
+	it("restores completed and pending idempotent results after restart", async () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 4 });
 		let completedRuns = 0;
 		reviewer.client.handle("invoice.saved", () => ({ run: ++completedRuns }));
@@ -598,7 +741,9 @@ describe("agx gateway: outbound", () => {
 			});
 			return { run: pendingRuns };
 		});
-		const pendingBody = JSON.stringify({ peer: reviewer.npub, capability: "invoice.unknown", timeoutSec: 1 });
+		// Long enough that the task cannot time out before the gateway stops, even on
+		// a busy machine: a 504 here would end the test with no gateway running.
+		const pendingBody = JSON.stringify({ peer: reviewer.npub, capability: "invoice.unknown", timeoutSec: 20 });
 		const pending = api("/v1/tasks", {
 			method: "POST",
 			headers: { "idempotency-key": "restart-pending" },
@@ -607,24 +752,63 @@ describe("agx gateway: outbound", () => {
 		pending.catch(() => undefined);
 		await waitForPeer(() => pendingRuns === 1, reviewer.client);
 		await gateway.close();
+		const outcome = await pending.then(
+			(res) => `answered ${res.status}`,
+			() => "rejected",
+		);
+		// Restart before asserting: a failed assertion with the gateway stopped would
+		// fail every test after this one with "fetch failed".
+		gateway = await startGateway(gatewayOptions());
+		expect(outcome).toBe("rejected");
+		const retry = api("/v1/tasks", {
+			method: "POST",
+			headers: { "idempotency-key": "restart-pending" },
+			body: pendingBody,
+		});
+		release();
+		const recovered = await pumping(retry, reviewer.client);
+		expect(recovered.status).toBe(200);
+		expect(await json(recovered)).toMatchObject({ status: "completed", output: { run: 1 } });
+		expect(pendingRuns).toBe(1);
+	}, 45_000);
+
+	it("keeps the idempotency key when a recovered task's peer failure text reads like a local error", async () => {
+		// The recovered path's twin of the live-path test: read as this gateway's
+		// "payload exceeds" error, the peer's words would give a retryable 413, free
+		// the key, and a retry would send the task again.
+		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
+		let runs = 0;
+		let release: () => void = () => undefined;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		reviewer.client.handle("invoice.recovered.peer-text", async () => {
+			runs += 1;
+			await held;
+			throw new AgxPublicError("AGX request: encoded payload exceeds the transport size limit");
+		});
+		const body = JSON.stringify({ peer: reviewer.npub, capability: "invoice.recovered.peer-text", timeoutSec: 20 });
+		const call = () => api("/v1/tasks", {
+			method: "POST",
+			headers: { "idempotency-key": "recovered-peer-text" },
+			body,
+		});
+		const pending = call();
+		pending.catch(() => undefined);
+		await waitForPeer(() => runs === 1, reviewer.client);
+		await gateway.close();
 		await expect(pending).rejects.toThrow();
 		gateway = await startGateway(gatewayOptions());
-		const unknown = await api("/v1/tasks", {
-			method: "POST",
-			headers: { "idempotency-key": "restart-pending" },
-			body: pendingBody,
-		});
-		expect(unknown.status).toBe(409);
-		expect(await json(unknown)).toMatchObject({ error: { code: "result_unknown" } });
+		const rejoined = call();
 		release();
-		await new Promise((resolve) => setTimeout(resolve, 1200));
-		const stillUnknown = await api("/v1/tasks", {
-			method: "POST",
-			headers: { "idempotency-key": "restart-pending" },
-			body: pendingBody,
-		});
-		expect(stillUnknown.status).toBe(409);
-		expect(pendingRuns).toBe(1);
+		const recovered = await pumping(rejoined, reviewer.client);
+		expect(recovered.status).toBe(502);
+		const failed = await json(recovered);
+		expect(failed).toMatchObject({ error: { code: "task_failed" } });
+		const retry = await pumping(call(), reviewer.client);
+		expect(retry.status).toBe(502);
+		expect(await json(retry)).toEqual(failed);
+		expect(runs).toBe(1);
 	}, 45_000);
 
 	it("returns a background handle before completion and its stored result after reconnect", async () => {
@@ -721,7 +905,7 @@ describe("agx gateway: outbound", () => {
 		expect(await backgroundTask(failedId)).toEqual(failed);
 	}, 45_000);
 
-	it("reports interrupted background work as unknown without rerunning it", async () => {
+	it("recovers interrupted background work without rerunning it", async () => {
 		const reviewer = await peer({ authorize: "accept-all", maxConcurrentTasks: 2 });
 		let runs = 0;
 		let release: () => void = () => undefined;
@@ -741,12 +925,103 @@ describe("agx gateway: outbound", () => {
 		await waitForPeer(() => runs === 1, reviewer.client);
 		await gateway.close();
 		gateway = await startGateway(gatewayOptions());
-		const unknown = await backgroundTask(id);
-		expect(unknown).toMatchObject({ id, status: "failed", error: { code: "result_unknown" } });
+		expect(await backgroundTask(id)).toMatchObject({ id, status: "running" });
 		release();
-		await new Promise((resolve) => setTimeout(resolve, 1200));
-		expect(await backgroundTask(id)).toEqual(unknown);
+		const completed = await settledBackgroundTask(id, reviewer.client);
+		expect(completed).toMatchObject({
+			id,
+			status: "completed",
+			result: { status: "completed", output: { run: 1 } },
+		});
 		expect(runs).toBe(1);
+	}, 45_000);
+
+	it("starts with stored waiting work above lowered in-flight limits and keeps all of it", async () => {
+		await gateway.close();
+		const path = gatewayTaskOperationsPath(profile);
+		const original = existsSync(path) ? readFileSync(path) : undefined;
+		try {
+			const seeded = new TaskOperationStore(profile);
+			const ids: string[] = [];
+			for (let index = 0; index < 3; index++) {
+				const view = seeded.submit(key, null, { index }, async (operationId: string) => {
+					const base = {
+						key: operationId,
+						taskId: `stored-task-${index}`,
+						peer: "c".repeat(64),
+						capability: "invoice.stored",
+						deadlineAt: Date.now() + 60_000,
+					};
+					seeded.save({ ...base, phase: "publishing" });
+					seeded.save({ ...base, phase: "waiting" });
+					return new Promise<Record<string, unknown>>(() => undefined);
+				});
+				ids.push(view.id as string);
+			}
+			seeded.close();
+
+			gateway = await startGateway({ ...gatewayOptions(), maxTaskOperationsInFlight: 1, maxBackgroundTasksInFlight: 1 });
+			for (const id of ids) {
+				expect(await backgroundTask(id)).toMatchObject({ id, status: "running" });
+			}
+			await gateway.close();
+		} finally {
+			if (original) {
+				writeFileSync(path, original);
+			} else {
+				rmSync(path, { force: true });
+			}
+			gateway = await startGateway(gatewayOptions());
+		}
+	}, 45_000);
+
+	it("stops within its shutdown budget while a task request is still publishing", async () => {
+		const original = NostrTransport.prototype.publishMessage;
+		let release: () => void = () => undefined;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let publishes = 0;
+		const spy = vi.spyOn(NostrTransport.prototype, "publishMessage").mockImplementation(async function (
+			this: NostrTransport,
+			...args: Parameters<NostrTransport["publishMessage"]>
+		) {
+			// Only the task request is held: a receipt or a message must not start the count.
+			if (args[1].contentType !== TASK_CONTENT_TYPE) {
+				return original.apply(this, args);
+			}
+			publishes += 1;
+			await held;
+			return original.apply(this, args);
+		});
+		let closing: Promise<void> | undefined;
+		let limit: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const call = api("/v1/tasks", {
+				method: "POST",
+				headers: { "idempotency-key": "shutdown-budget" },
+				body: JSON.stringify({ peer: toNpub(generateKeypair().publicKey), capability: "invoice.slow-relay", timeoutSec: 20 }),
+			});
+			call.catch(() => undefined);
+			await waitFor(() => publishes > 0);
+			const started = Date.now();
+			closing = gateway.close();
+			// The gateway's promise: stopped under the 10 s a container runtime gives.
+			const outcome = await Promise.race([
+				closing.then(() => "stopped"),
+				new Promise((resolve) => {
+					limit = setTimeout(() => resolve("still stopping"), 10_000);
+				}),
+			]);
+			expect(outcome).toBe("stopped");
+			expect(Date.now() - started).toBeLessThan(10_000);
+		} finally {
+			clearTimeout(limit);
+			release();
+			spy.mockRestore();
+			await closing;
+			gateway = await startGateway(gatewayOptions());
+		}
 	}, 45_000);
 });
 
@@ -921,17 +1196,17 @@ describe("agx gateway: inbound", () => {
 			allowedPeers: [requester.npub],
 			maxTaskAgeSec: 2,
 		});
-		const first = requester.client.request(gateway.npub, "invoice.queue", { n: 1 }, { timeoutMs: 25_000 });
-		await waitFor(() => busy.held.length === 1);
+		const first = requester.client.request(gateway.npub, "invoice.queue", { n: 1 }, { timeoutMs: SHARED_MACHINE_MS });
+		await waitFor(() => busy.held.length === 1, SHARED_MACHINE_MS);
 		// One task per webhook in these tests: the second waits its turn.
-		const second = requester.client.request(gateway.npub, "invoice.queue", { n: 2 }, { timeoutMs: 25_000 });
+		const second = requester.client.request(gateway.npub, "invoice.queue", { n: 2 }, { timeoutMs: SHARED_MACHINE_MS });
 		second.catch(() => undefined);
 		await new Promise((r) => setTimeout(r, 3500));
 		busy.answer(0, { n: 1 });
 		await expect(pumping(first, requester.client)).resolves.toEqual({ n: 1 });
 		await expect(pumping(second, requester.client)).rejects.toThrow("the workflow was busy for too long");
 		expect(busy.held).toHaveLength(1);
-	}, 30_000);
+	}, 120_000);
 
 	it("refuses tasks past a webhook's queue or the gateway's limit as busy, and keeps reading the inbox", async () => {
 		// One running and one waiting per webhook, three tasks in all.
@@ -946,13 +1221,13 @@ describe("agx gateway: inbound", () => {
 			const fast = await webhook(() => ({ status: 200, body: { fast: true } }));
 			await subscribe({ url: fast.url, events: ["task"], capabilities: ["invoice.quick"], allowedPeers: [requester.npub] });
 			const ask = (capability: string, n: number) => {
-				const result = requester.client.request(gateway.npub, capability, { n }, { timeoutMs: 25_000 });
+				const result = requester.client.request(gateway.npub, capability, { n }, { timeoutMs: SHARED_MACHINE_MS });
 				result.catch(() => undefined);
 				return result;
 			};
 
 			const running = ask("invoice.pile", 1);
-			await waitFor(() => slow.held.length === 1);
+			await waitFor(() => slow.held.length === 1, SHARED_MACHINE_MS);
 			const waiting = ask("invoice.pile", 2);
 			await new Promise((r) => setTimeout(r, 1000));
 			// The slow webhook's queue is full: refused at once, not held.
@@ -961,13 +1236,13 @@ describe("agx gateway: inbound", () => {
 			await expect(pumping(ask("invoice.quick", 4), requester.client)).resolves.toEqual({ fast: true });
 
 			const otherRunning = ask("invoice.other", 5);
-			await waitFor(() => other.held.length === 1);
+			await waitFor(() => other.held.length === 1, SHARED_MACHINE_MS);
 			// Three tasks in flight: the gateway refuses the next, wherever it goes.
 			await expect(pumping(ask("invoice.quick", 6), requester.client)).rejects.toThrow("the gateway is busy");
 
 			slow.answer(0, { n: 1 });
 			await expect(pumping(running, requester.client)).resolves.toEqual({ n: 1 });
-			await waitFor(() => slow.held.length === 2);
+			await waitFor(() => slow.held.length === 2, SHARED_MACHINE_MS);
 			slow.answer(1, { n: 2 });
 			await expect(pumping(waiting, requester.client)).resolves.toEqual({ n: 2 });
 			other.answer(0, { n: 5 });
@@ -978,7 +1253,7 @@ describe("agx gateway: inbound", () => {
 			await gateway.close();
 			gateway = await startGateway(gatewayOptions());
 		}
-	}, 60_000);
+	}, 120_000);
 
 	it("answers `result too large` for a workflow answer it could never send on", async () => {
 		const requester = await peer();

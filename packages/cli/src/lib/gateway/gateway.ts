@@ -19,7 +19,7 @@ import { loadIdentity } from "../identity.js";
 import { createCollector } from "../inbox.js";
 import { acquireLock } from "../lock.js";
 import { profileDir } from "../paths.js";
-import { toHexPubkey } from "../peer.js";
+import { isPastedSecretKey, toHexPubkey } from "../peer.js";
 import { FileSeenStore, loadState, updateState } from "../state.js";
 import { MessageStore } from "../store/message-store.js";
 import { createTransport } from "../transport.js";
@@ -27,9 +27,9 @@ import { AGX_CLI_VERSION } from "../version.js";
 import { DeliveryQueue, deliver } from "./delivery.js";
 import { messageEvent, receiptEvent, taskEvent } from "./events.js";
 import { ApiError, readJson, sendError, sendJson } from "./http.js";
-import { parseIdempotencyKey, TaskOperationStore } from "./idempotency.js";
+import { MAX_BACKGROUND_TASKS_IN_FLIGHT, parseIdempotencyKey, TaskOperationStore } from "./idempotency.js";
 import { verifyGatewayKey } from "./keys.js";
-import { type OperationDeps, parseTaskRequest, readCard, runTaskRequest, sendMessage } from "./operations.js";
+import { type OperationDeps, parseTaskRequest, readCard, runRecoveredTaskRequest, runTaskRequest, sendMessage } from "./operations.js";
 import { Requester } from "./requester.js";
 import { KeyedSlots } from "./slots.js";
 import {
@@ -63,6 +63,9 @@ export interface GatewayOptions {
 	port?: number;
 	/** Inbox poll interval, ms. Default 3000. */
 	pollIntervalMs?: number;
+	/** Per-run Tailscale opt-in/out (`--tailscale`, `--without-tailscale`). */
+	tailscale?: boolean;
+	withoutTailscale?: boolean;
 	logger?: AgxLogger;
 	/** One line per thing the gateway did, for its console. */
 	log?: (line: string) => void;
@@ -123,6 +126,11 @@ function nowSec(): number {
 	return Math.floor(Date.now() / 1000);
 }
 
+/** A request path or id as it may be quoted in an answer or a log line: never a pasted secret key. */
+function shown(value: string): string {
+	return isPastedSecretKey(value) ? "(a value with a secret key, not shown)" : value;
+}
+
 function bearer(req: IncomingMessage): string {
 	const header = req.headers.authorization ?? "";
 	return header.startsWith("Bearer ") ? header.slice(7).trim() : "";
@@ -136,9 +144,26 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 	const releaseLock = acquireLock(name);
 	let closed = false;
 	let stopGateway: (() => Promise<void>) | undefined;
+	/** Stops the transport (and with it, the run's Tailscale launcher and its
+	 * state directory). Idempotent; a no-op until the transport exists. Set up
+	 * separately from `stopGateway` so a failure during gateway construction —
+	 * before `stopGateway` is assigned — cannot orphan the launcher. */
+	let stopTransport: () => Promise<void> = async () => {};
 	try {
 		const state = loadState(name);
-		const transport = await createTransport(profile, identity, options.logger);
+		const transport = await createTransport(profile, identity, options.logger, {
+			profileName: name,
+			tailscale: options.tailscale,
+			withoutTailscale: options.withoutTailscale,
+		});
+		let transportStopped: Promise<void> | undefined;
+		stopTransport = () => {
+			// `liveDispatch: false` means client.stop() does NOT own the
+			// transport: only this explicit stop ends the Tailscale launcher and
+			// removes its per-run state directory.
+			transportStopped ??= transport.stop().catch(() => undefined);
+			return transportStopped;
+		};
 		const seen = new FileSeenStore(name);
 		// The newest messages only: the gateway runs for months.
 		const store = new MessageStore(profileDir(name), undefined, { claimSpool: true, maxMessages: MAX_HISTORY_MESSAGES });
@@ -172,13 +197,29 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			onFailure: (subscription, eventId, detail) =>
 				log(`DROP  delivery of ${eventId.slice(0, 8)} to ${subscription.id} failed: ${detail}`),
 		});
-		const requester = new Requester(transport, options.logger);
+		const requester = new Requester(
+			transport,
+			options.logger,
+			taskOperations,
+			// Stored work was admitted under the limits of an earlier run: restore all
+			// of it even when the limits were lowered since, rather than refuse to start.
+			// New work waits until the in-flight count drops below the current limits.
+			Math.max(
+				(options.maxTaskOperationsInFlight ?? MAX_TASK_REQUESTS_WAITING) +
+					(options.maxBackgroundTasksInFlight ?? MAX_BACKGROUND_TASKS_IN_FLIGHT),
+				taskOperations.list().length,
+			),
+		);
 		const deps: OperationDeps = {
 			npub: identity.npub,
 			publicKey: identity.publicKey,
 			relays: profile.relays,
 			signer: identity.signer,
 			transport,
+			// The transport's own implementation, not a fresh class: a bare
+			// `withHandshakeTimeout` carries no SOCKS agent, so with Tailscale on
+			// the gateway's agent-card lookups would dial the relay directly.
+			ws: transport.webSocket,
 			requester,
 			guard: new AutoReplyGuard(),
 			recordSent: (message) => {
@@ -482,7 +523,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				return;
 			}
 			if (!path.startsWith("/v1/")) {
-				throw new ApiError(404, "not_found", `No route for ${method} ${path}`);
+				throw new ApiError(404, "not_found", `No route for ${method} ${shown(path)}`);
 			}
 			const keyId = verifyGatewayKey(name, bearer(req));
 			if (keyId === null) {
@@ -542,7 +583,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				try {
 					const body = await readJson(req);
 					const taskRequest = parseTaskRequest(body);
-					const operation = () => runTaskRequest(deps, taskRequest);
+					const operation = (operationId: string) => runTaskRequest(deps, taskRequest, undefined, operationId);
 					if (taskRequest.background) {
 						sendJson(res, 202, taskOperations.submit(bearer(req), idempotencyKey, body, operation));
 						return;
@@ -596,14 +637,14 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 				if (method === "GET") {
 					const subscription = subscriptions.get(id);
 					if (!subscription) {
-						throw new ApiError(404, "not_found", `No subscription ${id}`);
+						throw new ApiError(404, "not_found", `No subscription ${shown(id)}`);
 					}
 					sendJson(res, 200, viewOf(subscription));
 					return;
 				}
 				if (method === "DELETE") {
 					if (!subscriptions.delete(id)) {
-						throw new ApiError(404, "not_found", `No subscription ${id}`);
+						throw new ApiError(404, "not_found", `No subscription ${shown(id)}`);
 					}
 					advertise();
 					log(`UNSUB ${id}`);
@@ -612,7 +653,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 					return;
 				}
 			}
-			throw new ApiError(404, "not_found", `No route for ${method} ${path}`);
+			throw new ApiError(404, "not_found", `No route for ${method} ${shown(path)}`);
 		};
 
 		const server: Server = createServer((req, res) => {
@@ -625,7 +666,7 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 					sendError(res, error);
 					return;
 				}
-				log(`API error on ${req.method} ${req.url}: ${error instanceof Error ? error.message : String(error)}`);
+				log(`API error on ${req.method} ${shown(req.url ?? "")}: ${error instanceof Error ? error.message : String(error)}`);
 				sendError(res, new ApiError(500, "internal_error", "The gateway could not complete the request"));
 			});
 		});
@@ -652,28 +693,37 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 			} catch (error) {
 				log(`task outcomes could not be saved: ${error instanceof Error ? error.message : String(error)}`);
 			}
-			requester.stop();
 			// One budget for the whole stop, under the 10 s a container runtime
-			// gives before it kills the process.
+			// gives before it kills the process. It includes the requester's stop,
+			// which waits for a task request still publishing.
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const deadline = new Promise<void>((resolve) => {
 				timer = setTimeout(resolve, SHUTDOWN_WAIT_MS);
 			});
-			await Promise.race([pumpLoop, deadline]);
-			// On disk before waiting for running tasks: a kill from here on loses
-			// nothing (a running task is already recorded as handled).
 			try {
-				persist();
-			} catch (error) {
-				log(`state could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+				// A requester stop that fails must not skip the saves and the lock release below.
+				await Promise.race([requester.stop().catch(() => undefined), deadline]);
+				await Promise.race([pumpLoop, deadline]);
+				// On disk before waiting for running tasks: a kill from here on loses
+				// nothing (a running task is already recorded as handled).
+				try {
+					persist();
+				} catch (error) {
+					log(`state could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				await Promise.race([Promise.all([publishing, client.tasksSettled(), queue.idle()]), deadline]);
+			} finally {
+				clearTimeout(timer);
 			}
-			await Promise.race([Promise.all([publishing, client.tasksSettled(), queue.idle()]), deadline]);
-			clearTimeout(timer);
 			if (queue.pending() > 0) {
 				log(`DROP  ${queue.pending()} message and receipt deliveries not made before stopping (they are in agx inbox)`);
 			}
 			await client.stop().catch(() => undefined);
+			await stopTransport();
 		};
+
+		const recovered = await requester.restore();
+		taskOperations.recover(recovered, (operation) => runRecoveredTaskRequest(deps, operation));
 
 		const host = options.host ?? "127.0.0.1";
 		await new Promise<void>((resolve, reject) => {
@@ -725,6 +775,10 @@ export async function startGateway(options: GatewayOptions): Promise<RunningGate
 		};
 	} catch (error) {
 		await stopGateway?.().catch(() => undefined);
+		// Covers a failure between the transport's creation and `stopGateway`'s
+		// assignment (a state store that cannot be created, say): without this
+		// the Tailscale launcher outlives the failed start and leaks its state.
+		await stopTransport();
 		releaseLock();
 		throw error;
 	}
