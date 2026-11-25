@@ -348,7 +348,7 @@ discoverable, advertise from a `serve` that actually serves something.
 
 Whatever the flags, a message body cannot pose as a header line: every line of
 it is indented (a break is any of `\n`, `\r`, `\v`, `\f`, U+0085, U+2028,
-U+2029), and control characters, ANSI escapes included, print as U+FFFD (`�`).
+U+2029), and control characters, ANSI escapes included, print as U+FFFD, the Unicode replacement character.
 The peer-supplied ids on header lines (`contextId`, a task's `taskId`, a
 receipt's `refEventId`) get the same treatment, and a task payload prints as
 one-line JSON.
