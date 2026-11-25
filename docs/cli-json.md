@@ -133,6 +133,21 @@ With `--json` each decision prints `{ "ok": true, "action": "allow", "npub": "â€
 
 Caps: 50 kept messages per held sender (the count keeps going) and 20 new unknown senders per hour.
 
+## `agx hook <event> --host <claude|cursor|codex>`
+
+The command a coding agent's hook configuration runs at the end of a turn (`stop`), at the start of a session (`session-start`) and when a prompt is sent (`prompt`). It is the hook path for `agx serve` and the other commands above: it reads the message store, never takes the profile lock (so it works while `agx serve` runs), and prints **one line of JSON in the host's own shape, or nothing**. Exit code is always `0` for a runtime error; a wrong command line is exit `1`, never `2` (all three hosts read `2` as "block").
+
+The text it carries is counts and thread ids only, never a message, subject, address or held sender's text:
+
+`agx has 2 unread messages. Threads with unread messages: thread-b, thread-a. agx threads lists every thread; agx thread <id> shows one, and agx thread <id> --mark-read marks it read once it is handled.`
+
+| Host | `stop` | `session-start` | `prompt` |
+| --- | --- | --- | --- |
+| `claude`, `codex` | `{ "decision": "block", "reason": "<text>" }` | `{ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": "<text>" } }` | `{ "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": "<text>" } }` |
+| `cursor` | `{ "followup_message": "<text>" }` | `{ "additional_context": "<text>" }` | nothing (no hook that adds context) |
+
+A message is announced once per host: `hook-nudged-<host>.json` in the profile folder keeps the ids of the unread messages already announced. `session-start` announces all unread mail again. Held senders and messages this profile sent never count. A hook cannot wake an idle agent. The full rules, the sources of each shape and the configuration to add are in [`hooks.md`](hooks.md).
+
 ## Hosts
 
 Check `schema` before reading a response. On a value you don't know, stop and tell the user to update `agx`; do not guess the shape. A new field is added within `/1`. A change that removes or renames a field raises the number (`/2`).

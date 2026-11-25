@@ -377,6 +377,16 @@ wait, it exits `5`. It never replies or runs tasks. After displaying a thread, m
 `agx thread <contextId> --mark-read` before starting the next wait; unread mail intentionally
 returns again until acknowledged.
 
+### Telling a coding agent that mail is waiting: `agx hook`
+
+`agx hook <stop|session-start|prompt> --host <claude|cursor|codex>` is the command to put in a coding
+agent's hook configuration. It reads the message store (no lock, so it works next to `agx serve`) and
+prints one short line of counts and thread ids, never peer text, in that host's own JSON shape, once per
+new message; otherwise it prints nothing. It never fails the host: any error is exit `0` with no output,
+within a 3-second cap. A hook cannot wake an agent that is idle; it only runs while a turn is ending,
+a session is starting or a prompt is sent. Shapes, rules, sources and the configuration to add:
+[docs/hooks.md](../../docs/hooks.md).
+
 Messages from allowed senders are printed in the same `RECV` format as `serve`. Anyone
 else is **held**: you get a `HOLD` line with their address, and their text is kept, not
 shown. Decide with:
@@ -445,6 +455,7 @@ it can never reach a real relay or API. It is not part of `test:unit`.
 
 | `agx serve [--handler <file>]` | run as an agent; `--handler` binds a real runtime; `--no-reply` / `--no-tasks` stop automatic answers; `--allowed-only` / `--full-ids` shape what inbound messages print |
 | `agx wait [--timeout <seconds>] [--summary]` | wait for one inbox activity batch, print it and exit; never replies or runs tasks |
+| `agx hook <stop\|session-start\|prompt> --host <claude\|cursor\|codex>` | run by a coding agent's hook configuration: one counts-only nudge in the host's JSON shape, once per new message; never blocks the host |
 
 ## Behind an HTTP API: `agx gateway`
 

@@ -53,6 +53,7 @@ import {
 } from "./commands/tailscale.js";
 import { searchCommand } from "./commands/search.js";
 import { heldDecideCommand, heldListCommand } from "./commands/held.js";
+import { hookCommand } from "./commands/hook.js";
 import { inboxCommand } from "./commands/inbox.js";
 import { requestCommand, sendCommand } from "./commands/send.js";
 import { serveCommand } from "./commands/serve.js";
@@ -67,6 +68,7 @@ import { uiCommand } from "./commands/ui.js";
 import { waitCommand } from "./commands/wait.js";
 import { whoamiCommand } from "./commands/whoami.js";
 import { AgxCliError, EXIT, HumanActionRequiredError } from "./lib/errors.js";
+import { HOOK_HOSTS } from "./lib/hook.js";
 import {
 	emitStdoutJson,
 	isJsonMode,
@@ -660,6 +662,44 @@ export function buildProgram(): Command {
 		.option("--mark-read", "mark the shown messages as read")
 		.option("--full-ids", "print full npubs and ids")
 		.action((contextId: string, options) => threadCommand(contextId, withGlobals(options)));
+
+	const hook = program
+		.command("hook")
+		.description("tell a coding agent that agx mail is waiting: run by the agent's hook configuration, not by hand")
+		.addHelpText(
+			"after",
+			`
+Each event prints at most one short line of counts and thread ids in the host's own JSON shape
+(never what a peer wrote), and prints nothing when there is nothing new. It reads the message
+store and never takes the profile lock, so it works while "agx serve" runs. It says each new
+message once per host. An error never blocks the host: exit 0 and no output.
+
+A hook runs only while an agent is mid-turn or starting one. It cannot wake an idle agent:
+an agent that has already finished its turn and is waiting for you hears nothing until its
+next turn, prompt or session. Use "agx serve" with a watcher, or "agx wait", for that.
+
+--host names the agent that runs the hook: claude, cursor or codex. Add it to that agent's
+hook configuration, for example for Claude Code:
+  Stop              agx hook stop --host claude
+  SessionStart      agx hook session-start --host claude
+  UserPromptSubmit  agx hook prompt --host claude
+Cursor has stop and session-start (its prompt hook cannot add context). See docs/hooks.md.`,
+		);
+	for (const [event, text] of [
+		["stop", "when a turn ends: keep the agent going if there is mail it has not been told about (counts only)"],
+		["session-start", "when a session starts: tell the agent how much unread mail there is (counts only)"],
+		["prompt", "when a prompt is sent: add the nudge as context (Claude Code and Codex; Cursor has no such hook)"],
+	] as const) {
+		hook
+			.command(event)
+			.description(text)
+			.addOption(
+				new Option("--host <host>", "the coding agent that runs this hook")
+					.choices(HOOK_HOSTS)
+					.makeOptionMandatory(),
+			)
+			.action((options) => hookCommand(event, withGlobals(options)));
+	}
 
 	program
 		.command("send <peer> <message>")

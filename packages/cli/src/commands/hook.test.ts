@@ -1,11 +1,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-	chmodSync,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	rmSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
@@ -496,14 +496,12 @@ describe("agx hook: an error never blocks the host", () => {
 		}
 	});
 
-	it.skipIf(process.getuid?.() === 0)("says nothing, rather than nudge without a saved mark, when the mark cannot be written", async () => {
-		chmodSync(profileDir("default"), 0o500);
-		try {
-			expectSilent(await hook("stop", "claude"));
-			expectSilent(await hook("stop", "claude"));
-		} finally {
-			chmodSync(profileDir("default"), 0o700);
-		}
+	it("says nothing, rather than nudge without a saved mark, when the mark cannot be written", async () => {
+		// A folder where the mark file belongs: it can neither be read nor replaced.
+		mkdirSync(markFile("claude"), { recursive: true });
+		expectSilent(await hook("stop", "claude"));
+		expectSilent(await hook("stop", "claude"));
+		rmSync(markFile("claude"), { recursive: true });
 		expect(onlyDocument(await hook("stop", "claude"))).toEqual({ decision: "block", reason: ALL_UNREAD });
 	});
 });
