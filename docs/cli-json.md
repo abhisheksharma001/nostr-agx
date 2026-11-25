@@ -148,6 +148,28 @@ The text it carries is counts and thread ids only, never a message, subject, add
 
 A message is announced once per host: `hook-nudged-<host>.json` in the profile folder keeps the ids of the unread messages already announced. `session-start` announces all unread mail again. Held senders and messages this profile sent never count. A hook cannot wake an idle agent. The full rules, the sources of each shape and the configuration to add are in [`hooks.md`](hooks.md).
 
+## `agx link install --agent <claude|cursor|codex>`
+
+Adds the `agx hook` entries (see above) to that coding agent's user-level configuration file. It writes nothing else and never replaces an `agx hook` entry that differs from the one it would write (exit `3`, nothing changed). `--dry-run` writes nothing. Which file and what goes in it: [`hooks.md`](hooks.md#agx-link-install).
+
+`--json` returns `agx.link.install/1`:
+
+```json
+{
+  "schema": "agx.link.install/1",
+  "ok": true,
+  "agent": "claude",
+  "file": "/home/me/.claude/settings.json",
+  "dryRun": false,
+  "action": "created",
+  "added": [{ "event": "Stop", "command": "agx hook stop --host claude" }],
+  "present": [],
+  "undo": "rm /home/me/.claude/settings.json"
+}
+```
+
+`action` is `created` (there was no file), `updated` (the file was there; `added` is what was appended) or `unchanged` (every entry was already there; `undo` is `null` and nothing was written). With `dryRun: true` nothing was written and the document is the one a real run would print. `present` lists entries that were there already.
+
 ## Hosts
 
 Check `schema` before reading a response. On a value you don't know, stop and tell the user to update `agx`; do not guess the shape. A new field is added within `/1`. A change that removes or renames a field raises the number (`/2`).

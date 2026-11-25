@@ -54,6 +54,7 @@ import {
 import { searchCommand } from "./commands/search.js";
 import { heldDecideCommand, heldListCommand } from "./commands/held.js";
 import { hookCommand } from "./commands/hook.js";
+import { linkInstallCommand } from "./commands/link-install.js";
 import { inboxCommand } from "./commands/inbox.js";
 import { requestCommand, sendCommand } from "./commands/send.js";
 import { serveCommand } from "./commands/serve.js";
@@ -700,6 +701,35 @@ Cursor has stop and session-start (its prompt hook cannot add context). See docs
 			)
 			.action((options) => hookCommand(event, withGlobals(options)));
 	}
+
+	const link = program
+		.command("link")
+		.description("set up two agents that talk to each other on this machine");
+	link
+		.command("install")
+		.description("add agx's hook entries to a coding agent's own configuration, so it hears about new agx mail")
+		.addOption(
+			new Option("--agent <host>", "the coding agent to set up: claude, cursor or codex")
+				.choices(HOOK_HOSTS)
+				.makeOptionMandatory(),
+		)
+		.option("--dry-run", "print the change and write nothing")
+		.addHelpText(
+			"after",
+			`
+Adds the entries that "agx hook" answers (see "agx hook --help") to that agent's user-level
+file, and nothing else:
+  claude  ~/.claude/settings.json    Stop, SessionStart, UserPromptSubmit
+  cursor  ~/.cursor/hooks.json       stop, sessionStart
+  codex   $CODEX_HOME/hooks.json, or ~/.codex/hooks.json when CODEX_HOME is not set
+          (Codex skips new hooks until you trust them with /hooks)
+
+It prints the change and one line to undo it. The rest of the file is kept. It stops, and changes
+nothing, when the file is not a JSON object or already has an "agx hook" entry that differs from
+the one it would write (another profile, another host, a path to agx). --profile <name> makes the
+hook read that profile. See docs/hooks.md.`,
+		)
+		.action((options) => linkInstallCommand(withGlobals(options)));
 
 	program
 		.command("send <peer> <message>")

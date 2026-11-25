@@ -474,7 +474,7 @@ describe("agx link install: never replaces an entry that is not its own", () => 
 		["a JSON string", '"hooks"'],
 		["hooks that is a list", '{"hooks": []}'],
 		["hooks that is a string", '{"hooks": "x"}'],
-		["an event that is not a list", '{"hooks": {"Stop": {}}}'],
+		["an event that is not a list", '{"hooks": {"Stop": {}, "stop": {}}}'],
 		["a byte order mark", `${String.fromCharCode(0xfeff)}{"hooks": {}}`],
 	])("refuses a file that is %s, names the file and changes nothing", async (_label, text) => {
 		for (const host of ALL) {

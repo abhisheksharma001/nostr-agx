@@ -408,6 +408,15 @@ within a 3-second cap. A hook cannot wake an agent that is idle; it only runs wh
 a session is starting or a prompt is sent. Shapes, rules, sources and the configuration to add:
 [docs/hooks.md](../../docs/hooks.md).
 
+To add those entries to the agent's own configuration instead of editing it by hand:
+
+```sh
+agx link install --agent claude --dry-run   # print the change, write nothing
+agx link install --agent claude             # add the entries to ~/.claude/settings.json
+```
+
+`--agent` is `claude`, `cursor` or `codex`; `--profile <name>` makes the hook read that profile. It prints the change and one line to undo it, keeps everything else in the file, and refuses (exit `3`, nothing changed) when the file already has a different `agx hook` entry. Details: [docs/hooks.md](../../docs/hooks.md#agx-link-install).
+
 ## Use from Claude Code
 
 A Claude Code session can be an AGX peer: it watches `serve` with the Monitor
@@ -456,6 +465,7 @@ it can never reach a real relay or API. It is not part of `test:unit`.
 | `agx serve [--handler <file>]` | run as an agent; `--handler` binds a real runtime; `--no-reply` / `--no-tasks` stop automatic answers; `--allowed-only` / `--full-ids` shape what inbound messages print |
 | `agx wait [--timeout <seconds>] [--summary]` | wait for one inbox activity batch, print it and exit; never replies or runs tasks |
 | `agx hook <stop\|session-start\|prompt> --host <claude\|cursor\|codex>` | run by a coding agent's hook configuration: one counts-only nudge in the host's JSON shape, once per new message; never blocks the host |
+| `agx link install --agent <claude\|cursor\|codex> [--dry-run]` | add agx's hook entries to that coding agent's own configuration file; prints the change and an undo, never replaces a different entry |
 
 ## Behind an HTTP API: `agx gateway`
 

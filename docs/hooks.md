@@ -68,7 +68,7 @@ Notes:
 
 ## Setting it up
 
-By hand, until `agx link install` does it for you. These are the documented file locations and shapes; `agx` must be on the `PATH` the host runs hooks with.
+The easy way is `agx link install --agent <claude|cursor|codex>`, described below. By hand, these are the documented file locations and shapes; `agx` must be on the `PATH` the host runs hooks with.
 
 **Claude Code**: `~/.claude/settings.json` (all projects) or `.claude/settings.json` (one project):
 
@@ -108,6 +108,30 @@ By hand, until `agx link install` does it for you. These are the documented file
 
 Add `--profile <name>` before `hook` when the agent should read a profile other than the default one.
 
+## `agx link install`
+
+```text
+agx link install --agent <claude|cursor|codex> [--profile <name>] [--dry-run]
+```
+
+Adds the entries shown above to that agent's own user-level file, and nothing else:
+
+| Agent | File | Entries |
+| --- | --- | --- |
+| `claude` | `~/.claude/settings.json` | `Stop`, `SessionStart`, `UserPromptSubmit` |
+| `cursor` | `~/.cursor/hooks.json` | `stop`, `sessionStart` (and `"version": 1` when the file names none) |
+| `codex` | `$CODEX_HOME/hooks.json`, or `~/.codex/hooks.json` when `CODEX_HOME` is not set | `Stop`, `SessionStart`, `UserPromptSubmit` |
+
+- **It prints the change and one line to undo it.** When it created the file, the undo is `rm <file>`. When the file was there already, the undo names the entries it added, so you can delete them. It makes no backup file.
+- **`--dry-run` writes nothing**: no file, no folder. It prints what a real run would print, and refuses what a real run would refuse.
+- **It never replaces an entry that is not the one it would write.** If an event already has an `agx hook` command that differs (another `--profile`, another host, a path to `agx`, extra words, an environment prefix), it stops with exit `3`, names the entry, and changes nothing, not even the other events. Delete that entry from the file to let it write a new one. A file that is not a JSON object, or whose `hooks` or event is the wrong kind of value, is refused the same way.
+- **Running it again changes nothing**: when every entry is there it says so and writes nothing. When only some are, it adds the missing ones.
+- **The rest of the file stays as it was**: other settings, other hooks and other entries under the same event are kept, in order, and the entries go last. The file is read and written back as JSON in its own indentation, so the line layout of an inline list can change. A link to the file is kept (the file it points at is rewritten), and so are the file's permissions. The file is replaced in one rename, so a failed write leaves the old one.
+- **`--profile <name>`** writes `agx --profile <name> hook ...`, so the hook reads that profile. Without it the hook reads whatever profile `agx` would use when the host runs it (`AGX_PROFILE`, then the stored active profile). Only the global `--profile` flag counts.
+- **Codex** skips a hook it has not been told to trust: after installing, open `/hooks` in Codex and trust the new entries.
+
+What it does not do: it does not look at project-level files (`.claude/settings.json`, `.cursor/hooks.json`, `.codex/hooks.json` in a project), it does not read `CLAUDE_CONFIG_DIR`, it does not check that `agx` is on the `PATH` the host uses, and it does not guard against the agent writing the same file at the same moment. It was not run against Claude Code, Cursor or Codex themselves. Whether Cursor's command-line agent loads `~/.cursor/hooks.json` is not confirmed (see Sources).
+
 ## Sources
 
 Every host shape above was read from the host's own documentation, live (not from a cache), on 2026-11-26 between about 03:30 and 03:55 IST:
@@ -115,5 +139,7 @@ Every host shape above was read from the host's own documentation, live (not fro
 - Claude Code, hooks reference: https://code.claude.com/docs/en/hooks (published 2026-11-25): `Stop` decision control, `additionalContext`, `SessionStart` and `UserPromptSubmit` output, exit codes, hook locations.
 - Cursor, hooks: https://cursor.com/docs/hooks (`stop`, `sessionStart`, `beforeSubmitPrompt`, exit codes, locations, `loop_limit`) and https://cursor.com/docs/reference/third-party-hooks (what Cursor accepts from Claude Code's format: documented for `PreToolUse` and `Stop` only, so nothing here relies on it).
 - Codex, hooks: https://developers.openai.com/codex/hooks.md (it redirected to https://learn.chatgpt.com/docs/hooks.md): `Stop`, `SessionStart`, `UserPromptSubmit`, trust review, locations.
+
+The file locations `agx link install` writes to come from the same pages, read live on 2026-11-26 (Codex and Cursor again at about 04:12 IST): Claude Code lists `~/.claude/settings.json` (all projects), `.claude/settings.json` and `.claude/settings.local.json`; Cursor lists `~/.cursor/hooks.json` (user) and `<project>/.cursor/hooks.json`; Codex lists `$CODEX_HOME/hooks.json` (user, `~/.codex/hooks.json` when `CODEX_HOME` is unset) and `.codex/hooks.json` for a trusted project. Codex also reads hooks declared inline in `config.toml` and combines every source, so a command registered in two places can run twice; `agx link install` only looks at `hooks.json`.
 
 What was not verified: that Cursor's user-level `~/.cursor/hooks.json` loads in its command-line agent (the issue that proposed this command reports it does not; the documentation says it loads), and any behaviour of the three hosts when the hook is actually run. Hook documentation changes often; re-read the pages before relying on a shape.
