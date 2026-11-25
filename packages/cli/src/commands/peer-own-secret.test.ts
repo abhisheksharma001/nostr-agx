@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { hexToBytes } from "@nostr-agx/nostr";
 import { nip19 } from "nostr-tools";
@@ -140,6 +140,15 @@ describe("this profile's own secret key given where a peer belongs", () => {
 		expect(run.code).toBe(2);
 		expect(run.stderr).toMatch(/own secret key/i);
 		expect(run.stderr).not.toMatch(/readable by other users/);
+		expect(getProfile("default").allow).toEqual([friend.publicKey]);
+	});
+
+	it("is refused when the identity file was edited by hand and holds the key in upper case", async () => {
+		const file = JSON.parse(readFileSync(identityPath("default"), "utf8")) as Record<string, unknown>;
+		file.secretKeyHex = mine.secretKeyHex.toUpperCase();
+		writeFileSync(identityPath("default"), JSON.stringify(file), { mode: 0o600 });
+		const run = await agx("identity", "allow", mine.secretKeyHex);
+		expect(run.code).toBe(2);
 		expect(getProfile("default").allow).toEqual([friend.publicKey]);
 	});
 
