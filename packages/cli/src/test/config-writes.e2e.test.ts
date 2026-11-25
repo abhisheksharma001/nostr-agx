@@ -1,10 +1,11 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createIdentity } from "../lib/identity.js";
+import { startRelay } from "../relay/server.js";
 
 // Drives the BUILT CLI (`pnpm build` first, then `pnpm test:e2e:config`): the
 // lost update this guards against is two real processes writing config.json.
@@ -38,6 +39,41 @@ function agx(...args: string[]): Promise<Run> {
 		child.on("error", reject);
 		child.on("close", (code) => resolve({ code, stdout }));
 	});
+}
+
+/** `agx serve` on a relay of the test's own (a free port), never the default one. It runs until stopped. */
+function startServe(relayPort: number, ...args: string[]): { child: ChildProcess; done: Promise<Run>; output: () => string } {
+	const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1" };
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("AGX_")) {
+			delete env[key];
+		}
+	}
+	env.AGX_HOME = home;
+	env.AGX_RELAY = `ws://127.0.0.1:${relayPort}`;
+	const child = spawn(process.execPath, [AGX, "serve", ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+	let stdout = "";
+	child.stdout?.on("data", (chunk: Buffer) => {
+		stdout += chunk.toString();
+	});
+	child.stderr?.on("data", (chunk: Buffer) => {
+		stdout += chunk.toString();
+	});
+	const done = new Promise<Run>((resolve, reject) => {
+		child.on("error", reject);
+		child.on("close", (code) => resolve({ code, stdout }));
+	});
+	return { child, done, output: () => stdout };
+}
+
+async function until(condition: () => boolean, timeoutMs: number): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() > deadline) {
+			throw new Error("condition not met in time");
+		}
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
 }
 
 async function allowed(): Promise<Set<string>> {
@@ -177,5 +213,32 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 			missingNpubs: asked.filter((npub) => !have.has(npub)).length,
 			missingProfiles: Array.from({ length: 15 }, (_, i) => `other${i}`).filter((name) => !new RegExp(`\\b${name}\\b`).test(profiles)),
 		}).toEqual({ missingNpubs: 0, missingProfiles: [] });
+	}, 120_000);
+
+	// `serve` holds the profile lock for as long as it runs. The config lock is a different, short one, so
+	// changing the allowlist must not have to wait for `serve` to stop.
+	it("identity allow and identity deny work while agx serve holds the profile lock", async () => {
+		const relay = await startRelay({ port: 0 });
+		const serve = startServe(relay.port, "--no-reply", "--no-tasks");
+		try {
+			await until(() => serve.output().includes("watching for messages"), 30_000);
+			// Control: the profile lock really is held, so a second serve is refused.
+			const refused = await startServe(relay.port, "--no-reply", "--no-tasks").done;
+			expect(refused.code).not.toBe(0);
+			expect(refused.stdout).toContain("already running");
+
+			const kept = createIdentity().npub;
+			const dropped = createIdentity().npub;
+			const allow = await agx("identity", "allow", kept, dropped);
+			expect(allow.code, allow.stdout).toBe(0);
+			const deny = await agx("identity", "deny", dropped);
+			expect(deny.code, deny.stdout).toBe(0);
+			const have = await allowed();
+			expect({ kept: have.has(kept), dropped: have.has(dropped) }).toEqual({ kept: true, dropped: false });
+		} finally {
+			serve.child.kill("SIGINT");
+			await serve.done;
+			await relay.close();
+		}
 	}, 120_000);
 });
