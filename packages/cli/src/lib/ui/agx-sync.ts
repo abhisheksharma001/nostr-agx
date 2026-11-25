@@ -33,7 +33,9 @@ export async function createAgxSync(options: {
 	const collector = createCollector({ store: options.store, allowed: options.allowed });
 	const seen = new FileSeenStore(options.profileName);
 	const state = loadState(options.profileName);
-	const transport = await createTransport(options.profile, options.identity, logger);
+	const transport = await createTransport(options.profile, options.identity, logger, {
+		profileName: options.profileName,
+	});
 	const client = new AgxClient({
 		transport,
 		seen,
@@ -45,12 +47,19 @@ export async function createAgxSync(options: {
 		onMessage: (msg) => {
 			collector.onMessage(msg);
 		},
-		onReceipt: (receipt) => collector.onReceipt(receipt),
+		onReceipt: (receipt) => {
+			collector.onReceipt(receipt);
+		},
 	});
 	await client.start({
 		pollIntervalMs: 0,
 		advertise: false,
 		liveDispatch: false,
+	}).catch(async (error: unknown) => {
+		// `liveDispatch: false` means client.stop() would not own the transport:
+		// a failed start must not orphan the Tailscale launcher.
+		await transport.stop().catch(() => undefined);
+		throw error;
 	});
 	let cursor = state.cursor;
 	let pulling = false;
@@ -86,6 +95,10 @@ export async function createAgxSync(options: {
 		},
 		async close(): Promise<void> {
 			await client.stop().catch(() => undefined);
+			// `liveDispatch: false` means client.stop() does NOT own the
+			// transport: only this explicit stop ends the Tailscale launcher and
+			// removes its per-run state directory.
+			await transport.stop().catch(() => undefined);
 			options.store.flush();
 			seen.flush();
 		},

@@ -206,6 +206,61 @@ silently. `--allow-all` opts out explicitly.
 
 ---
 
+## Route relay WebSockets over Tailscale (opt-in)
+
+Tailscale is transport-only. When enabled, the CLI loads the optional
+`@nostr-agx/tailscale` package, starts a bundled tsnet node, gets an authenticated
+loopback SOCKS5 proxy, and passes it to `NostrTransport` as `relayProxy`. No
+installed `tailscale` command, `tailscale serve` rule, tailnet URL adoption,
+Funnel or port forwarding is needed; Nostr remains the transport and nothing is
+exposed publicly. Install both packages together when you want this path:
+
+```sh
+npm install -g @nostr-agx/cli @nostr-agx/tailscale
+```
+
+```bash
+printf %s "$TS_AUTHKEY" | agx tailscale enable --auth-key-stdin
+agx serve
+```
+
+Or configure an OAuth service instead of a key:
+
+```bash
+printf %s "$CLIENT_SECRET" | agx tailscale enable \
+  --oauth-url https://api.tailscale.com/api/v2/oauth/token \
+  --oauth-client-id "$CLIENT_ID" \
+  --oauth-client-secret-stdin \
+  --oauth-scope auth_keys
+```
+
+`enable` briefly starts and stops the proxy to verify the credentials;
+long-running `gateway` and `serve` commands start and own their own proxy.
+`--tailscale` and `--without-tailscale` on `gateway` and `serve` override the
+profile's opt-in for one run. `agx relay` is always local and has no Tailscale
+flags. `agx tailscale status` shows readiness without ever printing a key;
+printed proxy URLs are credential-redacted. `agx tailscale disable --forget`
+turns the opt-in off and deletes the stored secrets. Auth material lives in
+`~/.agx/profiles/<name>/tailscale.json` (mode `0600`), never in `config.json`,
+and the key reaches the launcher through its environment, never argv.
+
+Each run uses a fresh ephemeral tsnet state dir so a one-off key's tags are
+applied. Use `--state-dir <path>` to keep state across runs.
+
+Routing is all-or-nothing for the profile's transport: with Tailscale enabled,
+its relays and peer-advertised NIP-65 relays are dialed through tsnet. Public
+relays/peers are not guaranteed to be reachable that way, so keep them in a
+profile without Tailscale unless you intentionally route public traffic through
+an exit node. See [docs/tailscale.md](../../integrations/tailscale/docs/tailscale.md).
+
+See [docs/tailscale.md](../../integrations/tailscale/docs/tailscale.md) for prerequisites, ACL example,
+the full command reference, and troubleshooting. For applications that create
+their own `NostrTransport` instead of using the CLI,
+[`@nostr-agx/tailscale`](../../integrations/tailscale/README.md) provides the same programmatic
+tsnet SOCKS5 `relayProxy`.
+
+---
+
 ## Plugging in a real runtime
 
 `--handler` points `serve` at a module that default-exports capability
@@ -460,10 +515,14 @@ outcome still receive it; later retries get `409 outcome_not_retained` instead o
 again. Background outcomes are capped at 1 MiB. A background task with an outcome over that limit
 becomes `failed` with `outcome_not_retained`.
 
-The gateway records an operation before publishing it. If the gateway stops before recording the
-outcome, retries get `409 result_unknown` instead of executing possibly duplicate work. Check the
-remote agent's effects before using a different key. Validation and card-resolution failures that prove
-no task was sent are not retained for synchronous callers, so the same key can retry after the cause is
+The gateway records an operation before publishing it, then keeps its task ID, original peer and
+absolute deadline while it waits. After a planned restart, a stored background or idempotent operation
+can accept the genuine result before that deadline without publishing another task. Results received
+while the gateway was fully down are not guaranteed: the requester does not yet have its own durable
+cursor. An operation interrupted during its publish boundary, or a legacy operation without waiting
+correlation, gets `409 result_unknown` instead of executing possibly duplicate work. Check the remote
+agent's effects before using a different key. Validation and card-resolution failures that prove no
+task was sent are not retained for synchronous callers, so the same key can retry after the cause is
 fixed. A background public ID remains available as `failed` with the real error, while its idempotency
 key is freed for a retry with a new public ID. Publish failures, timeouts and remote task failures are
 retained and replayed: a relay may have stored a task even when publishing reports failure, so remote
@@ -494,9 +553,9 @@ optional `description`. An unknown, evicted, or another credential's ID gets `40
 
 An optional idempotency key makes background retries return the same task ID without publishing
 another AGX request, except after a retryable pre-publish failure as described above. Retained
-completed and failed views survive gateway restart for the same 24-hour retention period. An
-operation interrupted before its outcome was recorded becomes `failed` with `result_unknown`; the
-gateway does not execute it again automatically.
+completed and failed views survive gateway restart for the same 24-hour retention period. A waiting
+operation with durable correlation can recover as described above. One without it becomes `failed`
+with `result_unknown`; the gateway does not execute it again automatically.
 
 ### Subscriptions
 
@@ -648,6 +707,37 @@ The three failures that produce no useful error on their own are an index that
 is not running, a relay nobody is running, and a listing that is `listed` but
 not `public` — `doctor` names all three.
 
+### Only the local exchange: `agx doctor --local`
+
+The report above also needs the hosted index and a login, so it can fail while a
+purely local exchange works. `agx doctor --local` checks only what that exchange
+needs: file permissions, the identity, each relay (a real REQ/EOSE round trip)
+and the allowlist. It never contacts the index and never opens
+`credentials.json` or uses `AGX_API_KEY`; the permission check still looks at
+the mode of `credentials.json`, because a readable credential file is a problem
+whatever you run.
+
+```bash
+agx doctor --local
+```
+
+It fails with exit 3 exactly as `agx doctor` does: a relay that is down or not
+configured, a missing identity, a secret file other users can read, or an
+allowlist entry that is not an npub or hex pubkey (named by position, never
+printed). An empty allowlist is a warning, not a failure: that is the
+default-deny posture. A relay that needs NIP-42 auth is reported the same way
+as in the full report.
+
+The report ends with the checks it skipped, by name, and `agx doctor`, the
+command for the full hosted-workflow diagnosis. The skipped checks are `index`,
+`api credentials`, `credential source`, `login expiry`, `pending login`,
+`login lock`, `state files`, `listing` and `nip-05`.
+
+With `--json` the document is `{ "checks": [...], "skipped": [...] }`. The
+`skipped` list is only present under `--local`; the full report's JSON is
+unchanged. With `--fix-perms`, `--local` repairs file permissions only; it does
+not remove an abandoned login lock.
+
 ---
 
 ## Commands
@@ -676,7 +766,9 @@ not `public` — `doctor` names all three.
 | `agx ui [--port n] [--no-open] [--compose <draft.json>] [--drafts <dir>]` | a local browser UI for your conversations (see [Local UI](#local-ui)) |
 | `agx gateway` / `agx gateway key new \| list \| revoke` | the agent behind an HTTP API with signed webhooks, for n8n Cloud and other HTTP tools (see [`agx gateway`](#behind-an-http-api-agx-gateway)) |
 | `agx relay` | a local NIP-01 relay |
+| `agx tailscale enable \| up \| status \| disable` | opt-in routing to a tailnet relay for `serve`/`gateway` (`--auth-key-stdin` or OAuth; see [Tailscale](#route-relay-websockets-over-tailscale-opt-in)) |
 | `agx doctor` | preflight |
+| `agx doctor --local` | preflight of the local exchange only: permissions, identity, relays, allowlist; skips the hosted index and login |
 
 `agx register` also advertises the profile's relays on the listing, so a peer
 that finds the agent can reach it. `agx listing create --pubkey` does the same
