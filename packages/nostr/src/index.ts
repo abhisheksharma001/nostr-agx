@@ -9,7 +9,7 @@
  * is injected (Node passes `ws`; browser/edge use the global).
  */
 
-export const AGX_NOSTR_VERSION = "0.6.0";
+export const AGX_NOSTR_VERSION = "0.7.1";
 
 // Re-exported so hosts can verify a peer-supplied signed event (e.g. a key
 // possession proof) without taking their own `nostr-tools` dependency — this
@@ -47,10 +47,11 @@ export {
 	pollInbox,
 	publishToRelays,
 } from "./relay-pool";
+export * from "./relay-proxy";
 export * from "./signer";
 export {
 	assertPublicHttpsUrl,
 	assertPublicUrl,
 	type UrlSafetyResult,
 } from "./ssrf";
-export { configureWebSocket } from "./ws";
+export { configureWebSocket, type WebSocketImpl } from "./ws";

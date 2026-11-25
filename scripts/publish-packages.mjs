@@ -16,14 +16,24 @@
  * again.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { packPackage } from "./lib/pack.mjs";
 
 const root = resolve(import.meta.dirname, "..");
-/** `nostr` depends on `core`; the CLI and the n8n nodes bundle both. The
- * gateway nodes depend on nothing, but release with the CLI that serves them. */
-const ORDER = ["core", "nostr", "cli", "n8n-nodes-agx", "n8n-nodes-agx-gateway"];
+/** `nostr` depends on `core`, and `tailscale` has `nostr` as a peer; the CLI
+ * and the n8n nodes bundle core and nostr, and the CLI has `tailscale` as an
+ * optional peer. The gateway nodes depend on nothing, but release with the CLI
+ * that serves them. Paths are relative to the repository root. */
+const ORDER = [
+	"packages/core",
+	"packages/nostr",
+	"integrations/tailscale",
+	"packages/cli",
+	"packages/n8n-nodes-agx",
+	"packages/n8n-nodes-agx-gateway",
+];
 
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
@@ -36,7 +46,7 @@ const version = tag.replace(/^v/, "");
 
 const packages = ORDER.map((dir) => {
 	const manifest = JSON.parse(
-		readFileSync(join(root, "packages", dir, "package.json"), "utf8"),
+		readFileSync(join(root, dir, "package.json"), "utf8"),
 	);
 	return { dir, name: manifest.name, version: manifest.version };
 });
@@ -73,14 +83,8 @@ try {
 			console.log(`${label}: already on npm, skipped`);
 			continue;
 		}
-		const before = new Set(readdirSync(out));
-		run("pnpm", ["pack", "--pack-destination", out], {
-			cwd: join(root, "packages", pkg.dir),
-		});
-		const tarball = readdirSync(out).find((file) => !before.has(file));
-		if (!tarball) {
-			throw new Error(`pnpm pack wrote no tarball for ${label}`);
-		}
+		// pnpm pack, with each file's executable bit restored (scripts/lib/pack.mjs).
+		const tarball = packPackage(join(root, pkg.dir), out);
 		const publishArgs = ["publish", join(out, tarball), "--access", "public"];
 		// Provenance is attested by the CI provider, so only a real CI publish
 		// can ask for it.

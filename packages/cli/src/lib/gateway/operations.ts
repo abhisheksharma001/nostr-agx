@@ -1,4 +1,6 @@
 import {
+	AgxPendingRequestStoreError,
+	AgxRequestUnknownError,
 	AgxTaskFailedError,
 	type AutoReplyGuard,
 	DEFAULT_AUTO_REPLY_LIMITS,
@@ -15,9 +17,12 @@ import {
 	resolvePeerCardWithStatus,
 	resolvePeerRelays,
 	toNpub,
+	type WebSocketImpl,
 } from "@nostr-agx/nostr";
+import { isPastedSecretKey } from "../peer.js";
 import type { NewOutboundMessage } from "../store/types.js";
 import { ApiError, integer, isRecord, text } from "./http.js";
+import type { RecoveredTaskOperation } from "./idempotency.js";
 import type { Requester } from "./requester.js";
 
 /**
@@ -39,6 +44,9 @@ export interface OperationDeps {
 	signer: AgxSigner;
 	publicKey: string;
 	transport: NostrTransport;
+	/** Same WebSocket implementation the transport uses, for direct discovery
+	 * calls that bypass the transport's own caches. */
+	ws: WebSocketImpl;
 	requester: Requester;
 	guard: AutoReplyGuard;
 	/** Keeps a sent message in the profile's history, as `agx send` does. */
@@ -56,7 +64,8 @@ function peerOf(value: unknown): string {
 	const input = text(value).trim();
 	const hex = normalizePubkey(input);
 	if (!hex) {
-		throw new ApiError(400, "invalid_peer", `The agent must be an npub1… key or a 64-character hex public key, not "${input}"`);
+		const shown = isPastedSecretKey(input) ? "a secret key (nsec1…), which is not shown here" : `"${input}"`;
+		throw new ApiError(400, "invalid_peer", `The agent must be an npub1… key or a 64-character hex public key, not ${shown}`);
 	}
 	return hex;
 }
@@ -100,39 +109,38 @@ export function parseTaskRequest(input: unknown): TaskRequest {
 	};
 }
 
-export async function runTaskRequest(
+async function awaitTaskResult(
 	deps: OperationDeps,
 	req: TaskRequest,
-	signal?: AbortSignal,
+	result: Promise<unknown>,
+	recovered = false,
 ): Promise<Record<string, unknown>> {
-	if (req.checkCard) {
-		const { card, reachable } = await resolvePeerCardWithStatus(req.peer, deps.relays, deps.signer);
-		if (!reachable) {
-			throw new ApiError(
-				503,
-				"relays_unreachable",
-				`No relay answered (${deps.relays.join(", ")}), so ${req.npub}'s card could not be read`,
-				"Check the gateway's relays. Whether the agent advertises the capability is unknown until one of them answers.",
-			);
-		}
-		if (!card) {
-			throw new ApiError(404, "no_card", `No Agent Card found for ${req.npub}`, "Not every agent advertises one. Send without the card check to request anyway.");
-		}
-		if (!matchesCapability(card.capabilities, req.capability)) {
-			throw new ApiError(
-				422,
-				"capability_not_advertised",
-				`${card.displayName ?? req.npub} does not advertise "${req.capability}"`,
-				`Its card lists: ${card.capabilities.join(", ") || "no capabilities"}.`,
-			);
-		}
-	}
-
 	let output: unknown;
 	try {
-		output = await deps.requester.request(req.peer, req.capability, req.payload, req.timeoutSec * 1000, signal);
+		output = await result;
 	} catch (error) {
 		const message = messageOf(error);
+		// By type or code only: a remote peer's failure is a plain Error carrying the
+		// peer's own text, so matching text would let it pose as a local condition.
+		const code = (error as { code?: unknown } | null)?.code;
+		if (error instanceof AgxRequestUnknownError || code === "result_unknown") {
+			throw new ApiError(
+				409,
+				"result_unknown",
+				"The gateway stopped before this task's outcome was recorded",
+				"The remote agent may have executed the task. Check its effects before submitting new work.",
+			);
+		}
+		if (error instanceof AgxPendingRequestStoreError || code === "pending_request_store_failed") {
+			throw new ApiError(
+				500,
+				"idempotency_store_failed",
+				"The task's pending correlation could not be stored",
+				(error as { mayHavePublished?: unknown }).mayHavePublished === false
+					? "Nothing was sent to the remote agent. Retry with a new key once the gateway can write its task store."
+					: "Do not retry with a different key until you have checked whether the remote agent executed the task.",
+			);
+		}
 		if (message.startsWith("AGX task requires input")) {
 			throw new ApiError(
 				422,
@@ -155,7 +163,9 @@ export async function runTaskRequest(
 			throw new ApiError(
 				504,
 				"timeout",
-				`No result from ${req.npub} within ${req.timeoutSec} seconds`,
+				recovered
+					? `No result from ${req.npub} by its original deadline`
+					: `No result from ${req.npub} within ${req.timeoutSec} seconds`,
 				`AGX denies by default and a denied request gets no reply, so first check that the agent has allowed this one (${deps.npub}). Then check that it is running, serves "${req.capability}", and shares a relay with this agent or advertises its relays.`,
 			);
 		}
@@ -168,6 +178,62 @@ export async function runTaskRequest(
 		throw new ApiError(502, "task_failed", `${req.npub} reported that the task failed: ${message}`);
 	}
 	return { peer: req.npub, capability: req.capability, status: "completed", output };
+}
+
+export async function runTaskRequest(
+	deps: OperationDeps,
+	req: TaskRequest,
+	signal?: AbortSignal,
+	storageKey?: string,
+): Promise<Record<string, unknown>> {
+	if (req.checkCard) {
+		const { card, reachable } = await resolvePeerCardWithStatus(
+			req.peer,
+			deps.relays,
+			deps.signer,
+			deps.ws,
+		);
+		if (!reachable) {
+			throw new ApiError(
+				503,
+				"relays_unreachable",
+				`No relay answered (${deps.relays.join(", ")}), so ${req.npub}'s card could not be read`,
+				"Check the gateway's relays. Whether the agent advertises the capability is unknown until one of them answers.",
+			);
+		}
+		if (!card) {
+			throw new ApiError(404, "no_card", `No Agent Card found for ${req.npub}`, "Not every agent advertises one. Send without the card check to request anyway.");
+		}
+		if (!matchesCapability(card.capabilities, req.capability)) {
+			throw new ApiError(
+				422,
+				"capability_not_advertised",
+				`${card.displayName ?? req.npub} does not advertise "${req.capability}"`,
+				`Its card lists: ${card.capabilities.join(", ") || "no capabilities"}.`,
+			);
+		}
+	}
+
+	return awaitTaskResult(
+		deps,
+		req,
+		deps.requester.request(req.peer, req.capability, req.payload, req.timeoutSec * 1000, signal, storageKey),
+	);
+}
+
+export async function runRecoveredTaskRequest(
+	deps: OperationDeps,
+	operation: RecoveredTaskOperation,
+): Promise<Record<string, unknown>> {
+	return awaitTaskResult(deps, {
+		peer: operation.peer,
+		npub: toNpub(operation.peer),
+		capability: operation.capability,
+		payload: {},
+		timeoutSec: 0,
+		checkCard: false,
+		background: true,
+	}, operation.result, true);
 }
 
 /** `POST /v1/messages`: send an encrypted message. */
@@ -276,8 +342,8 @@ export async function readCard(
 ): Promise<Record<string, unknown>> {
 	const peer = peerOf(peerInput);
 	const [{ card, reachable }, relays] = await Promise.all([
-		resolvePeerCardWithStatus(peer, deps.relays, deps.signer),
-		resolvePeerRelays(peer, deps.relays, deps.signer).catch(() => [] as string[]),
+		resolvePeerCardWithStatus(peer, deps.relays, deps.signer, deps.ws),
+		resolvePeerRelays(peer, deps.relays, deps.signer, deps.ws).catch(() => [] as string[]),
 	]);
 	if (!reachable) {
 		throw new ApiError(

@@ -10,7 +10,7 @@ import { agx, sandbox } from "../test/helpers.js";
 
 const { publishMessage } = vi.hoisted(() => ({ publishMessage: vi.fn() }));
 vi.mock("../lib/transport.js", () => ({
-	createTransport: async () => ({ publishMessage }),
+	createTransport: async () => ({ publishMessage, stop: async () => undefined }),
 	makeLogger: () => undefined,
 }));
 

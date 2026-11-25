@@ -5,6 +5,7 @@ import { isIP } from "node:net";
 import { normalizePubkey } from "@nostr-agx/nostr";
 import { z } from "zod";
 import { gatewaySubscriptionsPath, writePrivateJson } from "../paths.js";
+import { isPastedSecretKey } from "../peer.js";
 
 /**
  * Webhook subscriptions: where `agx gateway` delivers what arrives for this
@@ -239,7 +240,7 @@ export function parseSubscriptionInput(
 		if (hex) {
 			allowedPeers.push(hex);
 		} else if (entry.trim()) {
-			invalid.push(entry.trim());
+			invalid.push(isPastedSecretKey(entry) ? "(a secret key, not shown)" : entry.trim());
 		}
 	}
 	if (invalid.length > 0) {

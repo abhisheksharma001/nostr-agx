@@ -1,9 +1,80 @@
 import kleur from "kleur";
 import { WebSocketServer } from "ws";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { updateProfile } from "../lib/config.js";
 import { createIdentity, saveIdentity } from "../lib/identity.js";
-import { agx, jsonDocuments, sandbox } from "../test/helpers.js";
+import { agx, capture, jsonDocuments, sandbox } from "../test/helpers.js";
+import { sendCommand } from "./send.js";
+
+const mocks = vi.hoisted(() => ({
+	createTransport: vi.fn(),
+	publishMessage: vi.fn(),
+	stop: vi.fn(async () => undefined),
+}));
+
+vi.mock("../lib/transport.js", () => ({
+	createTransport: mocks.createTransport,
+	makeLogger: () => undefined,
+}));
+
+let box: ReturnType<typeof sandbox>;
+
+beforeEach(() => {
+	box = sandbox();
+	vi.clearAllMocks();
+	mocks.createTransport.mockImplementation(async () => ({
+		publishMessage: mocks.publishMessage,
+		stop: mocks.stop,
+	}));
+	mocks.publishMessage.mockResolvedValue({
+		ok: true,
+		eventId: "evt1",
+		contextId: "ctx1",
+		accepted: 1,
+		total: 1,
+		rejected: [],
+		errors: [],
+	});
+});
+
+afterEach(() => box.restore());
+
+async function newIdentity(): Promise<string> {
+	expect((await agx("identity", "new")).code).toBe(0);
+	const shown = await agx("identity", "show");
+	const npub = /npub1[0-9a-z]+/.exec(shown.stdout)?.[0];
+	if (!npub) {
+		throw new Error("no npub in `identity show` output");
+	}
+	return npub;
+}
+
+describe("sendCommand transport lifecycle", () => {
+	it("stops the transport after a successful send", async () => {
+		const self = await newIdentity();
+		const { value } = await capture(() => sendCommand(self, "hi", {}));
+		expect(value).toBeUndefined();
+		expect(mocks.publishMessage).toHaveBeenCalledOnce();
+		expect(mocks.stop).toHaveBeenCalledOnce();
+	});
+
+	it("stops the transport when publishing fails", async () => {
+		const self = await newIdentity();
+		mocks.publishMessage.mockResolvedValue({
+			ok: false,
+			eventId: "",
+			contextId: "",
+			accepted: 0,
+			total: 0,
+			rejected: [],
+			errors: ["message too long"],
+		});
+		await expect(
+			capture(() => sendCommand(self, "hi", {})).then((run) => run.value),
+		).rejects.toThrow(/message too long/);
+		expect(mocks.stop).toHaveBeenCalledOnce();
+	});
+});
 
 // What `agx send` prints when a relay answers `["OK", id, false, "<reason>"]`.
 // The reason is the relay's own text, so it must reach the terminal as text.
@@ -18,7 +89,6 @@ const PLAIN_REASON = "blocked: rate-limited, try again later";
 // biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
 const CONTROL_CHARACTER = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029]/;
 
-let box: ReturnType<typeof sandbox>;
 let peer: string;
 const relays: { close: () => Promise<void> }[] = [];
 
@@ -26,16 +96,23 @@ beforeAll(() => {
 	kleur.enabled = false;
 });
 
-beforeEach(() => {
-	box = sandbox();
-	saveIdentity("default", createIdentity());
-	peer = createIdentity().npub;
-});
+/**
+ * Call first in each describe below. The tests above use a fake transport; these
+ * run the real one against loopback relays, send from a saved identity to `peer`,
+ * and close the relays after each test (before the sandbox is removed).
+ */
+function useLoopbackRelays(): void {
+	beforeEach(async () => {
+		const actual = await vi.importActual<typeof import("../lib/transport.js")>("../lib/transport.js");
+		mocks.createTransport.mockImplementation(actual.createTransport);
+		saveIdentity("default", createIdentity());
+		peer = createIdentity().npub;
+	});
 
-afterEach(async () => {
-	await Promise.all(relays.splice(0).map((relay) => relay.close()));
-	box.restore();
-});
+	afterEach(async () => {
+		await Promise.all(relays.splice(0).map((relay) => relay.close()));
+	});
+}
 
 /** A relay that answers every REQ with EOSE and every EVENT with `reason` as a refusal, or an acceptance when `reason` is null. */
 async function startAnsweringRelay(reason: string | null): Promise<string> {
@@ -82,6 +159,8 @@ async function sendWhileTheOnlyRelayRefuses(reason: string, ...flags: string[]) 
 }
 
 describe("agx send, when one relay refuses and another accepts", () => {
+	useLoopbackRelays();
+
 	it("prints the refusal reason with control characters replaced, so a terminal does not act on them", async () => {
 		const { run, refusing } = await sendWhileOneRelayRefuses(ESCAPE_REASON);
 
@@ -138,6 +217,8 @@ describe("agx send, when one relay refuses and another accepts", () => {
 });
 
 describe("agx send, when every relay refuses", () => {
+	useLoopbackRelays();
+
 	it.each([
 		["human", []],
 		["--json", ["--json"]],
@@ -166,6 +247,8 @@ describe("agx send, when every relay refuses", () => {
 });
 
 describe("agx send, when every relay accepts", () => {
+	useLoopbackRelays();
+
 	it("prints no refusal line", async () => {
 		const accepting = await startAnsweringRelay(null);
 		updateProfile("default", { relays: [accepting] });
