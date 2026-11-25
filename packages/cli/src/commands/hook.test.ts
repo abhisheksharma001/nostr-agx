@@ -273,6 +273,34 @@ describe("agx hook: counts and thread ids only", () => {
 	});
 });
 
+describe("agx hook: thread ids", () => {
+	it("names a thread once, however many unread messages it has", async () => {
+		addUnread("in-x1", "thread-x", 1);
+		addUnread("in-x2", "thread-x", 2);
+		addUnread("in-y", "thread-y", 3);
+		addUnread("in-x3", "thread-x", 4);
+		const run = await hook("stop", "claude");
+		expect(onlyDocument(run)).toEqual({
+			decision: "block",
+			reason: `agx has 4 unread messages. Threads with unread messages: thread-x, thread-y. ${TAIL}`,
+		});
+	});
+
+	it("does not name a thread id that a stored line carries unsafely or marks as withheld", async () => {
+		// Lines as an older, newer or hand-edited store could hold them: the reader checks again.
+		const line = (id: string, contextId: string, withheld: boolean, minute: number): string =>
+			JSON.stringify({ id, direction: "in", peer: PEER, subject: null, contextId, contextIdWithheld: withheld, text: BODY, at: at(minute), deliveryStatus: null, readAt: null });
+		mkdirSync(profileDir("default"), { recursive: true });
+		writeFileSync(
+			join(profileDir("default"), "messages.jsonl"),
+			`${line("in-raw-1", UNSAFE_CONTEXT, false, 1)}\n${line("in-raw-2", "thread-w", true, 2)}\n`,
+		);
+		const run = await hook("stop", "claude");
+		expect(onlyDocument(run)).toEqual({ decision: "block", reason: `agx has 2 unread messages. ${TAIL}` });
+		expect(run.stdout).not.toMatch(/UNSAFE|thread-w/);
+	});
+});
+
 describe("agx hook: reads the store and never takes the profile lock", () => {
 	beforeEach(() => {
 		seedStore();
