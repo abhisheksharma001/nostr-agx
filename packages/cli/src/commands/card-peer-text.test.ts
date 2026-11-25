@@ -1,4 +1,4 @@
-import { CARD_KIND, generateKeypair, localSigner, type NostrEvent, RELAY_LIST_KIND, toNpub } from "@nostr-agx/nostr";
+import { CARD_KIND, configureWebSocket, generateKeypair, localSigner, type NostrEvent, RELAY_LIST_KIND, toNpub } from "@nostr-agx/nostr";
 import kleur from "kleur";
 import { verifyEvent } from "nostr-tools";
 import WebSocket from "ws";
@@ -53,6 +53,9 @@ const relayUrl = () => `ws://127.0.0.1:${relay.port}`;
 
 beforeAll(() => {
 	kleur.enabled = false;
+	// Node 20 has no global WebSocket; the relay client needs one handed to it,
+	// as `createTransport` does for the commands that make a transport.
+	configureWebSocket(WebSocket);
 });
 
 beforeEach(async () => {
