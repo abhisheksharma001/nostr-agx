@@ -31,6 +31,13 @@ const ESC = String.fromCharCode(0x1b);
 const BEL = String.fromCharCode(0x07);
 const LINE_SEPARATOR = String.fromCharCode(0x2028);
 const CSI = String.fromCharCode(0x9b);
+const NUL = String.fromCharCode(0);
+/** Characters that do not show on screen: a right-to-left override, a zero-width space, a byte order mark, a bidi isolate and its end mark. */
+const RLO = String.fromCharCode(0x202e);
+const ZWSP = String.fromCharCode(0x200b);
+const BOM = String.fromCharCode(0xfeff);
+const LRI = String.fromCharCode(0x2066);
+const PDI = String.fromCharCode(0x2069);
 
 /** Made-up text shaped like a secret key. It is not a key. */
 const FAKE_NSEC = `nsec1${"fakekey".repeat(8)}fa`;
@@ -80,9 +87,9 @@ function leaked(shown: string, text: string): string | null {
  * The text `config show --json` prints for the profile `writeAllow` writes: the saved profile with
  * `allow` as given, then `credentials`, then (only when something was left out) `invalidPositions`.
  */
-function expectedJson(allow: string[], invalidPositions?: number[]): string {
+function expectedJson(allow: string[], invalidPositions?: number[], profileName = "default"): string {
 	const { apiKey: _key, ...profile } = profileSchema.parse({ relays: [], allow });
-	const doc = { profile: "default", ...profile, credentials: null, ...(invalidPositions ? { invalidPositions } : {}) };
+	const doc = { profile: profileName, ...profile, credentials: null, ...(invalidPositions ? { invalidPositions } : {}) };
 	return `${escapeLineBreakers(JSON.stringify(doc, null, 2))}\n`;
 }
 
@@ -146,6 +153,16 @@ const kinds: Array<[string, string, string | null]> = [
 	["an npub that carries 33 bytes", NPUB_33_BYTES, NPUB_33_BYTES],
 	["an npub that carries 64 bytes", NPUB_64_BYTES, NPUB_64_BYTES],
 	["an npub written in capitals", c.npub.toUpperCase(), c.npub.toUpperCase()],
+	// A valid key with more text after it: a check of only the first word would let the whole entry through.
+	["a valid npub, a space, then a secret key", `${d.npub} ${THROWAWAY_NSEC}`, `${d.npub} ${THROWAWAY_NSEC}`],
+	["a valid hex key, a line break, then a secret key", `${d.publicKey}\n${THROWAWAY_NSEC}`, `${d.publicKey}\n${THROWAWAY_NSEC}`],
+	["a valid hex key, a NUL character, then x", `${d.publicKey}${NUL}x`, `${d.publicKey}${NUL}x`],
+	// A valid key with a character around it that does not show on screen. Each of these is left out like any other
+	// entry that is not exactly a key.
+	["a valid hex key with a right-to-left override in front", `${RLO}${e.publicKey}`, `${RLO}${e.publicKey}`],
+	["a valid hex key with a zero-width space in front", `${ZWSP}${d.publicKey}`, `${ZWSP}${d.publicKey}`],
+	["a valid npub with a zero-width space after it", `${e.npub}${ZWSP}`, `${e.npub}${ZWSP}`],
+	["a valid hex key between a bidi isolate and its end mark", `${LRI}${e.publicKey}${PDI}`, `${LRI}${e.publicKey}${PDI}`],
 	["an empty string", "", null],
 	["a string of spaces", "   ", null],
 ];
@@ -206,6 +223,22 @@ describe("agx config show --json: an entry of allow that is not a valid peer key
 			expect(normalizePubkey(entry)).toMatch(/^[0-9a-f]{64}$/);
 		}
 		expect(doc.invalidPositions).toEqual([1, 3, 5, 6, 7, 8, 9]);
+		expect(run.stdout).toBe(expectedJson([a.publicKey, b.npub], [1, 3, 5, 6, 7, 8, 9]));
+	});
+
+	it("checks every entry of a long list, however far down the bad one is", async () => {
+		const valid = Array.from({ length: 18 }, (_unused, i) => {
+			const peer = createIdentity();
+			return [peer.npub, peer.publicKey, peer.publicKey.toUpperCase()][i % 3] as string;
+		});
+		// 20 entries: a bad one right after the first nine, and a bad one last.
+		writeAllow([...valid.slice(0, 9), FAKE_NSEC, ...valid.slice(9), THROWAWAY_NSEC]);
+		const run = await agx("config", "show", "--json");
+		expect(run.code).toBe(0);
+		expect(run.stderr).toBe("");
+		expect(leaked(run.stdout, FAKE_NSEC)).toBeNull();
+		expect(leaked(run.stdout, THROWAWAY_NSEC)).toBeNull();
+		expect(run.stdout).toBe(expectedJson(valid, [10, 20]));
 	});
 
 	it("counts a list of only bad entries as a list with entries, with nothing left in allow", async () => {
@@ -250,6 +283,7 @@ describe("agx config show --json: an entry of allow that is not a valid peer key
 		expect(run.stderr).toBe("");
 		expect(leaked(run.stdout, FAKE_NSEC)).toBeNull();
 		expect(JSON.parse(run.stdout)).toMatchObject({ profile: "work", allow: [b.publicKey], invalidPositions: [1] });
+		expect(run.stdout).toBe(expectedJson([b.publicKey], [1], "work"));
 	});
 
 	it("hides the entry in the same way when colour is on, as it is on a terminal", async () => {
@@ -322,6 +356,17 @@ describe("agx config show: other output that must not change", () => {
 		writeAllow(saved);
 		const human = await agx("config", "show");
 		expect(human.stdout).toBe(expectedHuman(6));
+		const json = await agx("config", "show", "--json");
+		expect(json.code).toBe(0);
+		expect(json.stderr).toBe("");
+		expect(json.stdout).toBe(expectedJson(saved));
+		expect(JSON.parse(json.stdout)).not.toHaveProperty("invalidPositions");
+	});
+
+	it("counts a byte order mark around a valid key as padding, as before: the entry is listed and printed as saved", async () => {
+		// `normalizePubkey` trims the entry first, and trimming removes a byte order mark as it removes a space.
+		const saved = [`${BOM}${a.publicKey}`, `${b.npub}${BOM}`, `${BOM}${c.publicKey.toUpperCase()}${BOM}`];
+		writeAllow(saved);
 		const json = await agx("config", "show", "--json");
 		expect(json.code).toBe(0);
 		expect(json.stderr).toBe("");
