@@ -120,7 +120,7 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 			onError: (error) => warn(`A message could not be stored and will be retried: ${error instanceof Error ? error.message : String(error)}`),
 		});
 
-		const transport = await createTransport(profile, identity, logger);
+		const transport = await createTransport(profile, identity, logger, { profileName });
 		const client = new AgxClient({
 			transport,
 			seen,
@@ -226,6 +226,11 @@ export async function runInboxCommand(options: InboxOptions, control: InboxRunCo
 			}
 		} finally {
 			await client.stop().catch(() => undefined);
+			// `liveDispatch: false` means client.stop() does NOT own the
+			// transport: without this explicit stop, the Tailscale launcher
+			// (unref'd, but holding stdio pipes) keeps this one-shot command
+			// alive, and its per-run state directory is never removed.
+			await transport.stop().catch(() => undefined);
 		}
 
 		if (!interrupted) {

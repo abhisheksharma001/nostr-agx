@@ -1,6 +1,6 @@
 {
 	"name": "@nostr-agx/nostr",
-	"version": "0.6.0",
+	"version": "0.7.1",
 	"description": "Nostr transport for @nostr-agx/core: end-to-end encrypted task exchange between agents, with relay routing and authentication, Agent Cards and NIP-05 domain checks.",
 	"license": "MIT",
 	"author": "Ellavox AI",
@@ -50,21 +50,26 @@
 		"test:unit": "vitest run"
 	},
 	"dependencies": {
-		"@nostr-agx/core": "workspace:*",
 		"@noble/hashes": "2.0.1",
+		"@nostr-agx/core": "workspace:*",
 		"nostr-tools": "^2.25.0"
 	},
 	"peerDependencies": {
+		"socks-proxy-agent": "^10",
 		"ws": "^8",
 		"zod": "^4"
 	},
 	"peerDependenciesMeta": {
+		"socks-proxy-agent": {
+			"optional": true
+		},
 		"ws": {
 			"optional": true
 		}
 	},
 	"devDependencies": {
 		"@types/ws": "^8.18.1",
+		"socks-proxy-agent": "^10.1.0",
 		"tsup": "^8.5.1",
 		"typescript": "^5.9.3",
 		"vitest": "^4.1.11",
