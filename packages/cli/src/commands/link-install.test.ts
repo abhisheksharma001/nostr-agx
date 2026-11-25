@@ -417,6 +417,39 @@ describe("agx link install: an existing file", () => {
 		expect(tree(userHome).map((row) => row.replace(/ dir \d+$/, " dir"))).toEqual(before.map((row) => row.replace(/ dir \d+$/, " dir")));
 	});
 
+	it("refuses a folder where the file belongs, a file it cannot read and a folder it cannot look into, and changes nothing", async () => {
+		mkdirSync(path(".claude/settings.json"), { recursive: true });
+		const before = tree(userHome);
+		let run = await install("claude");
+		expect(run.code).toBe(EXIT.config);
+		expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		expect(tree(userHome)).toEqual(before);
+		if (process.getuid?.() === 0) {
+			return;
+		}
+
+		put(FILE.cursor, "{}", 0o000);
+		try {
+			run = await install("cursor");
+			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		} finally {
+			chmodSync(path(FILE.cursor), 0o600);
+		}
+		expect(read(FILE.cursor)).toBe("{}");
+
+		put(FILE.codex, "{}");
+		chmodSync(path(".codex"), 0o000);
+		try {
+			run = await install("codex");
+			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		} finally {
+			chmodSync(path(".codex"), 0o755);
+		}
+		expect(read(FILE.codex)).toBe("{}");
+	});
+
 	it("refuses a symbolic link that points nowhere, and creates nothing", async () => {
 		mkdirSync(path(".claude"));
 		symlinkSync(path("dotfiles/missing.json"), path(FILE.claude));
