@@ -57,7 +57,7 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 
 	it("keeps every npub when two identity allow commands overlap", async () => {
 		const asked: string[] = [];
-		for (let round = 0; round < 15; round += 1) {
+		for (let round = 0; round < 50; round += 1) {
 			const a = createIdentity().npub;
 			const b = createIdentity().npub;
 			asked.push(a, b);
@@ -66,11 +66,11 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 		}
 		const have = await allowed();
 		expect(asked.filter((npub) => !have.has(npub))).toEqual([]);
-	}, 120_000);
+	}, 300_000);
 
 	it("a peer that identity deny removed stays removed when an allow overlaps it", async () => {
 		const result = { stillAllowed: [] as number[], newPeerLost: [] as number[] };
-		for (let round = 0; round < 25; round += 1) {
+		for (let round = 0; round < 50; round += 1) {
 			const x = createIdentity().npub;
 			const y = createIdentity().npub;
 			await agx("identity", "allow", x);
@@ -85,7 +85,7 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 			}
 		}
 		expect(result).toEqual({ stillAllowed: [], newPeerLost: [] });
-	}, 120_000);
+	}, 300_000);
 
 	it("keeps both changes when held allow and identity allow overlap", async () => {
 		const asked: string[] = [];
