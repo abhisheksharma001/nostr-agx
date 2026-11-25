@@ -11,7 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { AgxCliError, EXIT, usageError } from "../lib/errors.js";
 import { type HookEvent, type HookHost, isHookProfileName } from "../lib/hook.js";
 import { heading, info, json, ok, say, table } from "../lib/output.js";
@@ -71,12 +71,6 @@ function refusal(message: string, remediation: string): AgxCliError {
 /** Where a host reads its user-level hooks from, from each host's documentation (see docs/hooks.md). */
 function configFile(host: HookHost): string {
 	const home = homedir();
-	if (!home || !isAbsolute(home)) {
-		throw refusal(
-			"The home folder is not an absolute path, so there is no safe place to write.",
-			"Set HOME to your home folder and run this again.",
-		);
-	}
 	if (host === "claude") {
 		return join(home, ".claude", "settings.json");
 	}
@@ -148,7 +142,7 @@ function parse(text: string | null, file: string): Json {
  * `hook` is one of the words after it. Another tool's command that only mentions
  * agx does not count.
  */
-export function isAgxHookCommand(command: string): boolean {
+function isAgxHookCommand(command: string): boolean {
 	const words = command.trim().split(/\s+/);
 	while (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0] ?? "")) {
 		words.shift();
