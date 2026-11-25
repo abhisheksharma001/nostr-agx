@@ -26,7 +26,7 @@ export function refuseSecretKey(input: string, label = "identity"): void {
  * A profile with no identity file, or one that cannot be read, has no key to compare with.
  */
 export function refuseOwnSecretKey(input: string, profileName: string, label = "peer"): void {
-	const hex = normalizePubkey(input.trim());
+	const hex = normalizePubkey(input);
 	if (hex === null) {
 		return;
 	}
