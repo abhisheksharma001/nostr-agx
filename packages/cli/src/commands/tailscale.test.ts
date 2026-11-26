@@ -338,6 +338,42 @@ describe("agx tailscale enable checks the node before it saves anything", () => 
 		expect(`${run.stdout}${run.stderr}`).not.toContain(KEY);
 	});
 
+	it("leaves the profile as it was when the OAuth client secret cannot be written after a good check", async () => {
+		calls = [];
+		restoreStarter = setTailscaleStarterForTests(async (options) => {
+			const call: StartedCall = { options, stopped: false };
+			calls.push(call);
+			// While the node starts, a folder takes the place of the secret file: the
+			// check passes and the write that follows it fails.
+			mkdirSync(tailscaleSecretsPath("default"), { recursive: true });
+			return { url: PROXY_URL, stop: async () => void (call.stopped = true) };
+		});
+		restoreFetch = setRuntimeForTests({
+			fetch: async () => new Response(JSON.stringify({ authKey: MINTED }), { status: 200 }),
+		});
+		const run = await withStdin(CLIENT_SECRET, () =>
+			agx(
+				"tailscale",
+				"enable",
+				"--oauth-url",
+				"https://auth.example.test/token",
+				"--oauth-client-id",
+				"client-id",
+				"--oauth-client-secret-stdin",
+			),
+		);
+		expect(run.code).not.toBe(0);
+		expect(calls, "the node was not checked first").toHaveLength(1);
+		expect(resolvedKey(calls[0])).toBe(MINTED);
+		expect(calls[0].stopped).toBe(true);
+		const profile = getProfile("default");
+		expect(profile.tailscale.enabled, "opted in without a client secret").toBe(false);
+		expect(profile.tailscale.authMode).toBe("key");
+		expect(profile.tailscale.oauth.clientId).toBeNull();
+		expect(existsSync(configPath())).toBe(false);
+		expect(`${run.stdout}${run.stderr}`).not.toContain(CLIENT_SECRET);
+	});
+
 	it("checks the key it is about to store, even when another key is in the environment", async () => {
 		fakeStarter();
 		process.env.AGX_TAILSCALE_AUTH_KEY = OTHER;
