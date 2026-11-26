@@ -266,7 +266,12 @@ export class NostrTransport implements AgxTransport {
 	 * discovery calls outside the transport (the gateway's agent-card lookups)
 	 * must pass this, not the bare class they injected: a raw `ws` subclass
 	 * receives no SOCKS agent, so with Tailscale on those lookups dial the
-	 * relay directly and fail on names only the proxy's DNS can resolve. */
+	 * relay directly and fail on names only the proxy's DNS can resolve.
+	 *
+	 * Do not log or print a socket made with this class, or its agent: the SOCKS
+	 * agent (from `socks-proxy-agent`) keeps the proxy address with its user name
+	 * and password, and shows it, for example in `console.log`, while the socket
+	 * connects. The transport itself does not show them. */
 	get webSocket(): WebSocketImpl | undefined {
 		return this.ws;
 	}
