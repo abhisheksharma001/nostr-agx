@@ -170,6 +170,28 @@ describe.skipIf(!posix)("two-agents-auth-key example", () => {
 		}
 	}, RUN_TIMEOUT_MS);
 
+	it("names stdin, not an argument, as the source of a key it finds malformed", async () => {
+		const words = `tskey-${hex(6)} ${hex(6)}`;
+		const run = await runExample("two-agents-auth-key.ts", [...relayArgs(), "--auth-key-stdin"], {
+			stdin: `${words}\n`,
+		});
+		expect(run.code, run.output).toBe(1);
+		expect(run.output).toMatch(/auth key from stdin /);
+		expect(run.output).not.toMatch(/from argument/);
+		expect(run.output).not.toContain(words);
+		expect(existsSync(keyFile), "the launcher was started").toBe(false);
+	}, RUN_TIMEOUT_MS);
+
+	it("names the environment, not an argument, as the source of a key it finds malformed", async () => {
+		const words = `tskey-${hex(6)} ${hex(6)}`;
+		const run = await runExample("two-agents-auth-key.ts", relayArgs(), { env: { TS_AUTHKEY: words } });
+		expect(run.code, run.output).toBe(1);
+		expect(run.output).toMatch(/auth key from the environment /);
+		expect(run.output).not.toMatch(/from argument/);
+		expect(run.output).not.toContain(words);
+		expect(existsSync(keyFile), "the launcher was started").toBe(false);
+	}, RUN_TIMEOUT_MS);
+
 	it("still answers --help and asks for a key when none is given", async () => {
 		const help = await runExample("two-agents-auth-key.ts", ["--help"]);
 		expect(help.code).toBe(0);
