@@ -984,13 +984,16 @@ describe("agx link install: two installs at once, and a lock that was left behin
 		expect(after.hooks.SessionStart).toEqual([group(command("session-start", "claude"))]);
 	});
 
-	it("says it is already installed when another install finished the same entries in between, and adds nothing twice", async () => {
+	it("says it is already installed when another install finished the same entries in between, and writes nothing", async () => {
 		put(FILE.claude, "{}");
+		// Written on one line: a rewrite by this run would lay it out again and change the bytes.
+		const theirs = JSON.stringify(expected("claude"));
 		const { stdout } = await capture(async () =>
-			linkInstallCommand({ agent: "claude" }, { afterFirstRead: () => writeFileSync(path(FILE.claude), JSON.stringify(expected("claude"), null, 2)) }),
+			linkInstallCommand({ agent: "claude" }, { afterFirstRead: () => writeFileSync(path(FILE.claude), theirs) }),
 		);
 		expect(stdout.toLowerCase()).toContain("already installed");
-		expect(readJson(FILE.claude)).toEqual(expected("claude"));
+		expect(read(FILE.claude)).toBe(theirs);
+		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
 	});
 
 	it("refuses, and changes nothing, when what another tool wrote in between is a different agx entry", async () => {
