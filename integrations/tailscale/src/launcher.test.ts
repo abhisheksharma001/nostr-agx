@@ -198,43 +198,48 @@ describe("startBundledTailscale: an address it refuses", () => {
 		}
 	});
 
-	it.skipIf(!posix)("stops the launcher when the address does not parse", async () => {
-		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-pid-test-"));
-		const pidFile = join(dir, "pid");
-		const fake = await fakeBinary(
-			`#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\necho socks5://${USER}:${PASS}@[not-an-ip:1080\nexec cat >/dev/null\n`,
-		);
-		let pid = 0;
-		try {
-			await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 }).catch(() => undefined);
-			pid = Number((await readFile(pidFile, "utf8")).trim());
-			expect(pid).toBeGreaterThan(1);
-			const alive = (): boolean => {
-				try {
-					process.kill(pid, 0);
-					return true;
-				} catch {
-					return false;
+	for (const [label, address] of [
+		["does not parse", "[not-an-ip:1080"],
+		["has a port that cannot be used", "127.0.0.1:0"],
+	] as const) {
+		it.skipIf(!posix)(`stops the launcher when the address ${label}`, async () => {
+			const dir = await mkdtemp(join(tmpdir(), "agx-launcher-pid-test-"));
+			const pidFile = join(dir, "pid");
+			const fake = await fakeBinary(
+				`#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\necho socks5://${USER}:${PASS}@${address}\nexec cat >/dev/null\n`,
+			);
+			let pid = 0;
+			try {
+				await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 }).catch(() => undefined);
+				pid = Number((await readFile(pidFile, "utf8")).trim());
+				expect(pid).toBeGreaterThan(1);
+				const alive = (): boolean => {
+					try {
+						process.kill(pid, 0);
+						return true;
+					} catch {
+						return false;
+					}
+				};
+				const deadline = Date.now() + 5_000;
+				while (alive() && Date.now() < deadline) {
+					await new Promise((resolve) => setTimeout(resolve, 25));
 				}
-			};
-			const deadline = Date.now() + 5_000;
-			while (alive() && Date.now() < deadline) {
-				await new Promise((resolve) => setTimeout(resolve, 25));
-			}
-			expect(alive(), "the launcher was left running").toBe(false);
-		} finally {
-			// Only the child this test started.
-			if (pid > 1) {
-				try {
-					process.kill(pid, "SIGKILL");
-				} catch {
-					// already gone
+				expect(alive(), "the launcher was left running").toBe(false);
+			} finally {
+				// Only the child this test started.
+				if (pid > 1) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {
+						// already gone
+					}
 				}
+				await rm(fake.dir, { recursive: true, force: true });
+				await rm(dir, { recursive: true, force: true });
 			}
-			await rm(fake.dir, { recursive: true, force: true });
-			await rm(dir, { recursive: true, force: true });
-		}
-	});
+		});
+	}
 
 	it.skipIf(!posix)("still hands back the real credentials in a good address", async () => {
 		const fake = await fakeBinary(

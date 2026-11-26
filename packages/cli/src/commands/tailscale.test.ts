@@ -390,6 +390,43 @@ describe("agx tailscale enable checks the node before it saves anything", () => 
 		expect(`${run.stdout}${run.stderr}`).not.toContain(MINTED);
 	});
 
+	it("checks the client secret that was piped, not the one in the environment, and stores that one", async () => {
+		fakeStarter();
+		const fromEnvironment = `env-secret-${Math.random().toString(16).slice(2, 12)}`;
+		process.env.AGX_TAILSCALE_OAUTH_CLIENT_SECRET = fromEnvironment;
+		const bodies: string[] = [];
+		restoreFetch = setRuntimeForTests({
+			fetch: async (_url, init) => {
+				bodies.push(String(init?.body ?? ""));
+				return new Response(JSON.stringify({ authKey: MINTED }), { status: 200 });
+			},
+		});
+		try {
+			const run = await withStdin(CLIENT_SECRET, () =>
+				agx(
+					"tailscale",
+					"enable",
+					"--oauth-url",
+					"https://auth.example.test/token",
+					"--oauth-client-id",
+					"client-id",
+					"--oauth-token-auth",
+					"post",
+					"--oauth-client-secret-stdin",
+				),
+			);
+			expect(run.code, run.stderr).toBe(0);
+			expect(bodies).toHaveLength(1);
+			expect(bodies[0], "the check did not use the secret about to be stored").toContain(CLIENT_SECRET);
+			expect(bodies[0]).not.toContain(fromEnvironment);
+			const stored = readFileSync(tailscaleSecretsPath("default"), "utf8");
+			expect(stored).toContain(CLIENT_SECRET);
+			expect(stored).not.toContain(fromEnvironment);
+		} finally {
+			delete process.env.AGX_TAILSCALE_OAUTH_CLIENT_SECRET;
+		}
+	});
+
 	it("still uses the hostname from the environment while checking the node", async () => {
 		fakeStarter();
 		process.env.AGX_TAILSCALE_HOSTNAME = "agx-from-env";
