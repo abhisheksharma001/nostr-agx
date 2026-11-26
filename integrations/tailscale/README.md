@@ -154,22 +154,62 @@ is never logged.
   `onExit(listener)`. The listener gets `{ code, signal }` if the launcher ends without `stop()`
   having been called (it crashed, or was killed from outside); after that the proxy URL no longer
   works. It returns a function that removes the listener. A transport that is given the handle keeps
-  only `url` and `stop()`, so subscribe before handing it over.
-- **State directory.** Without `stateDir`, each node gets its own private temporary directory,
-  deleted when the node stops (a process that is killed outright leaves it behind). Pass `stateDir`
+  only `url` and `stop()`, so subscribe before handing it over. A listener that throws does not end
+  your process and does not stop the listeners after it: the error is printed as a process warning
+  (code `AGX_TAILSCALE_ONEXIT_LISTENER`) and, on the handle from `startBundledTailscale()`, kept in
+  `listenerErrors`. Each listener is called once.
+- **State directory.** Without `stateDir`, each node gets its own private temporary directory
+  (`agx-tailscale-XXXXXX` in your operating system's temporary folder, mode 0700, POSIX).
+  It holds the node's private keys, so it is deleted as soon as the launcher stops. Pass `stateDir`
   to keep a node's identity between runs; a directory you pass is never deleted. tsnet ignores a
   new auth key once its state already holds a node, so a key's tags are applied only the first time
   a directory is used.
+  - *Removed:* when `stop()` is awaited (or the launcher ends on its own), and, as a last resort,
+    when the whole process ends through `process.exit()`, an uncaught exception or an unhandled
+    promise rejection (checked by tests with a stand-in launcher). The last-resort removal is
+    synchronous and best effort.
+  - *Left behind:* when the process is ended by `SIGKILL`, or by a signal it has no handler for
+    (`SIGINT`, `SIGTERM` and `SIGHUP` do that by default), because Node does not run the exit hook
+    then. Look in the temporary folder for `agx-tailscale-*` and delete what no running process uses.
+  - This library installs no signal handlers, because that is the host's choice. A host that wants
+    the directory removed on `Ctrl-C` handles the signal and awaits `stop()`. `agx serve` does this
+    for `SIGINT` and `SIGTERM` (not `SIGHUP`), and the `agx` command line already keeps its Tailscale
+    state in its own per-run folder under `AGX_HOME`.
+  - Windows has not been tried.
 - **Environment.** The launcher gets `HOME` and the auth key, plus these when they are set and not
   empty: `USERPROFILE`, `SystemRoot`, `TMPDIR`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (upper and
-  lower case) and `TS_NO_LOGS_NO_SUPPORT`. Nothing else from your environment reaches it. The key
-  comes only from the `authKey` option: `startTailscaleRelayProxy()` reads `TS_AUTHKEY` and
-  `AGX_TAILSCALE_AUTH_KEY` for you when `authKey` is omitted, `startBundledTailscale()` does not.
-  Windows has not been tried.
+  lower case) and `TS_NO_LOGS_NO_SUPPORT`. Nothing else from your environment reaches it, including
+  `TS_AUTHKEY`, `TS_AUTH_KEY` and `AGX_TAILSCALE_AUTH_KEY`. The key comes only from the `authKey`
+  option: `startTailscaleRelayProxy()` reads `TS_AUTHKEY` and `AGX_TAILSCALE_AUTH_KEY` for you when
+  `authKey` is omitted, `startBundledTailscale()` does not. Windows has not been tried.
+  - *Proxy logins.* Proxy variables are passed on as they are, so a URL like
+    `http://user:password@host:3128` reaches the launcher. The Tailscale code inside it logs the
+    proxy URL it uses, login included. The launcher's stderr is therefore read by this package and
+    written to your stderr one line at a time, with what sits between `://` and `@` in any URL
+    replaced by `***`. Nothing else is changed. The masking only covers the launcher's output; a
+    login in your own proxy variable is still visible to anything that can read your process's
+    environment.
+  - *`TS_NO_LOGS_NO_SUPPORT`.* Tailscale reads it as a yes/no value and stops the whole launcher
+    when it cannot read it. So the value is passed on only when it is one of `1`, `t`, `T`, `TRUE`,
+    `true`, `True`, `0`, `f`, `F`, `FALSE`, `false`, `False`. Any other value is left out, with one
+    line on stderr that names the variable and not its value.
 - **Log upload.** tsnet uploads Tailscale client logs to `log.tailscale.com` by default.
-  `disableLogUpload: true` sets `TS_NO_LOGS_NO_SUPPORT=true` for the launcher to turn that off;
-  Tailscale says this also opts the device out of support that would need those logs. It is off
-  unless you ask, and the `agx` command line has no flag for it yet.
+  `disableLogUpload: true` sets `TS_NO_LOGS_NO_SUPPORT=true` for the launcher to turn that off, and
+  it wins over the value in your environment. It is off unless you ask, and the `agx` command line
+  has no flag for it yet. Side effects, as of 2026-11-26:
+  - Tailscale's logging page says the switch "disables telemetry and opts the device out of any
+    support that would require that telemetry for debugging", and that Tailscale may then not be
+    able to give technical support
+    (<https://tailscale.com/docs/features/logging>, read live 2026-11-26).
+  - The network flow logs page says nodes report flow information when flow logs are enabled "and
+    `--no-logs-no-support` is not in use", so with the switch the node does not report flows
+    (<https://tailscale.com/docs/features/logging/network-flow-logs>, read live 2026-11-26).
+  - In the source of the Tailscale release this package pins (v1.104.7), the node also tells the
+    control server that it has opted out (`hostinfo/hostinfo.go` line 67), and if a tailnet
+    requires audit logs, a node with the switch sets itself to not run and reports "tailnet
+    requires logging to be enabled" (`ipn/ipnlocal/local.go` lines 2067-2081). Neither is stated
+    on the docs pages above. They were read from the source, and not run here, so what the
+    launcher does in that second case has not been tried.
 
 ### Using a proxy that is already running
 
