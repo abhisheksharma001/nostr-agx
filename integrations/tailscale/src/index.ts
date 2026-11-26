@@ -37,7 +37,11 @@ export interface TailscaleStartOptions {
 	authKey?: string;
 	/** Tailscale hostname. Defaults to `nostr-agx`. */
 	hostname?: string;
-	/** Persistent tsnet state directory. Defaults to `~/.nostr-agx/tailscale`. */
+	/**
+	 * Persistent tsnet state directory. A node enrolled in it is reused, and the
+	 * directory is kept when the node stops. When omitted, the node gets a private
+	 * temporary directory of its own, deleted when it stops.
+	 */
 	stateDir?: string;
 	/** Alternative coordination server URL. */
 	controlUrl?: string;

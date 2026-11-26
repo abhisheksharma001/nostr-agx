@@ -7,7 +7,9 @@
  * `make -C launcher stage`.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { accessSync, chmodSync, constants, existsSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
@@ -19,7 +21,13 @@ export interface StartBundledTailscaleOptions {
 	authKey?: string;
 	/** Tailscale hostname. Defaults to agx-tailscale. */
 	hostname?: string;
-	/** Persistent tsnet state directory. Defaults to ~/.nostr-agx/tailscale. */
+	/**
+	 * Persistent tsnet state directory. A node enrolled in it is reused, and the
+	 * directory is kept when the launcher stops. When omitted, the launcher gets a
+	 * private temporary directory of its own, so two processes never share one node
+	 * identity; it is deleted when the launcher stops. `stop()` is what deletes it:
+	 * a process that is killed outright leaves it behind.
+	 */
 	stateDir?: string;
 	/** Alternative coordination server URL. */
 	controlUrl?: string;
@@ -100,8 +108,22 @@ export async function startBundledTailscale(
 	}
 
 	const executable = binary ?? process.env.AGX_TAILSCALE_BINARY ?? resolveBinary();
+	// Without a directory of its own the launcher would fall back to
+	// ~/.nostr-agx/tailscale, shared by every process: two nodes would race on one
+	// state file, and tsnet ignores a new auth key (and its tags) once the state
+	// holds a node.
+	const ownedStateDir = stateDir ? undefined : mkdtempSync(join(tmpdir(), "agx-tailscale-"));
+	const removeOwnedStateDir = (): void => {
+		if (!ownedStateDir) return;
+		try {
+			rmSync(ownedStateDir, { recursive: true, force: true });
+		} catch {
+			// Best effort: a leftover temporary directory is not worth failing a stop for.
+		}
+	};
 	const args = ["--exit-on-stdin-eof", "--connect-timeout", `${Math.ceil(timeoutMs)}ms`];
-	if (stateDir) args.push("--state-dir", stateDir);
+	const stateDirectory = stateDir || ownedStateDir;
+	if (stateDirectory) args.push("--state-dir", stateDirectory);
 	if (hostname) args.push("--hostname", hostname);
 	if (controlUrl) args.push("--control-url", controlUrl);
 	if (listen) args.push("--listen", listen);
@@ -119,11 +141,17 @@ export async function startBundledTailscale(
 		env.TS_AUTHKEY = authKey;
 	}
 
-	const child = spawn(executable, args, {
-		env,
-		stdio: ["pipe", "pipe", "inherit"],
-		windowsHide: true,
-	});
+	let child: ChildProcess;
+	try {
+		child = spawn(executable, args, {
+			env,
+			stdio: ["pipe", "pipe", "inherit"],
+			windowsHide: true,
+		});
+	} catch (error) {
+		removeOwnedStateDir();
+		throw error;
+	}
 	const { stdin, stdout } = child;
 	if (!stdin || !stdout) {
 		child.kill();
@@ -131,9 +159,19 @@ export async function startBundledTailscale(
 	}
 	stdout.setEncoding("utf8");
 	stdin.on("error", () => {});
-	child.on("error", () => {});
+	// A launcher that could not be started has no pid and never emits `exit`.
+	child.on("error", () => {
+		if (child.pid === undefined) removeOwnedStateDir();
+	});
 
-	const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+	// Whatever ends the launcher (stop, a failed start, or its own exit), its
+	// state directory goes with it, and `exited` settles only after that.
+	const exited = new Promise<void>((resolve) =>
+		child.once("exit", () => {
+			removeOwnedStateDir();
+			resolve();
+		}),
+	);
 	let url: string;
 	try {
 		url = await waitForAddress(child, stdout, timeoutMs, executable);
