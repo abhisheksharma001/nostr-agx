@@ -1,10 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { TailscaleStartOptions } from "@nostr-agx/tailscale";
-import { getProfile } from "../lib/config.js";
+import { getProfile, updateProfile } from "../lib/config.js";
 import { configPath, tailscaleSecretsPath } from "../lib/paths.js";
 import { setRuntimeForTests } from "../lib/runtime.js";
 import { setStdinForTests } from "../lib/stdin.js";
+import { saveTailscaleSecret } from "../lib/tailscale/credentials.js";
 import { setTailscaleStarterForTests } from "../lib/tailscale/index.js";
 import { agx, jsonDocuments, sandbox } from "../test/helpers.js";
 
@@ -434,5 +436,107 @@ describe("agx tailscale enable checks the node before it saves anything", () => 
 		expect(run.code, run.stderr).toBe(0);
 		expect(calls[0].options.hostname).toBe("agx-from-env");
 		expect(getProfile("default").tailscale.hostname).toBeNull();
+	});
+});
+
+describe("an OAuth service that repeats the client secret in its error", () => {
+	const RESERVED_PORTS = new Set([7447, 53505]);
+	const hex = (length: number): string => Math.random().toString(16).slice(2).padEnd(length, "0").slice(0, length);
+	let servers: Server[] = [];
+	afterEach(async () => {
+		for (const server of servers) {
+			server.closeAllConnections();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+		servers = [];
+	});
+
+	/** A token endpoint on a free local port that refuses every request and repeats the client secret it was sent. */
+	async function repeatingService(): Promise<{ url: string; received: string[] }> {
+		for (;;) {
+			const received: string[] = [];
+			const server = createServer((request, response) => {
+				let body = "";
+				request.on("data", (chunk) => (body += chunk));
+				request.on("end", () => {
+					const sent = new URLSearchParams(body).get("client_secret") ?? "";
+					received.push(sent);
+					response.writeHead(400, { "content-type": "application/json" });
+					response.end(JSON.stringify({ error: "invalid_client", error_description: `bad secret ${sent}` }));
+				});
+			});
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			const port = (server.address() as { port: number }).port;
+			if (!RESERVED_PORTS.has(port)) {
+				servers.push(server);
+				return { url: `http://127.0.0.1:${port}/oauth/token`, received };
+			}
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+		}
+	}
+
+	/** A profile that has opted in to OAuth against `tokenUrl`, with no secret stored. */
+	function oauthProfile(tokenUrl: string): void {
+		const stored = getProfile("default").tailscale;
+		updateProfile("default", {
+			tailscale: {
+				...stored,
+				enabled: true,
+				authMode: "oauth",
+				oauth: { ...stored.oauth, tokenUrl, tokenAuth: "post", clientId: "client-id" },
+			},
+		});
+	}
+
+	function expectRefusedWithoutTheSecret(run: { code: number; stdout: string; stderr: string }, secret: string, received: string[]): void {
+		expect(received, "the service did not get the secret, so the test proves nothing").toEqual([secret]);
+		expect(run.code).not.toBe(0);
+		expect(run.stderr).toMatch(/HTTP 400/);
+		expect(`${run.stdout}${run.stderr}`).not.toContain(secret);
+	}
+
+	it("is not shown the secret that is piped to `enable`", async () => {
+		fakeStarter();
+		const secret = `piped-${hex(16)}`;
+		const service = await repeatingService();
+		const run = await withStdin(secret, () =>
+			agx(
+				"tailscale",
+				"enable",
+				"--oauth-url",
+				service.url,
+				"--oauth-client-id",
+				"client-id",
+				"--oauth-token-auth",
+				"post",
+				"--oauth-client-secret-stdin",
+			),
+		);
+		expectRefusedWithoutTheSecret(run, secret, service.received);
+		expect(existsSync(tailscaleSecretsPath("default"))).toBe(false);
+	});
+
+	it("is not shown the secret that the environment names", async () => {
+		fakeStarter();
+		const secret = `env-${hex(16)}`;
+		const service = await repeatingService();
+		oauthProfile(service.url);
+		process.env.AGX_TAILSCALE_OAUTH_CLIENT_SECRET = secret;
+		try {
+			const run = await agx("tailscale", "up");
+			expectRefusedWithoutTheSecret(run, secret, service.received);
+		} finally {
+			delete process.env.AGX_TAILSCALE_OAUTH_CLIENT_SECRET;
+		}
+	});
+
+	it("is not shown the secret that is stored for the profile", async () => {
+		fakeStarter();
+		const secret = `stored-${hex(16)}`;
+		const service = await repeatingService();
+		oauthProfile(service.url);
+		saveTailscaleSecret("default", { oauthClientSecret: secret });
+		const run = await agx("tailscale", "up");
+		expectRefusedWithoutTheSecret(run, secret, service.received);
 	});
 });
