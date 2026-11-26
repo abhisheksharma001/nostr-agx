@@ -566,6 +566,36 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		}
 	}, 90_000);
 
+	it("serve --once does not give the launcher a proxy login, and masks one the launcher prints", async () => {
+		// The Tailscale code in the real launcher logs the proxy it uses (with its
+		// login) and the start of the Proxy-Authorization header. The stand-in prints
+		// such a line whatever it was given, as a launcher that still got the login would.
+		const envFile = join(home, "launcher-env");
+		writeFileSync(
+			launcher,
+			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\nenv > ${JSON.stringify(envFile)}\necho "tshttpproxy: CONNECT response from http://leakuser:leak-pw-123@127.0.0.1:9 for target \\"x:443\\" (auth \\"Basic bGVha3VzZXI6bGVh...(36 total bytes)\\"): 407" >&2\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\nexec cat >/dev/null\n`,
+			{ mode: 0o755 },
+		);
+		const run = await startWith(["serve", "--once", "--no-reply", "--no-tasks"], {
+			HTTPS_PROXY: "http://leakuser:leak-pw-123@127.0.0.1:9",
+			NO_PROXY: "127.0.0.1,localhost",
+		}).done;
+		expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+		const launcherEnv = readFileSync(envFile, "utf8");
+		expect(launcherEnv).not.toContain("leak-pw-123");
+		expect(launcherEnv).not.toMatch(/^HTTPS_PROXY=/m);
+		expect(launcherEnv).toMatch(/^NO_PROXY=127\.0\.0\.1,localhost$/m);
+		const notice = "not passing HTTPS_PROXY to the launcher";
+		expect(run.stderr.split(notice)).toHaveLength(2);
+		expect(run.stderr).toContain("(auth \"***\")");
+		expect(run.stderr).toContain("http://***@127.0.0.1:9");
+		for (const secret of ["leakuser", "leak-pw-123", "bGVha3Vz"]) {
+			expect(run.stderr, `stderr shows ${secret}`).not.toContain(secret);
+			expect(run.stdout, `stdout shows ${secret}`).not.toContain(secret);
+		}
+		expectTailscaleRunWasPerRunAndCleanedUp();
+	}, 60_000);
+
 	it("inbox exits on its own and removes the run's state dir", async () => {
 		const run = await agx("inbox", "--json", "--wait", "2");
 		expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
