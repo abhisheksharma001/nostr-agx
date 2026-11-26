@@ -682,6 +682,97 @@ describe("the exit notice", () => {
 			await rm(dir, { recursive: true, force: true });
 		}
 	});
+
+	describe("when a listener throws", () => {
+		type Proxy = Awaited<ReturnType<typeof startBundledTailscale>>;
+
+		/** What the handle kept of the errors its listeners threw. */
+		function listenerErrorsOf(proxy: Proxy): readonly unknown[] {
+			return (proxy as unknown as { listenerErrors?: readonly unknown[] }).listenerErrors ?? [];
+		}
+
+		/** Run `body` with a launcher that ends (code 7) once told to, and uncaught exceptions collected. */
+		async function withEndingLauncher(
+			body: (
+				proxy: Proxy,
+				end: () => Promise<void>,
+				uncaught: unknown[],
+				warnings: (Error & { code?: string })[],
+			) => Promise<void>,
+		): Promise<void> {
+			const dir = await mkdtemp(join(tmpdir(), "agx-launcher-exit-"));
+			const trigger = join(dir, "go");
+			const fake = await fakeBinary("#!/bin/sh\n" + endingTail(trigger, "exit 7"));
+			const uncaught: unknown[] = [];
+			const warnings: (Error & { code?: string })[] = [];
+			const onUncaught = (error: unknown): void => {
+				uncaught.push(error);
+			};
+			const onWarning = (warning: Error & { code?: string }): void => {
+				warnings.push(warning);
+			};
+			process.on("uncaughtException", onUncaught);
+			process.on("warning", onWarning);
+			let proxy: Proxy | undefined;
+			try {
+				proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+				await body(proxy, () => writeFile(trigger, ""), uncaught, warnings);
+			} finally {
+				await proxy?.stop();
+				process.off("uncaughtException", onUncaught);
+				process.off("warning", onWarning);
+				await rm(fake.dir, { recursive: true, force: true });
+				await rm(dir, { recursive: true, force: true });
+			}
+		}
+
+		it.skipIf(!posix)("still calls the listeners after it, and does not end the host", async () => {
+			await withEndingLauncher(async (proxy, end, uncaught) => {
+				const later = vi.fn();
+				proxy.onExit(() => {
+					throw new Error("listener failed");
+				});
+				proxy.onExit(later);
+				await end();
+				await until(() => later.mock.calls.length > 0);
+				await new Promise((resolve) => setTimeout(resolve, 200));
+				expect(later).toHaveBeenCalledTimes(1);
+				expect(later).toHaveBeenCalledWith({ code: 7, signal: null });
+				expect(uncaught).toEqual([]);
+			});
+		});
+
+		it.skipIf(!posix)("keeps the error on the handle and reports it as a process warning", async () => {
+			await withEndingLauncher(async (proxy, end, _uncaught, warnings) => {
+				proxy.onExit(() => {
+					throw new Error("listener failed");
+				});
+				await end();
+				await until(() => listenerErrorsOf(proxy).length === 1);
+				expect((listenerErrorsOf(proxy)[0] as Error).message).toBe("listener failed");
+				await until(() => warnings.some((w) => w.code === "AGX_TAILSCALE_ONEXIT_LISTENER"));
+				const warning = warnings.find((w) => w.code === "AGX_TAILSCALE_ONEXIT_LISTENER")!;
+				expect(warning.message).toContain("listener failed");
+			});
+		});
+
+		it.skipIf(!posix)("treats a listener that subscribes after the launcher ended the same way", async () => {
+			await withEndingLauncher(async (proxy, end, uncaught) => {
+				await end();
+				// Give the launcher time to end before anyone subscribes.
+				await new Promise((resolve) => setTimeout(resolve, 600));
+				const later = vi.fn();
+				proxy.onExit(() => {
+					throw new Error("late listener failed");
+				});
+				proxy.onExit(later);
+				await until(() => later.mock.calls.length > 0);
+				await until(() => listenerErrorsOf(proxy).length === 1);
+				expect(later).toHaveBeenCalledTimes(1);
+				expect(uncaught).toEqual([]);
+			});
+		});
+	});
 });
 
 /**
