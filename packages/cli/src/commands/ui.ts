@@ -63,8 +63,8 @@ export async function uiCommand(options: UiOptions): Promise<void> {
 	let store: UiStore;
 	let releaseLock: () => void = () => undefined;
 	let closeSync: () => Promise<void> = async () => undefined;
-	// One transport for all sends in this UI process: one tsnet child, one
-	// tailnet node and one OAuth key, stopped on shutdown.
+	// One transport for all sends and pulls in this UI process: one tsnet child,
+	// one tailnet node and one OAuth key, stopped on shutdown.
 	const sendTransport = createUiSendTransport(profile, identity, {
 		profileName,
 		verbose: options.verbose ?? false,
@@ -100,8 +100,9 @@ export async function uiCommand(options: UiOptions): Promise<void> {
 				sync: async () => {
 					pull ??= await createAgxSync({
 						profileName,
-						profile: getProfile(profileName),
+						profile: effectiveProfile(profileName),
 						identity,
+						transport: await sendTransport.get(),
 						store: messages,
 						allowed,
 						beforePull: refreshAllowed,

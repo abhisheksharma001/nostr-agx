@@ -4,7 +4,7 @@ import type { Identity } from "../identity.js";
 import { createTransport, makeLogger } from "../transport.js";
 
 /**
- * The UI's one long-lived send transport.
+ * The UI's one long-lived transport, for sending and for pulling new messages.
  *
  * Creating a transport per send would start a fresh Tailscale launcher, join a
  * fresh tailnet node and mint a fresh OAuth key for every button press. This

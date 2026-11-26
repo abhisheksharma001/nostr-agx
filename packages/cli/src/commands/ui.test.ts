@@ -1,6 +1,7 @@
 import { createServer, type Socket } from "node:net";
 import { generateKeypair } from "@nostr-agx/nostr";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { effectiveProfile } from "../lib/config.js";
 import { toDisplayNpub } from "../lib/peer.js";
 import { setStdinForTests } from "../lib/stdin.js";
 import { setTailscaleStarterForTests } from "../lib/tailscale/index.js";
@@ -116,6 +117,8 @@ beforeEach(async () => {
 	});
 	expect((await agx("identity", "new")).code).toBe(0);
 	expect((await agx("config", "set", "relays", `ws://127.0.0.1:${relay.port}`)).code).toBe(0);
+	// Nothing in these tests may reach the default relay address (ws://127.0.0.1:7447).
+	expect(effectiveProfile("default").relays).toEqual([`ws://127.0.0.1:${relay.port}`]);
 	peerNpub = toDisplayNpub(generateKeypair().publicKey);
 });
 

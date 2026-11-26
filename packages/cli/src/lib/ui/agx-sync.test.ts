@@ -30,7 +30,8 @@ afterEach(() => {
 function options(transport?: NostrTransport) {
 	return {
 		profileName: "default",
-		profile: getProfile("default"),
+		// A throwaway relay that refuses: nothing here may reach the default relay address.
+		profile: { ...getProfile("default"), relays: ["ws://127.0.0.1:9"] },
 		identity: {} as Identity,
 		store: { flush: vi.fn(), absorbSpool: vi.fn() } as unknown as MessageStore,
 		allowed: new Set<string>(),
