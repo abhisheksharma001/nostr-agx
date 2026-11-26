@@ -1254,6 +1254,25 @@ async function stderrWritingBinary(
 	return { dir, path };
 }
 
+/**
+ * A stand-in launcher that runs `body` (JavaScript) first, then reports a proxy
+ * and waits for stdin to close.
+ */
+async function scriptedStderrBinary(body: string): Promise<{ dir: string; path: string }> {
+	const dir = await mkdtemp(join(tmpdir(), "agx-launcher-script-"));
+	const path = join(dir, "fake-agx-tailscale");
+	await writeFile(
+		path,
+		`#!${process.execPath}\n${body}\n` +
+			`console.log("socks5://agx:secret@127.0.0.1:43260");\n` +
+			`process.stdin.resume();\n` +
+			`process.stdin.on("end", () => process.exit(0));\n`,
+		{ mode: 0o755 },
+	);
+	await chmod(path, 0o755);
+	return { dir, path };
+}
+
 describe("what the launcher writes on its stderr", () => {
 	/** The URL the launcher's own proxy logging prints, with credentials in it. */
 	const PROXY_LINE =
@@ -1379,6 +1398,155 @@ describe("what the launcher writes on its stderr", () => {
 			await rm(fake.dir, { recursive: true, force: true });
 		}
 	});
+
+	// A line is held until it ends, so that a login is never written in pieces. The
+	// most that is held is 64 KiB of one line.
+	const CAP = 64 * 1024;
+	const LINE_CUT = " [line cut]\n";
+
+	/** Wait for `count` cut markers in what has reached stderr. */
+	async function waitForCuts(writes: string[], count: number, timeoutMs = 15_000): Promise<string> {
+		await until(() => writes.join("").split(LINE_CUT).length - 1 >= count, timeoutMs);
+		return writes.join("");
+	}
+
+	it.skipIf(!posix)("cuts a line that is longer than the cap and goes on with the next one", async () => {
+		const fake = await stderrWritingBinary([["x".repeat(CAP + 1000) + "\nafter\n", 0]]);
+		try {
+			await withStderrWrites(async (writes) => {
+				const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+				try {
+					await until(() => writes.join("").endsWith("after\n"));
+					expect(writes.join("")).toBe("x".repeat(CAP) + LINE_CUT + "after\n");
+				} finally {
+					await proxy.stop();
+				}
+			});
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("keeps a line of exactly the cap and cuts one character more", async () => {
+		const exact = "e".repeat(CAP - 1) + "\n";
+		const over = "o".repeat(CAP) + "\n";
+		const fake = await stderrWritingBinary([[exact + over + "end\n", 0]]);
+		try {
+			await withStderrWrites(async (writes) => {
+				const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+				try {
+					await until(() => writes.join("").endsWith("end\n"));
+					expect(writes.join("")).toBe(exact + "o".repeat(CAP) + LINE_CUT + "end\n");
+				} finally {
+					await proxy.stop();
+				}
+			});
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("drops the rest of a cut line even when it arrives in many pieces", async () => {
+		const piece = "y".repeat(40_000);
+		const fake = await stderrWritingBinary([
+			[piece, 30],
+			[piece, 30],
+			[piece, 30],
+			[piece + "\nnext\n", 0],
+		]);
+		try {
+			await withStderrWrites(async (writes) => {
+				const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+				try {
+					await until(() => writes.join("").endsWith("next\n"));
+					expect(writes.join("")).toBe("y".repeat(CAP) + LINE_CUT + "next\n");
+				} finally {
+					await proxy.stop();
+				}
+			});
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("cuts a last line that is too long and has no newline", async () => {
+		const fake = await stderrWritingBinary([["z".repeat(CAP * 2), 0]]);
+		try {
+			const text = (await stderrOf(fake)).join("");
+			expect(text).toBe("z".repeat(CAP) + LINE_CUT);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	// Whatever the cap lands in the middle of, nothing of a login is written.
+	it.skipIf(!posix).each([
+		["a proxy address with a login", ' using proxy "http://zq7user:zq7pass@h.invalid:1" for me'],
+		[
+			"a CONNECT line's header text",
+			' response (auth "Basic enE3dXNlcjp6cTdwYXNz...(40 total bytes)"): 407',
+		],
+		["a header written out", " sent Proxy-Authorization: Basic enE3dXNlcjp6cTdwYXNz now"],
+		["a loose Basic value", " sent Basic enE3dXNlcjp6cTdwYXNz now"],
+	])(
+		"writes nothing of a login that the cap falls inside, for %s, wherever it falls",
+		async (_what, login) => {
+			// One line for each place the cap can fall in the login, and one with the
+			// whole login before it. Every one is longer than the cap by at least its newline.
+			const lines = login.length + 1;
+			const fake = await scriptedStderrBinary(
+				`const login = ${JSON.stringify(login)};\n` +
+					`for (let i = 0; i <= login.length; i++) {\n` +
+					`  process.stderr.write("a".repeat(${CAP} - i) + login + "\\n");\n` +
+					`}\n`,
+			);
+			try {
+				await withStderrWrites(async (writes) => {
+					const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 10_000 });
+					try {
+						const text = await waitForCuts(writes, lines);
+						expect(text.split(LINE_CUT)).toHaveLength(lines + 1);
+						expect(text).not.toMatch(/zq|7user|7pass|enE|dXNl|cjp6|cTdw|YXNz/);
+					} finally {
+						await proxy.stop();
+					}
+				});
+			} finally {
+				await rm(fake.dir, { recursive: true, force: true });
+			}
+		},
+		60_000,
+	);
+
+	it.skipIf(!posix)("passes 20 MB written as one line in a bounded time", async () => {
+		const fake = await scriptedStderrBinary(
+			`const chunk = "x".repeat(1024);\n` +
+				`let left = 20 * 1024;\n` +
+				`function go() {\n` +
+				`  while (left > 0) {\n` +
+				`    left--;\n` +
+				`    if (!process.stderr.write(chunk)) { process.stderr.once("drain", go); return; }\n` +
+				`  }\n` +
+				`  process.stderr.write("\\nthe end\\n");\n` +
+				`}\n` +
+				`go();\n`,
+		);
+		try {
+			await withStderrWrites(async (writes) => {
+				const started = Date.now();
+				const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 10_000 });
+				try {
+					await until(() => writes.join("").endsWith("the end\n"), 30_000);
+					expect(Date.now() - started).toBeLessThan(15_000);
+					expect(writes.join("")).toBe("x".repeat(CAP) + LINE_CUT + "the end\n");
+				} finally {
+					await proxy.stop();
+				}
+			});
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
 
 	it.skipIf(!posix)("reaches stderr before a failed start is reported", async () => {
 		// The launcher says why it is ending and ends before it reports an address:
