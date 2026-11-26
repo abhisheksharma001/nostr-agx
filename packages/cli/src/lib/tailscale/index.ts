@@ -244,6 +244,7 @@ function oauthFor(
 			"Configure both, keeping the secret on stdin:\n    printf %s \"$CLIENT_SECRET\" | agx tailscale enable --oauth-client-id <id> --oauth-client-secret-stdin",
 		);
 	}
+	rememberSecret(clientSecret);
 	const tokenAuth =
 		envValue("AGX_TAILSCALE_OAUTH_TOKEN_AUTH") ?? config.tokenAuth;
 	if (tokenAuth !== "basic" && tokenAuth !== "post") {
