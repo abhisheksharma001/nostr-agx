@@ -14,7 +14,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { AgxCliError, EXIT, usageError } from "../lib/errors.js";
 import { type HookEvent, type HookHost, isHookProfileName } from "../lib/hook.js";
@@ -47,7 +47,7 @@ export interface LinkInstallDeps {
 /** How long to wait for another `agx link install` that is changing the same file. */
 const LOCK_WAIT_MS = 5000;
 
-/** A lock older than this is left over from a run that never finished: its process may be gone, or its number reused. */
+/** A lock older than this is left over from a run that never finished: its process may be gone, or its number reused. A lock made on another computer is judged by this alone. */
 const LOCK_STALE_MS = 60_000;
 
 /**
@@ -433,10 +433,20 @@ function writeFile(target: string, text: string, mode: number | null, beforeRena
 	}
 }
 
+/** What a lock or a takeover file holds: this process's number and the name of this computer, and a random token that tells it from any other. */
+function lockRecord(): string {
+	return `${JSON.stringify({ pid: process.pid, host: hostname(), token: randomBytes(8).toString("hex") })}\n`;
+}
+
+/**
+ * Whether the process that made this lock has ended. A process number only means something on the computer that
+ * made it, so this is judged only for a lock made on this computer: a lock from another computer (a home folder shared
+ * between computers), or one with no computer name (an earlier format), is only ever judged by its age.
+ */
 function holderIsGone(lockText: string): boolean {
 	try {
-		const pid = (JSON.parse(lockText) as { pid?: unknown }).pid;
-		if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+		const { pid, host } = JSON.parse(lockText) as { pid?: unknown; host?: unknown };
+		if (host !== hostname() || typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
 			return false;
 		}
 		process.kill(pid, 0);
@@ -478,7 +488,7 @@ function staleLockText(lock: string): string | null {
 function takeOverLeftOverLock(lock: string, judged: string, deps: LinkInstallDeps): boolean {
 	deps.afterLockJudged?.();
 	const takeover = `${lock}.takeover`;
-	const mine = `${JSON.stringify({ pid: process.pid, token: randomBytes(8).toString("hex") })}\n`;
+	const mine = lockRecord();
 	try {
 		const fd = openSync(takeover, "wx", 0o600);
 		try {
@@ -527,8 +537,8 @@ function withLock<T>(target: string, deps: LinkInstallDeps, run: (stillMine: () 
 	} catch (error) {
 		throw writeFailure(target, error);
 	}
-	// What this install's lock holds: its process number and a random token, so that its own lock can be told from any other.
-	const mine = `${JSON.stringify({ pid: process.pid, token: randomBytes(8).toString("hex") })}\n`;
+	// What this install's lock holds: its process number, this computer's name and a random token, so that its own lock can be told from any other.
+	const mine = lockRecord();
 	const stillMine = (): boolean => readText(lock) === mine;
 	const deadline = Date.now() + waitMs;
 	for (;;) {
