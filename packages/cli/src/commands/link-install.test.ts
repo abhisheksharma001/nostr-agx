@@ -215,7 +215,8 @@ describe("agx link install: a fresh home", () => {
 
 	it("Codex: says that its hooks need review once with /hooks before they run", async () => {
 		const run = await install("codex");
-		expect(run.stdout).toContain("/hooks");
+		expect(run.stdout).toContain("open /hooks in Codex and trust");
+		expect((await install("claude")).stdout).not.toContain("trust");
 	});
 
 	it("Codex: writes under CODEX_HOME when it is set, and nowhere else", async () => {
@@ -599,6 +600,7 @@ describe("agx link install: usage", () => {
 		for (const args of [["link", "install"], ["link", "install", "--agent", "vim"], ["link", "install", "--agent"]]) {
 			const run = await agx(...args);
 			expect(run.code).toBe(EXIT.generic);
+			expect(run.stderr).toContain("--agent");
 			expect(tree(userHome)).toEqual([]);
 		}
 	});
