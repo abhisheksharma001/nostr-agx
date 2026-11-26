@@ -372,6 +372,7 @@ let world: World;
 let startedIn = "";
 let restoreGuard: () => void;
 let restoreTailscale: () => void;
+let restoreWebSocket: () => void = () => undefined;
 
 function fillOf(slot: SlotInfo, spec: Spec, home: string): string {
 	if (spec.fill !== undefined) {
@@ -1463,6 +1464,14 @@ beforeAll(async () => {
 	startedIn = process.cwd();
 	const guard = guardConnections();
 	restoreGuard = guard.restore;
+	// Node 20 has no global WebSocket, and `agx card` reaches its relays through it without bringing one. Without this, on Node 20
+	// that command never connects and the canary would see less than on Node 22 and later, where the list was made.
+	if (typeof globalThis.WebSocket === "undefined") {
+		globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
+		restoreWebSocket = () => {
+			delete (globalThis as { WebSocket?: unknown }).WebSocket;
+		};
+	}
 	// A profile that has opted in to Tailscale would start a node. No command may: the package is reported missing.
 	restoreTailscale = setTailscaleSdkLoaderForTests(() => Promise.reject(new Error("no Tailscale package in the canary")));
 	const relayLog: string[] = [];
@@ -1493,6 +1502,7 @@ beforeAll(async () => {
 }, 30_000);
 
 afterAll(async () => {
+	restoreWebSocket();
 	restoreTailscale?.();
 	restoreGuard?.();
 	await world?.relay.close();
@@ -2912,6 +2922,10 @@ describe("the secret-key canary", () => {
 				box.restore();
 			}
 		});
+	});
+
+	it("has a WebSocket for code that does not bring its own, on every Node version", () => {
+		expect(typeof globalThis.WebSocket).toBe("function");
 	});
 
 	describe("the cleanup and the home", () => {
