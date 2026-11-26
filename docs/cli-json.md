@@ -150,7 +150,7 @@ A message is announced once per host: `hook-nudged-<host>.json` in the profile f
 
 ## `agx link install --agent <claude|cursor|codex>`
 
-Adds the `agx hook` entries (see above) to that coding agent's user-level configuration file. It writes nothing else and never replaces an `agx hook` entry that differs from the one it would write (exit `3`, nothing changed). `--dry-run` writes nothing. Which file and what goes in it: [`hooks.md`](hooks.md#agx-link-install).
+Adds the `agx hook` entries (see above) to that coding agent's user-level configuration file (Claude Code's is under `CLAUDE_CONFIG_DIR` when that is set). It writes nothing else and never replaces an entry that mentions agx and is not the one it would write (exit `3`, nothing changed, and the command is not printed). It also refuses, with exit `3`, a file it cannot write back exactly, a read-only file and a hard-linked file, and waits up to 5 seconds for another install of the same file. `--dry-run` writes nothing. Which file and what goes in it: [`hooks.md`](hooks.md#agx-link-install).
 
 `--json` returns `agx.link.install/1`:
 

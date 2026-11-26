@@ -722,14 +722,17 @@ Cursor has stop and session-start (its prompt hook cannot add context). See docs
 Adds the entries that "agx hook" answers (see "agx hook --help") to that agent's user-level
 file, and nothing else:
   claude  ~/.claude/settings.json    Stop, SessionStart, UserPromptSubmit
+          (settings.json in $CLAUDE_CONFIG_DIR when that is set)
   cursor  ~/.cursor/hooks.json       stop, sessionStart
   codex   $CODEX_HOME/hooks.json, or ~/.codex/hooks.json when CODEX_HOME is not set
           (Codex skips new hooks until you trust them with /hooks)
 
 It prints the change and one line to undo it. The rest of the file is kept. It stops, and changes
-nothing, when the file is not a JSON object or already has an "agx hook" entry that differs from
-the one it would write (another profile, another host, a path to agx). --profile <name> makes the
-hook read that profile. See docs/hooks.md.`,
+nothing, when the file is not a JSON object, holds something a rewrite would change (a number it
+cannot keep, a repeated key), is read-only or hard-linked, or already has a command that mentions
+agx and is not the one it would write (the command is not printed). Two installs at once wait for
+each other. --profile <name> makes the hook read that profile. AGX_HOME and AGX_PROFILE are not
+carried into the hook commands. See docs/hooks.md.`,
 		)
 		.action((options) => linkInstallCommand(withGlobals(options)));
 
