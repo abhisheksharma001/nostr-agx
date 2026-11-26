@@ -160,6 +160,12 @@ is never logged.
   to keep a node's identity between runs; a directory you pass is never deleted. tsnet ignores a
   new auth key once its state already holds a node, so a key's tags are applied only the first time
   a directory is used.
+- **Environment.** The launcher gets `HOME` and the auth key, plus these when they are set and not
+  empty: `USERPROFILE`, `SystemRoot`, `TMPDIR`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (upper and
+  lower case) and `TS_NO_LOGS_NO_SUPPORT`. Nothing else from your environment reaches it. The key
+  comes only from the `authKey` option: `startTailscaleRelayProxy()` reads `TS_AUTHKEY` and
+  `AGX_TAILSCALE_AUTH_KEY` for you when `authKey` is omitted, `startBundledTailscale()` does not.
+  Windows has not been tried.
 
 ### Using a proxy that is already running
 
