@@ -98,15 +98,19 @@ leaves this machine depends on the address:
 | Destination | Where the connection goes |
 |---|---|
 | A node on your tailnet (its tailnet address or MagicDNS name) | Over the tailnet. |
-| Anything else: a public relay, a peer-advertised relay, `127.0.0.1`, an address on your local network | Out of this machine's own network connection, as if Tailscale were off. The destination sees this machine's IP address, and a hostname that is not a tailnet name is looked up with this machine's DNS resolver. |
+| An address inside a subnet route that another node on your tailnet advertises | Over the tailnet to that node, but only when this node accepts subnet routes. In tsnet v1.104.7 that is on by default on Windows and off on Linux and macOS, and the launcher has no option to change it. |
+| Anything else: a public relay, a peer-advertised relay, `127.0.0.1`, an address on your local network | Out of this machine's own network connection, not through the tailnet. The destination sees this machine's IP address, and a hostname that is not a tailnet name is looked up with this machine's DNS resolver. |
 
 So public relays are **reachable** (if this machine can reach them), but they
 are **not hidden**: the tailnet does not protect this machine's IP address from
-them.
+them. In the last row, tsnet's own source comment describes the path as
+connecting "without going over Tailscale". Whether a VPN, or a Tailscale client
+that is already running on this machine, also carries these connections was not
+checked and can depend on the platform.
 
 - tsnet can send non-tailnet addresses through an exit node when one is
   selected on the node. The launcher never selects one, and neither the SDK nor
-  the CLI has an option for it, so the second row above does not change.
+  the CLI has an option for it, so the last row above does not change.
 - Peer-advertised relays are dialed the same way. `@nostr-agx/nostr` only
   accepts a peer's relay if it is a `wss://` URL that resolves to a public
   address, so a peer-advertised relay is never the address of a node on your
@@ -123,8 +127,10 @@ hide this machine's IP address from public relays or from a peer's advertised
 relays.
 
 This describes tsnet v1.104.7, the version pinned in `launcher/go.mod`
-(`net/tsdial` `dialOneUser`, and `tsnet` `UseNetstackForIP`). Check it again
-when you upgrade tsnet.
+(`net/tsdial` `dialOneUser` and `SystemDial`, `tsnet` `UseNetstackForIP`, and
+`ipn` `NewPrefs` with `DefaultRouteAll` for the subnet-route default). It is read
+from that source and was not run against a tailnet. Check it again when you
+upgrade tsnet.
 
 ## Tailnet ACLs for agent nodes
 

@@ -177,14 +177,17 @@ A borrowed URL can be reused after `transport.stop()`; an owned handle cannot.
 
 **Routing scope.** The proxy is all-or-nothing for a transport: every relay
 WebSocket it owns (operator relays and peer-advertised NIP-65 relays) is handed
-to the local tsnet proxy. Only addresses of nodes on your tailnet then travel
-over the tailnet. Any other address (a public relay, a peer-advertised relay,
-`127.0.0.1`, a local-network address) is dialed from this machine's own network
-connection, so public relays stay reachable but the tailnet does not hide this
-machine's IP address from them, and the proxy does not limit where it dials.
-The launcher has no exit-node option. Use this integration for relays that live
-on your tailnet; [Routing scope](docs/tailscale.md#routing-scope) has the table
-and the tsnet source it is based on.
+to the local tsnet proxy. Addresses of nodes on your tailnet then travel over
+the tailnet, and so does an address inside a subnet route that another tailnet
+node advertises, when this node accepts subnet routes (tsnet v1.104.7 turns that
+on by default on Windows, not on Linux or macOS; the launcher cannot change it).
+Any other address (a public relay, a peer-advertised relay, `127.0.0.1`, a
+local-network address) is dialed from this machine's own network connection and
+not through the tailnet, so public relays stay reachable but the tailnet does
+not hide this machine's IP address from them, and the proxy does not limit where
+it dials. The launcher has no exit-node option. Use this integration for relays
+that live on your tailnet; [Routing scope](docs/tailscale.md#routing-scope) has
+the table, what was not checked, and the tsnet source it is based on.
 
 Proxy routing needs an explicit WebSocket implementation (`ws` in Node), because the global WHATWG
 WebSocket has no socket/agent options. Operator-configured relay hostnames are resolved by the proxy
