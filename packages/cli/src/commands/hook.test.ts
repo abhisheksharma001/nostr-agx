@@ -606,6 +606,8 @@ describe("agx hook: an error never blocks the host", () => {
 		mkdirSync(markFile("claude"), { recursive: true });
 		expectSilent(await hook("stop", "claude"));
 		expectSilent(await hook("stop", "claude"));
+		// The failed write does not leave its temporary file in the user's profile folder.
+		expect(readdirSync(profileDir("default")).filter((name) => name.endsWith(".tmp"))).toEqual([]);
 		rmSync(markFile("claude"), { recursive: true });
 		expect(onlyDocument(await hook("stop", "claude"))).toEqual({ decision: "block", reason: ALL_UNREAD });
 	});

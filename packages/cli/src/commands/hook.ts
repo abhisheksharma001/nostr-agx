@@ -87,11 +87,8 @@ async function decide(event: HookEvent, options: HookOptions, input: Readable | 
 		return null;
 	}
 	// Only a sender on the allowlist as it is NOW counts: one taken off it after their mail
-	// arrived does not nudge. An empty allowlist, or one the hook cannot read, means nothing to say.
+	// arrived does not nudge. An empty allowlist leaves nothing to say, and one that cannot be read is an error.
 	const allowed = allowedPeerKeys(effectiveProfile(profile).allow);
-	if (allowed.size === 0) {
-		return null;
-	}
 	// The profile's own messages never nudge, even when its own key is on its allowlist.
 	const ownKey = identityExists(profile) ? toHexPubkey(loadIdentityFile(profile, { allowInsecurePerms: true }).publicKey) : null;
 	// Read the store as `agx threads` does: no lock, nothing written. A thread another process
