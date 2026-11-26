@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { TailscaleStartOptions } from "@nostr-agx/tailscale";
 import { getProfile } from "../lib/config.js";
 import { configPath, tailscaleSecretsPath } from "../lib/paths.js";
+import { setRuntimeForTests } from "../lib/runtime.js";
 import { setStdinForTests } from "../lib/stdin.js";
 import { setTailscaleStarterForTests } from "../lib/tailscale/index.js";
 import { agx, jsonDocuments, sandbox } from "../test/helpers.js";
@@ -237,5 +238,145 @@ describe("agx tailscale up / disable", () => {
 			enabled: false,
 			forgot: true,
 		});
+	});
+});
+
+describe("agx tailscale enable checks the node before it saves anything", () => {
+	// Made fresh for every run.
+	const OTHER = `tskey-auth-k0000000000CNTRL-${Math.random().toString(16).slice(2, 18)}`;
+	const MINTED = `tskey-auth-k7777777777CNTRL-${Math.random().toString(16).slice(2, 18)}`;
+	let restoreFetch: (() => void) | null = null;
+	afterEach(() => {
+		restoreFetch?.();
+		restoreFetch = null;
+	});
+
+	function rejectingStarter(): void {
+		calls = [];
+		restoreStarter = setTailscaleStarterForTests(async (options) => {
+			calls.push({ options, stopped: false });
+			throw new Error("fake launcher: the control server refused the key");
+		});
+	}
+
+	it("saves neither the opt-in nor the key when the node cannot start", async () => {
+		rejectingStarter();
+		const run = await withStdin(KEY, () => agx("tailscale", "enable", "--auth-key-stdin"));
+		expect(run.code).not.toBe(0);
+		expect(calls).toHaveLength(1);
+		expect(getProfile("default").tailscale.enabled).toBe(false);
+		expect(existsSync(tailscaleSecretsPath("default"))).toBe(false);
+		expect(existsSync(configPath())).toBe(false);
+		expect(`${run.stdout}${run.stderr}`).not.toContain(KEY);
+	});
+
+	it("saves neither the opt-in nor the client secret when the OAuth service refuses", async () => {
+		fakeStarter();
+		restoreFetch = setRuntimeForTests({
+			fetch: async () => new Response(JSON.stringify({ error: "invalid_client" }), { status: 401 }),
+		});
+		const run = await withStdin(CLIENT_SECRET, () =>
+			agx(
+				"tailscale",
+				"enable",
+				"--oauth-url",
+				"https://auth.example.test/token",
+				"--oauth-client-id",
+				"client-id",
+				"--oauth-client-secret-stdin",
+			),
+		);
+		expect(run.code).not.toBe(0);
+		expect(calls).toHaveLength(0);
+		const profile = getProfile("default");
+		expect(profile.tailscale.enabled).toBe(false);
+		expect(profile.tailscale.oauth.clientId).toBeNull();
+		expect(existsSync(tailscaleSecretsPath("default"))).toBe(false);
+		expect(`${run.stdout}${run.stderr}`).not.toContain(CLIENT_SECRET);
+	});
+
+	it("keeps an earlier opt-in and key as they were when a new key is refused", async () => {
+		fakeStarter();
+		const first = await withStdin(KEY, () => agx("tailscale", "enable", "--auth-key-stdin"));
+		expect(first.code, first.stderr).toBe(0);
+		const before = readFileSync(tailscaleSecretsPath("default"), "utf8");
+
+		calls = [];
+		restoreStarter?.();
+		restoreStarter = setTailscaleStarterForTests(async (options) => {
+			calls.push({ options, stopped: false });
+			throw new Error("fake launcher: the control server refused the key");
+		});
+		const second = await withStdin(OTHER, () =>
+			agx("tailscale", "enable", "--auth-key-stdin", "--hostname", "agx-changed"),
+		);
+		expect(second.code).not.toBe(0);
+		expect(calls).toHaveLength(1);
+		expect(readFileSync(tailscaleSecretsPath("default"), "utf8")).toBe(before);
+		expect(statSync(tailscaleSecretsPath("default")).mode & 0o777).toBe(0o600);
+		expect(getProfile("default").tailscale).toMatchObject({ enabled: true, hostname: null });
+	});
+
+	it("checks the key it is about to store, even when another key is in the environment", async () => {
+		fakeStarter();
+		process.env.AGX_TAILSCALE_AUTH_KEY = OTHER;
+		const run = await withStdin(KEY, () => agx("tailscale", "enable", "--auth-key-stdin"));
+		expect(run.code, run.stderr).toBe(0);
+		expect(calls).toHaveLength(1);
+		expect(resolvedKey(calls[0])).toBe(KEY);
+		expect(readFileSync(tailscaleSecretsPath("default"), "utf8")).toContain(KEY);
+	});
+
+	it("saves the opt-in and the key, privately, once the node has started", async () => {
+		fakeStarter();
+		const run = await withStdin(KEY, () =>
+			agx("tailscale", "enable", "--auth-key-stdin", "--hostname", "agx-saved"),
+		);
+		expect(run.code, run.stderr).toBe(0);
+		expect(calls).toHaveLength(1);
+		expect(calls[0].stopped).toBe(true);
+		expect(getProfile("default").tailscale).toMatchObject({ enabled: true, authMode: "key", hostname: "agx-saved" });
+		expect(statSync(tailscaleSecretsPath("default")).mode & 0o777).toBe(0o600);
+		expect(readFileSync(tailscaleSecretsPath("default"), "utf8")).toContain(KEY);
+	});
+
+	it("checks an OAuth client secret before storing it, then stores it privately", async () => {
+		fakeStarter();
+		const bodies: string[] = [];
+		restoreFetch = setRuntimeForTests({
+			fetch: async (_url, init) => {
+				bodies.push(String(init?.body ?? ""));
+				return new Response(JSON.stringify({ authKey: MINTED }), { status: 200 });
+			},
+		});
+		const run = await withStdin(CLIENT_SECRET, () =>
+			agx(
+				"tailscale",
+				"enable",
+				"--oauth-url",
+				"https://auth.example.test/token",
+				"--oauth-client-id",
+				"client-id",
+				"--oauth-client-secret-stdin",
+			),
+		);
+		expect(run.code, run.stderr).toBe(0);
+		expect(bodies).toHaveLength(1);
+		expect(calls).toHaveLength(1);
+		expect(resolvedKey(calls[0])).toBe(MINTED);
+		expect(getProfile("default").tailscale).toMatchObject({ enabled: true, authMode: "oauth" });
+		expect(statSync(tailscaleSecretsPath("default")).mode & 0o777).toBe(0o600);
+		expect(readFileSync(tailscaleSecretsPath("default"), "utf8")).toContain(CLIENT_SECRET);
+		expect(`${run.stdout}${run.stderr}`).not.toContain(CLIENT_SECRET);
+		expect(`${run.stdout}${run.stderr}`).not.toContain(MINTED);
+	});
+
+	it("still uses the hostname from the environment while checking the node", async () => {
+		fakeStarter();
+		process.env.AGX_TAILSCALE_HOSTNAME = "agx-from-env";
+		const run = await withStdin(KEY, () => agx("tailscale", "enable", "--auth-key-stdin"));
+		expect(run.code, run.stderr).toBe(0);
+		expect(calls[0].options.hostname).toBe("agx-from-env");
+		expect(getProfile("default").tailscale.hostname).toBeNull();
 	});
 });
