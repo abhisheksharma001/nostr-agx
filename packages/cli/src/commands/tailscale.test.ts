@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { TailscaleStartOptions } from "@nostr-agx/tailscale";
 import { getProfile } from "../lib/config.js";
@@ -315,6 +315,25 @@ describe("agx tailscale enable checks the node before it saves anything", () => 
 		expect(readFileSync(tailscaleSecretsPath("default"), "utf8")).toBe(before);
 		expect(statSync(tailscaleSecretsPath("default")).mode & 0o777).toBe(0o600);
 		expect(getProfile("default").tailscale).toMatchObject({ enabled: true, hostname: null });
+	});
+
+	it("leaves the profile as it was when the key file cannot be written after a good check", async () => {
+		calls = [];
+		restoreStarter = setTailscaleStarterForTests(async (options) => {
+			const call: StartedCall = { options, stopped: false };
+			calls.push(call);
+			// While the node starts, a folder takes the place of the key file: the
+			// check passes and the write that follows it fails.
+			mkdirSync(tailscaleSecretsPath("default"), { recursive: true });
+			return { url: PROXY_URL, stop: async () => void (call.stopped = true) };
+		});
+		const run = await withStdin(KEY, () => agx("tailscale", "enable", "--auth-key-stdin"));
+		expect(run.code).not.toBe(0);
+		expect(calls, "the node was not checked first").toHaveLength(1);
+		expect(calls[0].stopped).toBe(true);
+		expect(getProfile("default").tailscale.enabled, "opted in without a key").toBe(false);
+		expect(existsSync(configPath())).toBe(false);
+		expect(`${run.stdout}${run.stderr}`).not.toContain(KEY);
 	});
 
 	it("checks the key it is about to store, even when another key is in the environment", async () => {
