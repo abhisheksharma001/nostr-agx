@@ -32,6 +32,9 @@ workflow ([`publish.yml`](../../.github/workflows/publish.yml)) builds them for 
 checkout you cross-compile them from `launcher/` with `pnpm build:launcher` (requires Go 1.27.4 or
 later, the version in `launcher/go.mod`).
 
+The binaries link the Go standard library and other Go modules under their own licences;
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists them and reproduces each text. It is not a legal review.
+
 ## Use
 
 ```ts

@@ -5,8 +5,31 @@ the Go source in `launcher/` and are statically linked: each binary contains the
 and the Go modules listed below. Those components are licensed by their respective authors, and the
 licence texts are reproduced in this file. The exact dependency versions are recorded in
 `launcher/go.mod` and `launcher/go.sum` in the source repository (`integrations/tailscale/launcher/` in
-https://github.com/ellavox-ai/nostr-agx); those two files are not part of the npm package. The launcher's own code
-is under this package's MIT `LICENSE`.
+https://github.com/ellavox-ai/nostr-agx); those two files are not part of the npm package. The
+launcher's own code is under this package's MIT `LICENSE`.
+
+## How this file was made
+
+It was put together with the steps below. They were run by hand and with a script that is not part of
+this repository; they are written down so that the file can be redone when the launcher's modules change.
+The texts were read on 2026-11-26 (the check for licence files in subdirectories and the
+`zstd/internal/xxhash` text on 2026-11-27). The binaries were only read, never run.
+
+1. Build the five launcher binaries: `make -C integrations/tailscale/launcher build-all` (Go 1.27.4, the
+   version in `launcher/go.mod`; the output is in `launcher/dist/<platform>/`).
+2. List what each binary links with `go version -m <binary>` and compare every version with
+   `launcher/go.mod`.
+3. For each module, read its top-level licence file from its upstream repository at that version, for
+   example `gh api -H "Accept: application/vnd.github.raw" "repos/<owner>/<repo>/contents/LICENSE?ref=<tag or commit>"`.
+   File names tried, in this order: `LICENSE`, `LICENSE.md`, `LICENSE.txt`, `LICENCE`, `COPYING`, `License`,
+   `license`. `golang.zx2c4.com/wintun` is read from `git.zx2c4.com` (the link in the table).
+4. For licence files in subdirectories, list each repository's tree at that version with
+   `gh api "repos/<owner>/<repo>/git/trees/<tag or commit>?recursive=1"`, keep the files named `LICENSE`,
+   `LICENCE`, `COPYING`, `NOTICE` or `PATENTS` below the top level, and check whether their directory
+   appears as a package path in `strings <binary>`.
+5. Copy each text unchanged, except that the final newline is dropped, identical texts are printed once
+   with the modules they cover, and the Apache-2.0 section of the combined `klauspost/compress` file is
+   replaced by a note (said where it is printed).
 
 ## What is linked
 
