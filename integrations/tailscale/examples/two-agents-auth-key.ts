@@ -27,6 +27,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	customAuthKey,
 	startTailscaleRelayProxy,
 	TailscaleError,
 } from "../src/index";
@@ -148,7 +149,9 @@ async function main(): Promise<void> {
 		// Start once. Both transports borrow this URL (a bare string), so neither
 		// stops the node — `tailscale.stop()` below is the single owner.
 		tailscale = await startTailscaleRelayProxy({
-			authKey,
+			// Named after where the key came from, so a malformed key is reported
+			// as coming from stdin or the environment, not as an "argument".
+			authKey: customAuthKey(() => authKey, opts.authKeyStdin ? "stdin" : "the environment"),
 			hostname: opts.hostname,
 			stateDir,
 			ephemeral: true,
