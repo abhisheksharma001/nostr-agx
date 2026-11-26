@@ -150,10 +150,18 @@ function start(...args: string[]): {
 	return startWith(false, args);
 }
 
+/** The environment of a command that does not use Tailscale: it dials the relay directly. */
+const WITHOUT_TAILSCALE = {
+	AGX_TAILSCALE: undefined,
+	AGX_TAILSCALE_AUTH_KEY: undefined,
+	AGX_TAILSCALE_BINARY: undefined,
+};
+
 /** `detached` puts the process in a group of its own, so a signal can reach it and its launcher together, as Ctrl-C does. */
 function startWith(
 	detached: boolean,
 	args: string[],
+	envOverrides: Record<string, string | undefined> = {},
 ): {
 	child: ChildProcess;
 	done: Promise<Run>;
@@ -168,6 +176,10 @@ function startWith(
 	env.AGX_TAILSCALE_AUTH_KEY = KEY;
 	env.AGX_TAILSCALE_BINARY = launcher;
 	env.FAKE_SOCKS_PORT = String(socks.port);
+	for (const [name, value] of Object.entries(envOverrides)) {
+		if (value === undefined) delete env[name];
+		else env[name] = value;
+	}
 	const child = spawn(process.execPath, [AGX, ...args], {
 		env,
 		stdio: ["ignore", "pipe", "pipe"],
@@ -352,6 +364,82 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 			await serve.done;
 		}
 	}, 60_000);
+
+	it("serve that is already stopping says nothing when its launcher then ends", async () => {
+		// serve waits for a running task before it stops the launcher. If the
+		// launcher ends in that wait, serve is already stopping: it must not report
+		// the launcher or cut the wait short with another exit status.
+		const trigger = join(home, "launcher-die");
+		const release = join(home, "release-task");
+		writeFileSync(
+			launcher,
+			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\nwhile [ ! -e ${JSON.stringify(trigger)} ]; do sleep 0.1; done\n: > ${JSON.stringify(`${trigger}.gone`)}\nexit 7\n`,
+			{ mode: 0o755 },
+		);
+		const handler = join(home, "held-handler.mjs");
+		writeFileSync(
+			handler,
+			[
+				'import { existsSync } from "node:fs";',
+				"export default {",
+				"	'held.echo': async () => {",
+				`		while (!existsSync(${JSON.stringify(release)})) await new Promise((r) => setTimeout(r, 50));`,
+				"		return { held: true };",
+				"	},",
+				"};",
+			].join("\n"),
+		);
+		// The asker dials the throwaway relay directly; check that before it connects.
+		expect((await agx("--profile", "asker", "identity", "new")).code).toBe(0);
+		expect(
+			(await agx("--profile", "asker", "config", "set", "relays", `ws://127.0.0.1:${relay.port}`)).code,
+		).toBe(0);
+		const askerConfig = await agx("--profile", "asker", "config", "show");
+		expect(askerConfig.stdout).toContain(`ws://127.0.0.1:${relay.port}`);
+		expect(askerConfig.stdout).not.toMatch(/ws:\/\/127\.0\.0\.1:7447\b/);
+		const me = await agx("identity", "show");
+		const npub = /npub1[0-9a-z]+/.exec(me.stdout)?.[0];
+		expect(npub).toBeTruthy();
+
+		const serve = start("serve", "--allow-all", "--handler", handler, "--poll-interval", "500");
+		let request: ReturnType<typeof startWith> | undefined;
+		try {
+			await until(() => serve.output().includes("watching for messages"), 20_000);
+			request = startWith(
+				false,
+				["--profile", "asker", "request", npub!, "held.echo", "--payload", "{}", "--timeout", "30000"],
+				WITHOUT_TAILSCALE,
+			);
+			await until(() => serve.output().includes("TASK"), 20_000);
+			serve.child.kill("SIGINT");
+			await until(() => serve.output().includes("stopping"), 10_000);
+			// The launcher ends while serve waits for the task.
+			writeFileSync(trigger, "");
+			await until(() => existsSync(`${trigger}.gone`), 10_000);
+			await new Promise((r) => setTimeout(r, 1_000));
+			writeFileSync(release, "");
+			const run = await Promise.race([
+				serve.done,
+				new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
+			]);
+			expect(run, "serve was still running 20 s after its task was released").not.toBeNull();
+			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(0);
+			expect(run!.stderr).not.toContain("Tailscale launcher");
+			expectTailscaleRunWasPerRunAndCleanedUp();
+		} finally {
+			writeFileSync(release, "");
+			if (serve.child.exitCode === null && serve.child.signalCode === null) {
+				serve.child.kill("SIGKILL");
+			}
+			await serve.done;
+			if (request) {
+				if (request.child.exitCode === null && request.child.signalCode === null) {
+					request.child.kill("SIGKILL");
+				}
+				await request.done;
+			}
+		}
+	}, 90_000);
 
 	it("inbox exits on its own and removes the run's state dir", async () => {
 		const run = await agx("inbox", "--json", "--wait", "2");
