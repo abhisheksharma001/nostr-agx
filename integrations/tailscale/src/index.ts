@@ -48,6 +48,14 @@ export interface TailscaleStartOptions {
 	controlUrl?: string;
 	/** Register an ephemeral node. */
 	ephemeral?: boolean;
+	/**
+	 * Do not let Tailscale upload this node's client logs to `log.tailscale.com`,
+	 * which tsnet does by default. Tailscale's documentation says this also opts the
+	 * device out of support that would need those logs. Defaults to false, so the
+	 * launcher's default applies unless `TS_NO_LOGS_NO_SUPPORT` is set in this
+	 * process.
+	 */
+	disableLogUpload?: boolean;
 	/** ACL tags such as `tag:agx-agent`. */
 	tags?: string[];
 	/** SOCKS5 listen address. Must be loopback. Defaults to `127.0.0.1:0`. */
@@ -147,6 +155,7 @@ export async function startTailscaleRelayProxy(
 		stateDir: config.stateDir,
 		controlUrl: config.controlUrl,
 		ephemeral: config.ephemeral,
+		disableLogUpload: config.disableLogUpload,
 		tags: config.tags,
 		listen: config.listen,
 		timeoutMs: config.timeoutMs,

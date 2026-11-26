@@ -58,6 +58,15 @@ export interface StartBundledTailscaleOptions {
 	controlUrl?: string;
 	/** Register an ephemeral node. */
 	ephemeral?: boolean;
+	/**
+	 * Do not let Tailscale upload this node's client logs to log.tailscale.com,
+	 * which tsnet does by default. Sets TS_NO_LOGS_NO_SUPPORT=true for the
+	 * launcher; Tailscale's documentation says that also opts the device out of
+	 * support that would need those logs. When false or omitted the launcher's
+	 * default applies, unless TS_NO_LOGS_NO_SUPPORT is already set in this process,
+	 * in which case that value is passed on.
+	 */
+	disableLogUpload?: boolean;
 	/** ACL tags such as tag:agx. */
 	tags?: string[];
 	/** SOCKS5 listen address. Must be loopback. Defaults to 127.0.0.1:0. */
@@ -116,6 +125,7 @@ export async function startBundledTailscale(
 		stateDir,
 		controlUrl,
 		ephemeral = false,
+		disableLogUpload,
 		tags = [],
 		listen,
 		timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -142,6 +152,9 @@ export async function startBundledTailscale(
 	}
 	if (binary !== undefined && typeof binary !== "string") {
 		throw new TypeError("binary must be a string");
+	}
+	if (disableLogUpload !== undefined && typeof disableLogUpload !== "boolean") {
+		throw new TypeError("disableLogUpload must be a boolean");
 	}
 	if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== "string")) {
 		throw new TypeError("tags must be an array of strings");
@@ -182,6 +195,9 @@ export async function startBundledTailscale(
 		if (value) {
 			env[name] = value;
 		}
+	}
+	if (disableLogUpload) {
+		env.TS_NO_LOGS_NO_SUPPORT = "true";
 	}
 	if (authKey !== undefined) {
 		env.TS_AUTHKEY = authKey;
