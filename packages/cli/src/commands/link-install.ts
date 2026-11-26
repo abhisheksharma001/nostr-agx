@@ -35,6 +35,12 @@ export interface LinkInstallDeps {
 	afterFirstRead?: () => void;
 	/** A step between judging a lock left over and taking it over. */
 	afterLockJudged?: () => void;
+	/** A step between judging a takeover file left over and removing it. */
+	afterTakeoverJudged?: () => void;
+	/** A step while this install holds the takeover file, before it lets go of it. */
+	duringTakeover?: () => void;
+	/** A step while this install holds the lock, right before it checks the lock is still its own and publishes the file. */
+	beforePublish?: () => void;
 }
 
 /** How long to wait for another `agx link install` that is changing the same file. */
