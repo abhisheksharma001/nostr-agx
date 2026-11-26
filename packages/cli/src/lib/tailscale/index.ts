@@ -62,6 +62,8 @@ export interface TailscaleUseOptions {
 	withoutTailscale?: boolean;
 	/** One-off key from a command flag; never persisted. */
 	authKey?: string | null;
+	/** An OAuth client secret not stored yet, to check before it is; never persisted here. */
+	oauthClientSecret?: string | null;
 }
 
 let testStarter: TailscaleStarter | undefined;
@@ -126,7 +128,9 @@ export async function tailscaleConfigForProfile(
 	const sdk = await loadTailscaleSdk();
 	const secret = loadTailscaleSecret(profileName);
 	const oauth =
-		profile.tailscale.authMode === "oauth" ? oauthFor(profileName, profile) : null;
+		profile.tailscale.authMode === "oauth"
+			? oauthFor(profileName, profile, options.oauthClientSecret)
+			: null;
 	const explicit = options.authKey?.trim() || null;
 	const storedKey =
 		!explicit && profile.tailscale.authMode === "key" ? secret.authKey : null;
@@ -225,13 +229,15 @@ export function tailscaleRelayProxyForProfile(
 function oauthFor(
 	profileName: string,
 	profile: Profile,
+	pendingClientSecret?: string | null,
 ): TailscaleOAuthOptions {
 	const secret = loadTailscaleSecret(profileName);
 	const config = profile.tailscale.oauth;
 	const clientId =
 		envValue("AGX_TAILSCALE_OAUTH_CLIENT_ID") ?? config.clientId;
 	const clientSecret =
-		envValue("AGX_TAILSCALE_OAUTH_CLIENT_SECRET") ?? secret.oauthClientSecret;
+		pendingClientSecret?.trim() ||
+		(envValue("AGX_TAILSCALE_OAUTH_CLIENT_SECRET") ?? secret.oauthClientSecret);
 	if (!clientId || !clientSecret) {
 		throw configError(
 			`Profile "${profileName}" asks for Tailscale OAuth, but has no ${clientId ? "client secret" : "client id"}.`,
