@@ -108,6 +108,24 @@ describe("startTailscaleForProfile state directory", () => {
 		expect(existsSync(persistent)).toBe(true);
 	});
 
+	it("removes the fresh dir even when stopping the node fails", async () => {
+		let dir: string | undefined;
+		restoreStarter = setTailscaleStarterForTests(async (options) => {
+			dir = options.stateDir;
+			return {
+				url: PROXY_URL,
+				stop: async () => {
+					throw new Error("the launcher did not stop");
+				},
+			};
+		});
+
+		const handle = await startTailscaleForProfile("default", effectiveProfile("default"));
+		expect(existsSync(dir!)).toBe(true);
+		await expect(handle.stop()).rejects.toThrow(/did not stop/);
+		expect(existsSync(dir!)).toBe(false);
+	});
+
 	it("removes the fresh dir when the launcher fails to start", async () => {
 		let failedDir: string | undefined;
 		restoreStarter = setTailscaleStarterForTests(async (options) => {

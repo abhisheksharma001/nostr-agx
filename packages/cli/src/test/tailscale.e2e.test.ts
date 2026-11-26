@@ -653,13 +653,22 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		try {
 			held.serve.child.kill("SIGINT");
 			await until(() => held.serve.output().includes("stopping"), 10_000);
+			const secondSignalAt = Date.now();
 			held.serve.child.kill("SIGINT");
+			const endedAt = held.serve.done.then(() => Date.now());
 			const run = await Promise.race([
 				held.serve.done,
 				new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
 			]);
 			expect(run, "serve did not end on the second signal").not.toBeNull();
 			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(130);
+			// serve also ends with 130 when its 10 second limit on a stop runs out, so
+			// the status alone cannot tell "ended on the second signal" from "swallowed
+			// it and waited for the limit": the time can.
+			expect(
+				(await endedAt) - secondSignalAt,
+				"serve did not end at once on the second signal",
+			).toBeLessThan(6_000);
 			expect(existsSync(pidFile)).toBe(true);
 			expectTailscaleRunWasPerRunAndCleanedUp();
 		} finally {

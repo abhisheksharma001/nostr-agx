@@ -1477,6 +1477,26 @@ describe("what the launcher writes on its stderr", () => {
 		}
 	});
 
+	it.skipIf(!posix)("masks every login on a line, not only the first", async () => {
+		const fake = await stderrWritingBinary([
+			[
+				"a http://u1:p1@h1.invalid:1 b socks5://u2:p2@h2.invalid:2 c\n" +
+					"sent Basic dXNlcjpwYXNzd29yZA== and Basic eHl6OmFiY2RlZmdoaWo= end\n" +
+					'x (auth "Basic dTE6cDE=") y (auth "Basic dTI6cDI=") z\n',
+				0,
+			],
+		]);
+		try {
+			expect((await stderrOf(fake)).join("")).toBe(
+				"a http://***@h1.invalid:1 b socks5://***@h2.invalid:2 c\n" +
+					"sent Basic *** and Basic *** end\n" +
+					'x (auth "***") y (auth "***") z\n',
+			);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
 	it.skipIf(!posix)("masks a login in a last line that has no newline", async () => {
 		const fake = await stderrWritingBinary([['using proxy "http://puser:ppass@127.0.0.1:9"', 0]]);
 		try {
