@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,61 @@ async function fakeBinary(source: string): Promise<{ dir: string; path: string }
 	await writeFile(path, source, { mode: 0o755 });
 	await chmod(path, 0o755);
 	return { dir, path };
+}
+
+/** A launcher that reports a proxy and then waits for stdin to close, like the real one. */
+const RUNNING = "echo socks5://agx:secret@127.0.0.1:43220\nexec cat >/dev/null\n";
+
+/** Wait until `condition` holds, or fail after `timeoutMs`. */
+async function until(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() > deadline) throw new Error("condition not met in time");
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+}
+
+/**
+ * A fake launcher that writes its arguments to `<dir>/args.<pid>`, then runs
+ * `tail`. One file per launch, so two launches from one binary stay apart.
+ */
+async function recordingBinary(tail: string): Promise<{ dir: string; path: string }> {
+	const dir = await mkdtemp(join(tmpdir(), "agx-launcher-args-"));
+	const path = join(dir, "fake-agx-tailscale");
+	await writeFile(
+		path,
+		`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(dir)}/args.$$\n${tail}`,
+		{ mode: 0o755 },
+	);
+	await chmod(path, 0o755);
+	return { dir, path };
+}
+
+/** The arguments of each launch a recording binary saw. */
+async function recordedLaunches(dir: string): Promise<string[][]> {
+	const names = (await readdir(dir)).filter((name) => name.startsWith("args.")).sort();
+	return Promise.all(
+		names.map(async (name) =>
+			(await readFile(join(dir, name), "utf8")).split("\n").filter(Boolean),
+		),
+	);
+}
+
+/** The arguments of the one launch a recording binary saw, once it has written them. */
+async function firstLaunch(dir: string): Promise<string[]> {
+	const deadline = Date.now() + 10_000;
+	for (;;) {
+		const [launch] = await recordedLaunches(dir);
+		if (launch) return launch;
+		if (Date.now() > deadline) throw new Error("the launcher never recorded its arguments");
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+}
+
+function stateDirArg(args: string[]): string {
+	const flag = args.indexOf("--state-dir");
+	expect(flag, `no --state-dir in ${JSON.stringify(args)}`).toBeGreaterThanOrEqual(0);
+	return args[flag + 1]!;
 }
 
 describe("bundledBinaryPath", () => {
@@ -147,5 +202,102 @@ describe("startBundledTailscale", () => {
 		await expect(startBundledTailscale({ authKey: "" })).rejects.toThrow(
 			/authKey must not be empty/,
 		);
+	});
+});
+
+describe("the default state directory", () => {
+	it.skipIf(!posix)(
+		"gives two handles started with defaults different state directories",
+		async () => {
+			const fake = await recordingBinary(RUNNING);
+			const proxies: Awaited<ReturnType<typeof startBundledTailscale>>[] = [];
+			try {
+				proxies.push(await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 }));
+				proxies.push(await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 }));
+				const dirs = (await recordedLaunches(fake.dir)).map(stateDirArg);
+				expect(dirs).toHaveLength(2);
+				expect(new Set(dirs).size).toBe(2);
+				for (const dir of dirs) {
+					expect(dir.startsWith(tmpdir())).toBe(true);
+				}
+			} finally {
+				for (const proxy of proxies) await proxy.stop();
+				await rm(fake.dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(!posix)("is private while the handle runs and deleted when it stops", async () => {
+		const fake = await recordingBinary(RUNNING);
+		const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+		try {
+			const dir = stateDirArg(await firstLaunch(fake.dir));
+			expect(existsSync(dir)).toBe(true);
+			expect((await stat(dir)).mode & 0o777).toBe(0o700);
+
+			await proxy.stop();
+			expect(existsSync(dir)).toBe(false);
+			await proxy.stop();
+		} finally {
+			await proxy.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("is deleted when the launcher exits before it reports an address", async () => {
+		const fake = await recordingBinary("exit 3\n");
+		try {
+			await expect(
+				startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 }),
+			).rejects.toThrow(/exited before reporting/);
+			expect(existsSync(stateDirArg(await firstLaunch(fake.dir)))).toBe(false);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("is deleted when the launcher does not report an address in time", async () => {
+		const fake = await recordingBinary("exec cat >/dev/null\n");
+		try {
+			await expect(
+				startBundledTailscale({ binary: fake.path, timeoutMs: 1_000 }),
+			).rejects.toThrow(/did not report/);
+			const dir = stateDirArg(await firstLaunch(fake.dir));
+			// The launcher is told to stop, and the directory goes once it has.
+			await until(() => !existsSync(dir));
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("is deleted when the launcher reports an unauthenticated address", async () => {
+		const fake = await recordingBinary("echo socks5://127.0.0.1:43221\nexec cat >/dev/null\n");
+		try {
+			await expect(
+				startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 }),
+			).rejects.toThrow(/unauthenticated SOCKS5/);
+			const dir = stateDirArg(await firstLaunch(fake.dir));
+			await until(() => !existsSync(dir));
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("passes a directory the caller names through, and keeps it", async () => {
+		const fake = await recordingBinary(RUNNING);
+		const named = await mkdtemp(join(tmpdir(), "agx-launcher-named-state-"));
+		try {
+			const proxy = await startBundledTailscale({
+				binary: fake.path,
+				stateDir: named,
+				timeoutMs: 5_000,
+			});
+			expect(stateDirArg(await firstLaunch(fake.dir))).toBe(named);
+			await proxy.stop();
+			expect(existsSync(named)).toBe(true);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+			await rm(named, { recursive: true, force: true });
+		}
 	});
 });
