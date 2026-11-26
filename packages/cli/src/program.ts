@@ -670,9 +670,11 @@ export function buildProgram(): Command {
 			"after",
 			`
 Each event prints at most one short line of counts and thread ids in the host's own JSON shape
-(never what a peer wrote), and prints nothing when there is nothing new. It reads the message
+(never what a peer wrote; a thread id only when it is a UUID), and prints nothing when there is
+nothing new. It counts only mail from senders on the current allowlist. It reads the message
 store and never takes the profile lock, so it works while "agx serve" runs. It says each new
-message once per host. An error never blocks the host: exit 0 and no output.
+message once per host, and nothing while the host is already continuing because of a stop hook.
+An error never blocks the host: exit 0 and no output.
 
 A hook runs only while an agent is mid-turn or starting one. It cannot wake an idle agent:
 an agent that has already finished its turn and is waiting for you hears nothing until its

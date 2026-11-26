@@ -137,16 +137,16 @@ Caps: 50 kept messages per held sender (the count keeps going) and 20 new unknow
 
 The command a coding agent's hook configuration runs at the end of a turn (`stop`), at the start of a session (`session-start`) and when a prompt is sent (`prompt`). It is the hook path for `agx serve` and the other commands above: it reads the message store, never takes the profile lock (so it works while `agx serve` runs), and prints **one line of JSON in the host's own shape, or nothing**. Exit code is always `0` for a runtime error; a wrong command line is exit `1`, never `2` (all three hosts read `2` as "block").
 
-The text it carries is counts and thread ids only, never a message, subject, address or held sender's text:
+The text it carries is counts and thread ids only, never a message, subject, address or held sender's text. A thread id is named only when it is a UUID (the form agx makes); an id a sender chose in any other form is counted, never shown:
 
-`agx has 2 unread messages. Threads with unread messages: thread-b, thread-a. agx threads lists every thread; agx thread <id> shows one, and agx thread <id> --mark-read marks it read once it is handled.`
+`agx has 2 unread messages. Threads with unread messages: 0b2f61c4-7a1e-4d58-9c3a-5e8d2f1a6b07, d41c9a7e-3b52-4f08-a6d1-90c27e5b8f13. agx threads lists every thread; agx thread <id> shows one, and agx thread <id> --mark-read marks it read once it is handled.`
 
 | Host | `stop` | `session-start` | `prompt` |
 | --- | --- | --- | --- |
 | `claude`, `codex` | `{ "decision": "block", "reason": "<text>" }` | `{ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": "<text>" } }` | `{ "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": "<text>" } }` |
 | `cursor` | `{ "followup_message": "<text>" }` | `{ "additional_context": "<text>" }` | nothing (no hook that adds context) |
 
-A message is announced once per host: `hook-nudged-<host>.json` in the profile folder keeps the ids of the unread messages already announced. `session-start` announces all unread mail again. Held senders and messages this profile sent never count. A hook cannot wake an idle agent. The full rules, the sources of each shape and the configuration to add are in [`hooks.md`](hooks.md).
+A message is announced once per host: `hook-nudged-<host>.json` in the profile folder keeps the ids of the unread messages already announced. `session-start` announces all unread mail again. Only mail from a sender on the allowlist as it is now counts: a sender taken off it, held senders, and messages this profile sent or that come from its own key never count. A `stop` hook the host is already continuing (`stop_hook_active` for Claude Code and Codex, `loop_count` for Cursor) prints nothing and records nothing. A hook cannot wake an idle agent. The full rules, the sources of each shape and the configuration to add are in [`hooks.md`](hooks.md).
 
 ## Hosts
 
