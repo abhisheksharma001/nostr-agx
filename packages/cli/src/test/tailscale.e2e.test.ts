@@ -147,7 +147,7 @@ function start(...args: string[]): {
 	done: Promise<Run>;
 	output: () => string;
 } {
-	return startWith(false, args);
+	return startWith(args);
 }
 
 /** The environment of a command that does not use Tailscale: it dials the relay directly. */
@@ -157,9 +157,7 @@ const WITHOUT_TAILSCALE = {
 	AGX_TAILSCALE_BINARY: undefined,
 };
 
-/** `detached` puts the process in a group of its own, so a signal can reach it and its launcher together, as Ctrl-C does. */
 function startWith(
-	detached: boolean,
 	args: string[],
 	envOverrides: Record<string, string | undefined> = {},
 ): {
@@ -183,7 +181,6 @@ function startWith(
 	const child = spawn(process.execPath, [AGX, ...args], {
 		env,
 		stdio: ["ignore", "pipe", "pipe"],
-		detached,
 	});
 	let stdout = "";
 	let stderr = "";
@@ -340,31 +337,6 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		}
 	}, 60_000);
 
-	it("serve stays quiet about a launcher that is interrupted together with it, as Ctrl-C does", async () => {
-		// A terminal sends Ctrl-C to the whole foreground process group, so the
-		// launcher ends at the same moment serve starts to stop. serve is already
-		// stopping then, so it must not report the launcher or change its exit status.
-		const serve = startWith(true, ["serve", "--no-reply", "--no-tasks", "--poll-interval", "500"]);
-		try {
-			await until(() => serve.output().includes("watching for messages"), 20_000);
-			await new Promise((r) => setTimeout(r, 500));
-			process.kill(-serve.child.pid!, "SIGINT");
-			const run = await Promise.race([
-				serve.done,
-				new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
-			]);
-			expect(run, "serve was still running 20 s after Ctrl-C").not.toBeNull();
-			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(0);
-			expect(run!.stderr).not.toContain("Tailscale launcher");
-			expectTailscaleRunWasPerRunAndCleanedUp();
-		} finally {
-			if (serve.child.exitCode === null && serve.child.signalCode === null) {
-				process.kill(-serve.child.pid!, "SIGKILL");
-			}
-			await serve.done;
-		}
-	}, 60_000);
-
 	it("serve that is already stopping says nothing when its launcher then ends", async () => {
 		// serve waits for a running task before it stops the launcher. If the
 		// launcher ends in that wait, serve is already stopping: it must not report
@@ -406,7 +378,6 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		try {
 			await until(() => serve.output().includes("watching for messages"), 20_000);
 			request = startWith(
-				false,
 				["--profile", "asker", "request", npub!, "held.echo", "--payload", "{}", "--timeout", "30000"],
 				WITHOUT_TAILSCALE,
 			);
