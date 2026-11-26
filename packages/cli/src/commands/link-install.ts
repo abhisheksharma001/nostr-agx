@@ -271,13 +271,17 @@ function lossyContent(text: string): "number" | "key" | "deep" | null {
 }
 
 /**
- * `agx` used as a command or a path component: the word `agx`, or a file called `agx.js`, `agx.cmd` or
- * `agx.exe`, after the start of the text, white space, a slash, a backslash, a quote or a shell separator
- * and before the end, white space, a quote or a shell separator. That covers `agx hook ...`, a path with or
- * without spaces, `npx agx`, `env X=y agx`, `sh -c '...'` and `$(agx ...)`, in any case. It leaves out `tagx`,
- * `~/nostr-agx/lint.sh`, `AGX_DONE` and the like, which are other tools.
+ * A command that runs agx: the word `agx`, a file called `agx.<js|mjs|cjs|cmd|exe|ps1|bat|sh>`, `agx@<version>`
+ * (as in `npx agx@latest`), or this CLI's npm package `@nostr-agx/cli` (with or without a version). It has to come
+ * after the start of the text, white space, a slash, a backslash, a quote or a shell separator, and it ends at the
+ * end, white space or a shell character (`; | & < > ( ) ` ' " ,`; a slash too, for the package's own files). That
+ * covers `agx hook ...`, a path with or without spaces, `npx -y agx@latest`, `pnpm dlx @nostr-agx/cli`,
+ * `env X=y agx`, `sh -c '...'`, `$(agx ...)`, `agx>/dev/null` and `agx,hook`, in any case. It leaves out `tagx`,
+ * `~/nostr-agx/lint.sh`, `AGX_DONE`, `agxx` and the like, which are other tools. A folder named exactly `agx`
+ * followed by a space, `'agx'` and `grep agx log` still count: a cautious refusal that is accepted.
  */
-const AGX_AS_A_COMMAND = /(?:^|[\s/\\'"(;&|`])agx(?:\.(?:js|cmd|exe))?(?=$|[\s'");&|)`])/i;
+const AGX_AS_A_COMMAND =
+	/(?:^|[\s/\\'"(;&|`])(?:agx(?:@|(?:\.(?:js|mjs|cjs|cmd|exe|ps1|bat|sh))?(?=$|[\s;|&<>()`'",]))|@nostr-agx\/cli(?=$|[\s/@;|&<>()`'",]))/i;
 
 /** Whether a hook command runs agx. It errs on the side of yes: the one thing worse than a refusal is a second copy of the hook. */
 function mentionsAgx(command: string): boolean {
