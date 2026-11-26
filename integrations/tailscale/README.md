@@ -148,6 +148,14 @@ is never logged.
   string, so a host can branch on the failure without parsing messages.
 - `start` in the config replaces the launcher, which is useful in tests or with a custom binary.
 
+### State directory, exit notice, environment and logs
+
+- **State directory.** Without `stateDir`, each node gets its own private temporary directory,
+  deleted when the node stops (a process that is killed outright leaves it behind). Pass `stateDir`
+  to keep a node's identity between runs; a directory you pass is never deleted. tsnet ignores a
+  new auth key once its state already holds a node, so a key's tags are applied only the first time
+  a directory is used.
+
 ### Using a proxy that is already running
 
 If you start Tailscale once for the whole process, pass the proxy URL to the transport directly. The
