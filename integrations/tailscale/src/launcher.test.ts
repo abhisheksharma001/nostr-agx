@@ -602,6 +602,57 @@ describe("the default state directory when the whole process ends", () => {
 	);
 });
 
+describe("a stand-in that waits for a trigger file", () => {
+	it.skipIf(!posix)("leaves when the process that started it is gone", async () => {
+		// A short-lived parent starts the stand-in and ends at once, as a host that
+		// was killed would; nothing ever creates the trigger file.
+		const fake = await fakeBinary("#!/bin/sh\n" + endingTail(join(tmpdir(), `agx-launcher-no-trigger-${process.pid}`), "exit 7"));
+		let pid = 0;
+		try {
+			const parent = spawn(
+				process.execPath,
+				[
+					"-e",
+					`const c = require("node:child_process").spawn(${JSON.stringify(fake.path)}, [], { stdio: "ignore" }); console.log(c.pid); c.unref();`,
+				],
+				{ stdio: ["ignore", "pipe", "ignore"] },
+			);
+			let printed = "";
+			parent.stdout.on("data", (chunk: Buffer) => {
+				printed += chunk.toString();
+			});
+			await new Promise((resolve) => parent.on("close", resolve));
+			pid = Number(printed.trim());
+			expect(pid).toBeGreaterThan(1);
+			const alive = () => {
+				try {
+					process.kill(pid, 0);
+					return true;
+				} catch (error) {
+					return (error as NodeJS.ErrnoException).code === "EPERM";
+				}
+			};
+			let gone = false;
+			try {
+				await until(() => !alive(), 5_000);
+				gone = true;
+			} catch {
+				// still running: reported below
+			}
+			expect(gone, `the stand-in (pid ${pid}) was still running 5 s after its parent ended`).toBe(true);
+		} finally {
+			if (pid > 1) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// already gone
+				}
+			}
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	}, 20_000);
+});
+
 describe("the exit notice", () => {
 	it.skipIf(!posix)("gives a listener the exit code when the launcher exits on its own", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-exit-"));
