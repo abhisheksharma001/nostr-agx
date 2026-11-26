@@ -97,6 +97,12 @@ export interface Planted {
 
 const NSEC_PREFIX = "nsec1".length;
 const NCRYPTSEC_PREFIX = "ncryptsec1".length;
+/**
+ * The first 16 bits after `ncryptsec1` (version and cost) are the same for every string made with
+ * the same cost, and the next bits are the salt: with fewer than 8 characters of data, another
+ * string made by the same program would match too. 8 characters hold 24 bits that belong to this key.
+ */
+const NCRYPTSEC_MIN_DATA = 8;
 const NPUB_PREFIX = "npub1".length;
 
 /** Every shape the same 32 secret bytes can come back in: hex, nsec1… and npub1… (a secret read as a public key). */
@@ -166,7 +172,7 @@ export function plant(form: Form, label = ""): Planted {
 	if (form === "ncryptsec") {
 		// A real NIP-49 string from a throwaway key and password (scrypt cost 2^4: quick). Salt and nonce are random.
 		const value = encrypt(secret, "throwaway-password", 4);
-		return { form, value, needles: windowsWithPrefix(value, NCRYPTSEC_PREFIX), identity: own };
+		return { form, value, needles: windowsWithPrefix(value, NCRYPTSEC_PREFIX, NCRYPTSEC_MIN_DATA), identity: own };
 	}
 	const nsec = nip19.nsecEncode(secret);
 	const needles = needlesOfSecret(bytesToHex(secret));
@@ -193,7 +199,7 @@ export function mask(value: string): string {
 /**
  * True when any 10-character stretch of the key (any case; also after `%xx`
  * decoding of `text`) appears in `text`. For `nsec1…` and `ncryptsec1…` the stretch
- * may run into the prefix, but must hold 5 characters of key data (see `windowsWithPrefix`).
+ * may run into the prefix, but must hold 5 (8 for `ncryptsec1…`) characters of key data (see `windowsWithPrefix`).
  */
 export function holdsKey(text: string, needles: readonly string[]): boolean {
 	if (text === "") {

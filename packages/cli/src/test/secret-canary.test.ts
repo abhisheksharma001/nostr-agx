@@ -1042,7 +1042,7 @@ async function sendProbe(watch: HttpWatch, probe: HttpProbe, value: Planted): Pr
 		relay: world.relayLog.slice(relayBefore).join("\n"),
 		"file-name": changed.names,
 		// The profile's own key is in every request and in the files it makes: only a file that holds it more often than before is a leak of this request.
-		"file-content": countKey(after.contents, value.needles) > countKey(before.contents, value.needles) ? after.contents : "",
+		"file-content": countKey(after.contents, value.needles) > countKey(before.contents, value.needles) ? changed.contents : "",
 		connect: world.attempts.slice(attemptsBefore).map((a) => `${a.host}:${a.port}`).join("\n"),
 	};
 	const channels = new Set<Channel>();
@@ -2715,8 +2715,9 @@ describe("the secret-key canary", () => {
 			expect(holdsKey(`"${planted.value.slice(0, 10)}"... is not valid JSON`, planted.needles)).toBe(true);
 			expect(holdsKey(`"${planted.value.slice(0, 9)}"... is not valid JSON`, planted.needles)).toBe(false);
 			const protectedKey = plant("ncryptsec");
-			expect(holdsKey(protectedKey.value.slice(5, 15), protectedKey.needles)).toBe(true);
-			expect(holdsKey(protectedKey.value.slice(4, 14), protectedKey.needles)).toBe(false);
+			// For `ncryptsec1` the first characters of data are the same in every string (the cost), so it takes 8.
+			expect(holdsKey(protectedKey.value.slice(8, 18), protectedKey.needles)).toBe(true);
+			expect(holdsKey(protectedKey.value.slice(7, 17), protectedKey.needles)).toBe(false);
 			// In capitals as well.
 			const capitals = plant("NSEC");
 			expect(capitals.value.startsWith("NSEC1")).toBe(true);
