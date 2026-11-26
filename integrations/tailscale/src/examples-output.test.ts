@@ -214,3 +214,51 @@ describe.skipIf(!posix)("two-agents-oauth example", () => {
 		expect(await readFile(keyFile, "utf8")).toBe(minted);
 	}, RUN_TIMEOUT_MS);
 });
+
+describe.skipIf(!posix)("the examples and an argument they do not know", () => {
+	/** Run `example` with `args` and check that it refuses without repeating `secret` or starting anything. */
+	async function refusesWithout(example: string, args: string[], secret: string): Promise<Run> {
+		const run = await runExample(example, [...relayArgs(), ...args]);
+		expect(run.code, run.output).toBe(1);
+		expect(run.output).not.toContain(secret);
+		expect(run.output).toMatch(/not shown/i);
+		expect(existsSync(keyFile), "the launcher was started").toBe(false);
+		return run;
+	}
+
+	it("auth-key example: does not repeat the value of an unknown option written as name=value", async () => {
+		const key = `tskey-auth-${hex(20)}`;
+		const run = await refusesWithout("two-agents-auth-key.ts", [`--authkey=${key}`], key);
+		expect(run.output).toContain("--authkey");
+	}, RUN_TIMEOUT_MS);
+
+	it("auth-key example: does not repeat a key typed after --auth-key-stdin", async () => {
+		const key = `tskey-auth-${hex(20)}`;
+		await refusesWithout("two-agents-auth-key.ts", ["--auth-key-stdin", key], key);
+	}, RUN_TIMEOUT_MS);
+
+	it("auth-key example: does not repeat a key given as a bare argument", async () => {
+		const key = `tskey-auth-${hex(20)}`;
+		await refusesWithout("two-agents-auth-key.ts", [key], key);
+	}, RUN_TIMEOUT_MS);
+
+	it("oauth example: does not repeat the value of an unknown option written as name=value", async () => {
+		const secret = `secret-${hex(16)}`;
+		const run = await refusesWithout("two-agents-oauth.ts", [`--clientsecret=${secret}`], secret);
+		expect(run.output).toContain("--clientsecret");
+	}, RUN_TIMEOUT_MS);
+
+	it("oauth example: does not repeat a secret typed after --client-secret-stdin", async () => {
+		const secret = `secret-${hex(16)}`;
+		await refusesWithout("two-agents-oauth.ts", ["--client-secret-stdin", secret], secret);
+	}, RUN_TIMEOUT_MS);
+
+	it("both examples still name an unknown option that has no value", async () => {
+		for (const example of ["two-agents-auth-key.ts", "two-agents-oauth.ts"]) {
+			const run = await runExample(example, [...relayArgs(), "--bogus"]);
+			expect(run.code, example).toBe(1);
+			expect(run.output, example).toContain("--bogus");
+			expect(existsSync(keyFile), `${example}: the launcher was started`).toBe(false);
+		}
+	}, RUN_TIMEOUT_MS);
+});
