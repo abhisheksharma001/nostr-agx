@@ -1,13 +1,19 @@
-import { readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { isSafeId } from "./inbound-lines.js";
-import { profileDir, writePrivateJson } from "./paths.js";
+import { toHexPubkey } from "./peer.js";
+import { profileDir } from "./paths.js";
 import type { StoredMessage } from "./store/types.js";
 
 /**
  * What `agx hook` says to a coding agent, and when. A hook runs inside the host's
  * turn, so everything here is small and quiet: one short line of counts and thread
  * ids, never what a peer wrote, and nothing at all when there is nothing new.
+ *
+ * Whatever is printed becomes part of another agent's prompt (on Codex a Stop hook's
+ * text is read as a new user prompt, on Cursor as the next user message). So a thread
+ * id is printed only when it is a UUID, the form agx itself makes: any other id is
+ * words a peer chose.
  */
 
 export const HOOK_HOSTS = ["claude", "cursor", "codex"] as const;
@@ -25,8 +31,8 @@ export const MAX_HOOK_INPUT_BYTES = 1024 * 1024;
 /** Thread ids named in one nudge; the rest are only counted. */
 export const MAX_NAMED_THREADS = 5;
 
-/** A thread id longer than this is not named: it is text a peer chose, so it stays short. */
-export const MAX_THREAD_ID_LENGTH = 64;
+/** The only thread ids a nudge names: 8-4-4-4-12 hex digits, in either case. No other id is printed. */
+const THREAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** One folder name made of letters, digits, dot, dash and underscore, not starting with a dot. */
 const PROFILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -41,6 +47,54 @@ export function isHookProfileName(name: string): boolean {
 	return PROFILE_NAME_RE.test(name);
 }
 
+/** The pubkeys on an allowlist, as hex. An entry that is not a public key is ignored, never an error. */
+export function allowedPeerKeys(entries: readonly string[]): Set<string> {
+	const keys = new Set<string>();
+	for (const entry of entries) {
+		try {
+			keys.add(toHexPubkey(entry, "allowlist entry"));
+		} catch {
+			// Not a key `serve` could match either: it names nobody.
+		}
+	}
+	return keys;
+}
+
+/**
+ * The unread messages worth a nudge: from a sender on the CURRENT allowlist, and not from
+ * `ownKey` (this profile's own key, when it is on its own allowlist). A sender is compared
+ * as a key, whatever form it was stored or listed in; one that is not a key is left out.
+ */
+export function nudgeableMessages(
+	unread: readonly StoredMessage[],
+	allowed: ReadonlySet<string>,
+	ownKey: string | null,
+): StoredMessage[] {
+	return unread.filter((message) => {
+		let from: string;
+		try {
+			from = toHexPubkey(message.peer, "sender");
+		} catch {
+			return false;
+		}
+		return allowed.has(from) && from !== ownKey;
+	});
+}
+
+/**
+ * Whether a `stop` hook may speak, given the host's own input. False when the host says it
+ * is already continuing because of a stop hook: speaking then could keep two agents that
+ * answer each other going forever. The field is the one each host documents (2026-11-26):
+ * Claude Code and Codex `stop_hook_active`, Cursor `loop_count` (0 for the first stop of a
+ * turn). Anything but the documented "not continuing" value counts as continuing.
+ */
+export function stopInputAllowsNudge(host: HookHost, input: Record<string, unknown>): boolean {
+	if (host === "cursor") {
+		return input.status === "completed" && (input.loop_count === undefined || input.loop_count === 0);
+	}
+	return input.stop_hook_active === undefined || input.stop_hook_active === false;
+}
+
 export interface Nudge {
 	text: string;
 }
@@ -53,8 +107,9 @@ function messages(count: number): string {
  * The nudge for the unread inbound messages in `unread` (oldest first), or null when
  * every one of them has been announced already. `announced` holds their ids.
  *
- * Only counts and thread ids go in. A thread id is named only when it is a short,
- * safe id; the newest threads come first and at most {@link MAX_NAMED_THREADS} are named.
+ * Only counts and thread ids go in. A thread id is named only when it is a UUID; the
+ * newest threads come first and at most {@link MAX_NAMED_THREADS} are named. A message
+ * whose thread id is anything else is counted, and its id is not shown.
  */
 export function buildNudge(
 	unread: readonly StoredMessage[],
@@ -70,13 +125,7 @@ export function buildNudge(
 	const threads: string[] = [];
 	for (const message of [...fresh].reverse()) {
 		const id = message.contextId;
-		if (
-			id !== null &&
-			!message.contextIdWithheld &&
-			id.length <= MAX_THREAD_ID_LENGTH &&
-			isSafeId(id) &&
-			!threads.includes(id)
-		) {
+		if (id !== null && !message.contextIdWithheld && THREAD_ID_RE.test(id) && !threads.includes(id)) {
 			threads.push(id);
 		}
 	}
@@ -122,21 +171,44 @@ export function nudgeMarkPath(profile: string, host: HookHost): string {
 
 const MARK_VERSION = 1;
 
+export interface NudgeMarks {
+	/** The ids already announced. Empty when the file is missing or damaged. */
+	ids: Set<string>;
+	/** True when a newer agx wrote the file: its shape is not known, so it is left alone. */
+	newerVersion: boolean;
+}
+
 /** The ids already announced to a host. A missing or damaged file means none. */
-export function readNudgeMarks(path: string): Set<string> {
+export function readNudgeMarks(path: string): NudgeMarks {
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-		const nudged = (parsed as { nudged?: unknown } | null)?.nudged;
-		if (!Array.isArray(nudged)) {
-			return new Set();
+		const record = parsed as { version?: unknown; nudged?: unknown } | null;
+		if (typeof record?.version === "number" && record.version > MARK_VERSION) {
+			return { ids: new Set(), newerVersion: true };
 		}
-		return new Set(nudged.filter((id): id is string => typeof id === "string"));
+		const nudged = record?.nudged;
+		if (!Array.isArray(nudged)) {
+			return { ids: new Set(), newerVersion: false };
+		}
+		return { ids: new Set(nudged.filter((id): id is string => typeof id === "string")), newerVersion: false };
 	} catch {
-		return new Set();
+		return { ids: new Set(), newerVersion: false };
 	}
 }
 
-/** Record the ids now announced. Message ids only, no text; throws when the file cannot be written. */
+/**
+ * Record the ids now announced: message ids only, no text. Throws when the file cannot be
+ * written. The folder and the file's mode are never changed: the profile folder belongs to
+ * the user (the shared private-file writer would put it back to 0700), and the temporary
+ * file is created private. A failed write removes its temporary file.
+ */
 export function writeNudgeMarks(path: string, ids: readonly string[]): void {
-	writePrivateJson(path, { version: MARK_VERSION, nudged: ids });
+	const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+	try {
+		writeFileSync(tmp, `${JSON.stringify({ version: MARK_VERSION, nudged: ids }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+		renameSync(tmp, path);
+	} catch (error) {
+		rmSync(tmp, { force: true });
+		throw error;
+	}
 }

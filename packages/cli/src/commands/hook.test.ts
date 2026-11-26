@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { updateProfile } from "../lib/config.js";
 import { EXIT } from "../lib/errors.js";
 import { loadIdentityFile } from "../lib/identity.js";
-import { lockPath, profileDir } from "../lib/paths.js";
+import { identityPath, lockPath, profileDir } from "../lib/paths.js";
 import { setStdinForTests } from "../lib/stdin.js";
 import { MessageStore } from "../lib/store/message-store.js";
 import { agx, type CliRun, sandbox } from "../test/helpers.js";
@@ -49,7 +49,8 @@ import { agx, type CliRun, sandbox } from "../test/helpers.js";
  *                automatic follow-up for this conversation (starts at 0)"
  */
 
-const PEER = toNpub("11".repeat(32));
+const PEER_HEX = "11".repeat(32);
+const PEER = toNpub(PEER_HEX);
 const STRANGER = toNpub("22".repeat(32));
 const BODY = "BODY-MARKER-7316 please review the invoice";
 const SUBJECT = "SUBJECT-MARKER-7316";
@@ -124,7 +125,7 @@ function seedStore(profile = "default"): void {
 }
 
 /** Put `entries` (default: the peer that sent the seeded mail) on the profile's allowlist, as `agx identity allow` stores them. */
-function allow(profile = "default", entries: string[] = [PEER]): void {
+function allow(profile = "default", entries: string[] = [PEER_HEX]): void {
 	updateProfile(profile, { allow: entries });
 }
 
@@ -567,6 +568,16 @@ describe("agx hook: an error never blocks the host", () => {
 		for (const event of ["stop", "session-start", "prompt"] as const) {
 			expectSilent(await hook(event, "claude", { profile: "broken" }));
 		}
+	});
+
+	it("exits 0 with no output when the profile's identity file cannot be read", async () => {
+		// Its own key is how the hook leaves the profile's own messages out.
+		writeFileSync(identityPath("default"), "{ not an identity");
+		for (const event of ["stop", "session-start", "prompt"] as const) {
+			expectSilent(await hook(event, "claude"));
+		}
+		rmSync(identityPath("default"));
+		expect(onlyDocument(await hook("stop", "claude"))).toEqual({ decision: "block", reason: ALL_UNREAD });
 	});
 
 	it("exits 0 with no output when AGX_HOME does not exist", async () => {
