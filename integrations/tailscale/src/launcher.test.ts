@@ -1053,6 +1053,92 @@ describe("a TS_NO_LOGS_NO_SUPPORT value in the environment", () => {
 	});
 });
 
+const PROXY_VARIABLES = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] as const;
+
+/** What the SDK says when it leaves a proxy variable out: the name, never the value. */
+function skippedProxyNotice(name: string): string {
+	return `@nostr-agx/tailscale: not passing ${name} to the launcher, because its value holds a login (a user name and password) that the launcher would print in its log. Use a proxy address without one.\n`;
+}
+
+describe("a proxy variable that holds a login", () => {
+	async function launcherSaw(
+		parent: Record<string, string | undefined>,
+	): Promise<{ env: Record<string, string>; written: string }> {
+		const fake = await envDumpingBinary();
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			const { written } = await withParentEnv(
+				{ ...Object.fromEntries(PROXY_VARIABLES.map((name) => [name, undefined])), ...parent },
+				() =>
+					collectingStderr(async () => {
+						proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+					}),
+			);
+			return { env: await savedEnv(fake.envFile), written };
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	}
+
+	it.skipIf(!posix).each(PROXY_VARIABLES)(
+		"is not passed on in %s, and the notice names the variable and not the value",
+		async (name) => {
+			const { env, written } = await launcherSaw({ [name]: "http://puser:ppass@proxy.invalid:3128" });
+			expect(env).not.toHaveProperty(name);
+			expect(written).toBe(skippedProxyNotice(name));
+			expect(written).not.toContain("puser");
+			expect(written).not.toContain("ppass");
+		},
+	);
+
+	it.skipIf(!posix).each([
+		["a user name alone", "http://puser@proxy.invalid:3128"],
+		["no scheme", "puser:ppass@proxy.invalid:3128"],
+		["a space in the password, which is not a valid address", "http://puser:pp ass@proxy.invalid:3128"],
+		["an @ in the password", "http://puser:pp@ss@proxy.invalid:3128"],
+		["a slash in the password, which is not a valid address", "http://puser:pp/ss@proxy.invalid:3128"],
+		["a SOCKS address", "socks5h://puser:ppass@proxy.invalid:1080"],
+	] as const)("is not passed on when it has %s", async (_what, value) => {
+		const { env, written } = await launcherSaw({ HTTPS_PROXY: value });
+		expect(env).not.toHaveProperty("HTTPS_PROXY");
+		expect(written).toBe(skippedProxyNotice("HTTPS_PROXY"));
+		expect(written).not.toContain("ppass");
+		expect(written).not.toContain("pp ass");
+	});
+
+	it.skipIf(!posix)("is left out one variable at a time, and the others still go on", async () => {
+		const { env, written } = await launcherSaw({
+			HTTPS_PROXY: "http://puser:ppass@proxy.invalid:3128",
+			https_proxy: "http://puser:ppass@proxy.invalid:3128",
+			HTTP_PROXY: "http://plain.invalid:3128",
+			NO_PROXY: "internal.invalid",
+		});
+		expect(env).not.toHaveProperty("HTTPS_PROXY");
+		expect(env).not.toHaveProperty("https_proxy");
+		expect(env.HTTP_PROXY).toBe("http://plain.invalid:3128");
+		expect(env.NO_PROXY).toBe("internal.invalid");
+		expect(written).toBe(skippedProxyNotice("HTTPS_PROXY") + skippedProxyNotice("https_proxy"));
+	});
+
+	it.skipIf(!posix)("does not stop a proxy address without a login from being passed on", async () => {
+		const { env, written } = await launcherSaw({
+			HTTPS_PROXY: "http://proxy.invalid:3128/path?x=1#frag",
+			https_proxy: "proxy.invalid:3128",
+		});
+		expect(env.HTTPS_PROXY).toBe("http://proxy.invalid:3128/path?x=1#frag");
+		expect(env.https_proxy).toBe("proxy.invalid:3128");
+		expect(written).toBe("");
+	});
+
+	it.skipIf(!posix)("is only a concern for the proxy address, not for NO_PROXY", async () => {
+		const { env, written } = await launcherSaw({ NO_PROXY: "a@b.invalid", no_proxy: "c@d.invalid" });
+		expect(env.NO_PROXY).toBe("a@b.invalid");
+		expect(env.no_proxy).toBe("c@d.invalid");
+		expect(written).toBe("");
+	});
+});
+
 /** Run `run` while writes to this process's stderr are kept in `writes` instead of printed. */
 async function withStderrWrites<T>(run: (writes: string[]) => Promise<T>): Promise<T> {
 	const writes: string[] = [];
@@ -1156,6 +1242,46 @@ describe("what the launcher writes on its stderr", () => {
 			expect(writes.join("")).toBe('tshttpproxy: using proxy "http://***@127.0.0.1:9" for URL: "x"\n');
 			// Whole lines only, so no piece of a credential is ever written alone.
 			for (const piece of writes) expect(piece.endsWith("\n")).toBe(true);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	// The CONNECT line Tailscale logs for every request through a proxy: the proxy
+	// address (with its login) and the first 20 characters of the
+	// Proxy-Authorization header, which is "Basic " and the start of
+	// base64(user:password).
+	it.skipIf(!posix)("masks the proxy's login and the start of its header in a CONNECT line", async () => {
+		const line =
+			'2026/11/27 01:20:01 tshttpproxy: CONNECT response from http://puser:ppass@127.0.0.1:9 for target "controlplane.tailscale.com:443" (auth "Basic cHVzZXI6cHBh...(26 total bytes)"): 407 Proxy Authentication Required\n';
+		const fake = await stderrWritingBinary([[line, 0]]);
+		try {
+			expect((await stderrOf(fake)).join("")).toBe(
+				'2026/11/27 01:20:01 tshttpproxy: CONNECT response from http://***@127.0.0.1:9 for target "controlplane.tailscale.com:443" (auth "***"): 407 Proxy Authentication Required\n',
+			);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("masks a whole encoded login, a header line and a loose Basic value", async () => {
+		// For a short login the 20 characters hold all of base64(user:password).
+		const fake = await stderrWritingBinary([
+			[
+				'x (auth "Basic dTpwYXNzd29yZA==") y\n' +
+					"Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==\n" +
+					"proxy-authorization: Bearer some-token-value\n" +
+					"sent Basic dXNlcjpwYXNzd29yZA== to the proxy\n",
+				0,
+			],
+		]);
+		try {
+			expect((await stderrOf(fake)).join("")).toBe(
+				'x (auth "***") y\n' +
+					"Proxy-Authorization: ***\n" +
+					"proxy-authorization: ***\n" +
+					"sent Basic *** to the proxy\n",
+			);
 		} finally {
 			await rm(fake.dir, { recursive: true, force: true });
 		}
