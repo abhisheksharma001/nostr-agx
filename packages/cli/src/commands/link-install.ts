@@ -276,17 +276,22 @@ function lossyContent(text: string): "number" | "key" | "deep" | null {
 }
 
 /**
- * A command that runs agx: the word `agx`, a file called `agx.<js|mjs|cjs|cmd|exe|ps1|bat|sh>`, `agx@<version>`
- * (as in `npx agx@latest`), or this CLI's npm package `@nostr-agx/cli` (with or without a version). It has to come
- * after the start of the text, white space, a slash, a backslash, a quote or a shell separator, and it ends at the
- * end, white space or a shell character (`; | & < > ( ) ` ' " ,`; a slash too, for the package's own files). That
- * covers `agx hook ...`, a path with or without spaces, `npx -y agx@latest`, `pnpm dlx @nostr-agx/cli`,
- * `env X=y agx`, `sh -c '...'`, `$(agx ...)`, `agx>/dev/null` and `agx,hook`, in any case. It leaves out `tagx`,
- * `~/nostr-agx/lint.sh`, `AGX_DONE`, `agxx` and the like, which are other tools. A folder named exactly `agx`
- * followed by a space, `'agx'` and `grep agx log` still count: a cautious refusal that is accepted.
+ * A command that runs agx: the word `agx`, a file called `agx.<js|mjs|cjs|ts|mts|cts|cmd|exe|com|ps1|bat|sh>` (which
+ * includes the CLI's own entry files, `src/bin/agx.ts` and `dist/agx.js`), `agx@<version>` (as in `npx agx@latest`),
+ * or this CLI's npm package `@nostr-agx/cli` (with or without a version). It has to come after the start of the text,
+ * white space, a slash, a backslash, a quote, a colon (`npm:agx`), a backtick or one of `( { ; & |`, and it ends at the
+ * end, white space, a backtick, a quote or one of `; | & < > ( ) { } ,` (a slash too, for the package's own files), or at
+ * a backslash or caret that ends a line (a continuation). That covers `agx hook ...`, a path with or without spaces, `npx -y
+ * agx@latest`, `pnpm dlx @nostr-agx/cli`, `deno run -A npm:agx`, `env X=y agx`, `sh -c '...'`, `$(agx ...)`,
+ * `powershell -c "& {agx hook}"`, `agx>/dev/null` and `agx,hook`, in any case. It leaves out `tagx`,
+ * `~/nostr-agx/lint.sh`, `AGX_DONE`, `agxx`, `x-agx` and the like, which are other tools. A command that builds the
+ * name from a variable (`${AGX_BIN:-agx}`) is not seen: a dash before the name would also refuse `my-agx-tool`. Cautious
+ * refusals that are accepted: a folder named exactly `agx` followed by a space, `'agx'`, `grep agx log`, `agx@` followed by
+ * anything (`ssh agx@buildbox`), and a non-breaking space or byte order mark beside the name (JavaScript counts both as
+ * white space, a shell does not).
  */
 const AGX_AS_A_COMMAND =
-	/(?:^|[\s/\\'"(;&|`])(?:agx(?:@|(?:\.(?:js|mjs|cjs|cmd|exe|ps1|bat|sh))?(?=$|[\s;|&<>()`'",]))|@nostr-agx\/cli(?=$|[\s/@;|&<>()`'",]))/i;
+	/(?:^|[\s/\\'"(;&|:{`])(?:agx(?:@|(?:\.(?:js|mjs|cjs|ts|mts|cts|cmd|exe|com|ps1|bat|sh))?(?=$|[\s;|&<>(){}`'",]|[\\^]\r?\n))|@nostr-agx\/cli(?=$|[\s/@;|&<>(){}`'",]))/i;
 
 /** Whether a hook command runs agx. It errs on the side of yes: the one thing worse than a refusal is a second copy of the hook. */
 function mentionsAgx(command: string): boolean {
