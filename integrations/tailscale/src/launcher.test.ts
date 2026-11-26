@@ -683,6 +683,36 @@ describe("the exit notice", () => {
 		}
 	});
 
+	it.skipIf(!posix)("calls each listener exactly once, also after stop() and for a late subscriber", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-exit-"));
+		const trigger = join(dir, "go");
+		const fake = await fakeBinary("#!/bin/sh\n" + endingTail(trigger, "exit 7"));
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+			const first = vi.fn();
+			const second = vi.fn();
+			proxy.onExit(first);
+			proxy.onExit(second);
+			await writeFile(trigger, "");
+			await until(() => first.mock.calls.length > 0 && second.mock.calls.length > 0);
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			await proxy.stop();
+			const late = vi.fn();
+			proxy.onExit(late);
+			await until(() => late.mock.calls.length > 0);
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			for (const listener of [first, second, late]) {
+				expect(listener).toHaveBeenCalledTimes(1);
+				expect(listener).toHaveBeenCalledWith({ code: 7, signal: null });
+			}
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	describe("when a listener throws", () => {
 		type Proxy = Awaited<ReturnType<typeof startBundledTailscale>>;
 
@@ -856,6 +886,9 @@ describe("the launcher's environment", () => {
 			AWS_SECRET_ACCESS_KEY: "throwaway-not-a-real-secret",
 			ALL_PROXY: "socks5://other.invalid:1080",
 			TS_AUTHKEY: "tskey-auth-throwaway-from-parent",
+			TS_AUTH_KEY: "tskey-auth-throwaway-underscore-from-parent",
+			TS_CONTROL_URL: "https://control.invalid",
+			TSNET_FORCE_LOGIN: "1",
 			AGX_TAILSCALE_AUTH_KEY: "throwaway-agx-key-from-parent",
 		};
 		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
@@ -913,13 +946,19 @@ describe("the launcher's environment", () => {
 		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
 		try {
 			await withParentEnv(
-				{ TS_AUTHKEY: "tskey-auth-throwaway-from-parent", AGX_TAILSCALE_AUTH_KEY: "throwaway" },
+				{
+					TS_AUTHKEY: "tskey-auth-throwaway-from-parent",
+					// tsnet itself also reads this spelling of the variable.
+					TS_AUTH_KEY: "tskey-auth-throwaway-underscore-from-parent",
+					AGX_TAILSCALE_AUTH_KEY: "throwaway",
+				},
 				async () => {
 					proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
 				},
 			);
 			const env = await savedEnv(fake.envFile);
 			expect(env).not.toHaveProperty("TS_AUTHKEY");
+			expect(env).not.toHaveProperty("TS_AUTH_KEY");
 			expect(env).not.toHaveProperty("AGX_TAILSCALE_AUTH_KEY");
 		} finally {
 			await proxy?.stop();

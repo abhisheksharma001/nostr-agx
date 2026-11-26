@@ -147,6 +147,18 @@ function start(...args: string[]): {
 	done: Promise<Run>;
 	output: () => string;
 } {
+	return startWith(false, args);
+}
+
+/** `detached` puts the process in a group of its own, so a signal can reach it and its launcher together, as Ctrl-C does. */
+function startWith(
+	detached: boolean,
+	args: string[],
+): {
+	child: ChildProcess;
+	done: Promise<Run>;
+	output: () => string;
+} {
 	const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1" };
 	for (const key of Object.keys(env)) {
 		if (key.startsWith("AGX_")) delete env[key];
@@ -159,6 +171,7 @@ function start(...args: string[]): {
 	const child = spawn(process.execPath, [AGX, ...args], {
 		env,
 		stdio: ["ignore", "pipe", "pipe"],
+		detached,
 	});
 	let stdout = "";
 	let stderr = "";
@@ -283,7 +296,11 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(5);
 			expect(run!.stderr).toContain("Tailscale launcher");
 			expect(run!.stderr).toContain("exit code 7");
-			expect(run!.stderr).not.toContain(SOCKS_PASS);
+			// Neither the SOCKS password nor the auth key may be in what serve says.
+			for (const secret of [SOCKS_PASS, KEY]) {
+				expect(run!.stderr).not.toContain(secret);
+				expect(run!.stdout).not.toContain(secret);
+			}
 			expectTailscaleRunWasPerRunAndCleanedUp();
 		} finally {
 			if (serve.child.exitCode === null && serve.child.signalCode === null) {
@@ -306,6 +323,31 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		} finally {
 			if (serve.child.exitCode === null && serve.child.signalCode === null) {
 				serve.child.kill("SIGINT");
+			}
+			await serve.done;
+		}
+	}, 60_000);
+
+	it("serve stays quiet about a launcher that is interrupted together with it, as Ctrl-C does", async () => {
+		// A terminal sends Ctrl-C to the whole foreground process group, so the
+		// launcher ends at the same moment serve starts to stop. serve is already
+		// stopping then, so it must not report the launcher or change its exit status.
+		const serve = startWith(true, ["serve", "--no-reply", "--no-tasks", "--poll-interval", "500"]);
+		try {
+			await until(() => serve.output().includes("watching for messages"), 20_000);
+			await new Promise((r) => setTimeout(r, 500));
+			process.kill(-serve.child.pid!, "SIGINT");
+			const run = await Promise.race([
+				serve.done,
+				new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
+			]);
+			expect(run, "serve was still running 20 s after Ctrl-C").not.toBeNull();
+			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(0);
+			expect(run!.stderr).not.toContain("Tailscale launcher");
+			expectTailscaleRunWasPerRunAndCleanedUp();
+		} finally {
+			if (serve.child.exitCode === null && serve.child.signalCode === null) {
+				process.kill(-serve.child.pid!, "SIGKILL");
 			}
 			await serve.done;
 		}
