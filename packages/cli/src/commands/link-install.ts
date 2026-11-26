@@ -183,8 +183,8 @@ function canonicalNumber(token: string): string {
 /** Whether a number written as `token` comes back with the same value after JSON.parse and JSON.stringify. */
 function numberSurvives(token: string): boolean {
 	const value = Number(token);
-	// JSON.stringify writes -0 as 0.
-	return Number.isFinite(value) && !Object.is(value, -0) && canonicalNumber(token) === canonicalNumber(JSON.stringify(value));
+	// JSON.stringify writes -0 as 0 and an infinite value (1e400) as null, which never matches.
+	return !Object.is(value, -0) && canonicalNumber(token) === canonicalNumber(JSON.stringify(value));
 }
 
 /** No hook file nests this deep; a bigger number is a file built to overflow the stack of whatever rewrites it. */
