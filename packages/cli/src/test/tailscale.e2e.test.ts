@@ -290,11 +290,7 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 	it("serve reports a launcher that dies mid-run and exits non-zero", async () => {
 		// The launcher reports its proxy, then ends by itself once `trigger` exists.
 		const trigger = join(home, "launcher-die");
-		writeFileSync(
-			launcher,
-			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\nwhile [ ! -e ${JSON.stringify(trigger)} ]; do sleep 0.1; done\nexit 7\n`,
-			{ mode: 0o755 },
-		);
+		waitingLauncher(trigger);
 		const serve = start("serve", "--no-reply", "--no-tasks", "--poll-interval", "500");
 		try {
 			await until(() => serve.output().includes("watching for messages"), 20_000);
@@ -345,11 +341,7 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		// the launcher or cut the wait short with another exit status.
 		const trigger = join(home, "launcher-die");
 		const release = join(home, "release-task");
-		writeFileSync(
-			launcher,
-			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\nwhile [ ! -e ${JSON.stringify(trigger)} ]; do sleep 0.1; done\n: > ${JSON.stringify(`${trigger}.gone`)}\nexit 7\n`,
-			{ mode: 0o755 },
-		);
+		waitingLauncher(trigger, `: > ${JSON.stringify(`${trigger}.gone`)}\n`);
 		const handler = join(home, "held-handler.mjs");
 		writeFileSync(
 			handler,
@@ -427,6 +419,66 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		);
 		return pidFile;
 	}
+
+	/**
+	 * A launcher that reports its proxy, waits until `trigger` exists, runs
+	 * `after` (shell lines, each ending in a newline) and ends with code 7. It
+	 * writes its pid where the test can read it.
+	 */
+	function waitingLauncher(trigger: string, after = ""): string {
+		const pidFile = join(home, "launcher-pid");
+		writeFileSync(
+			launcher,
+			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho $$ > ${JSON.stringify(pidFile)}\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\nwhile [ ! -e ${JSON.stringify(trigger)} ]; do sleep 0.1; done\n${after}exit 7\n`,
+			{ mode: 0o755 },
+		);
+		return pidFile;
+	}
+
+	function isAlive(pid: number): boolean {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "EPERM";
+		}
+	}
+
+	it.each([
+		["waits for a trigger file", () => waitingLauncher(join(home, "launcher-die"))],
+		["waits for a signal", () => interruptibleLauncher()],
+	])("a stand-in launcher that %s does not outlive an agx that was killed", async (_name, make) => {
+		const pidFile = make();
+		const serve = start("serve", "--no-reply", "--no-tasks", "--poll-interval", "500");
+		let pid = 0;
+		try {
+			await until(() => serve.output().includes("watching for messages"), 20_000);
+			pid = Number(readFileSync(pidFile, "utf8").trim());
+			expect(pid).toBeGreaterThan(1);
+			serve.child.kill("SIGKILL");
+			await serve.done;
+			let gone = false;
+			try {
+				await until(() => !isAlive(pid), 5_000);
+				gone = true;
+			} catch {
+				// still running: reported below
+			}
+			expect(gone, `the stand-in launcher (pid ${pid}) was still running 5 s after its agx was killed`).toBe(true);
+		} finally {
+			if (serve.child.exitCode === null && serve.child.signalCode === null) {
+				serve.child.kill("SIGKILL");
+			}
+			await serve.done;
+			if (pid > 1 && isAlive(pid)) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// already gone
+				}
+			}
+		}
+	}, 40_000);
 
 	const LAUNCHER_NOTICE = "The Tailscale launcher stopped on its own";
 
