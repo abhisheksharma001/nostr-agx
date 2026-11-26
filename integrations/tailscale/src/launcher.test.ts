@@ -837,6 +837,92 @@ describe("the launcher's environment", () => {
 	});
 });
 
+/** Run `fn` while writes to this process's stderr are collected instead of printed. */
+async function collectingStderr<T>(fn: () => Promise<T>): Promise<{ value: T; written: string }> {
+	let written = "";
+	const spy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+		written += typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString();
+		return true;
+	}) as typeof process.stderr.write);
+	try {
+		const value = await fn();
+		return { value, written };
+	} finally {
+		spy.mockRestore();
+	}
+}
+
+/** The spellings Go's strconv.ParseBool, which tsnet reads this variable with, accepts. */
+const BOOLEANS_TAILSCALE_ACCEPTS = [
+	"1",
+	"t",
+	"T",
+	"TRUE",
+	"true",
+	"True",
+	"0",
+	"f",
+	"F",
+	"FALSE",
+	"false",
+	"False",
+] as const;
+
+/** What the SDK says when it leaves the variable out: the name, never the value. */
+const IGNORED_NOTICE =
+	"@nostr-agx/tailscale: ignoring TS_NO_LOGS_NO_SUPPORT from the environment, because Tailscale does not accept its value (use true or false).\n";
+
+describe("a TS_NO_LOGS_NO_SUPPORT value in the environment", () => {
+	async function launcherSaw(
+		value: string,
+		options: { disableLogUpload?: boolean } = {},
+	): Promise<{ env: Record<string, string>; written: string }> {
+		const fake = await envDumpingBinary();
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			const { written } = await withParentEnv({ TS_NO_LOGS_NO_SUPPORT: value }, () =>
+				collectingStderr(async () => {
+					proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000, ...options });
+				}),
+			);
+			return { env: await savedEnv(fake.envFile), written };
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	}
+
+	it.skipIf(!posix).each(BOOLEANS_TAILSCALE_ACCEPTS)(
+		"passes %j on, because Tailscale reads it as a boolean",
+		async (value) => {
+			const { env, written } = await launcherSaw(value);
+			expect(env.TS_NO_LOGS_NO_SUPPORT).toBe(value);
+			expect(written).toBe("");
+		},
+	);
+
+	it.skipIf(!posix).each(["yes", "no", "on", "off", "2", "tRuE", " true", "true ", "enabled"])(
+		"leaves %j out, because Tailscale would refuse it at start, and names only the variable",
+		async (value) => {
+			const { env, written } = await launcherSaw(value);
+			expect(env).not.toHaveProperty("TS_NO_LOGS_NO_SUPPORT");
+			expect(written).toBe(IGNORED_NOTICE);
+		},
+	);
+
+	it.skipIf(!posix)("is replaced by true, without a notice, when the switch is on", async () => {
+		const { env, written } = await launcherSaw("yes", { disableLogUpload: true });
+		expect(env.TS_NO_LOGS_NO_SUPPORT).toBe("true");
+		expect(written).toBe("");
+	});
+
+	it.skipIf(!posix)("is left out without a notice when it is set but empty", async () => {
+		const { env, written } = await launcherSaw("");
+		expect(env).not.toHaveProperty("TS_NO_LOGS_NO_SUPPORT");
+		expect(written).toBe("");
+	});
+});
+
 describe("the log upload switch", () => {
 	async function launchedEnv(
 		parent: Record<string, string | undefined>,
