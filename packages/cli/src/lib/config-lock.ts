@@ -216,19 +216,30 @@ let heldToken: string | null = null;
 /** A function that returns a promise is refused: the lock is let go when `fn` returns, before the promise settles. */
 type NotAPromise<T> = T extends PromiseLike<unknown> ? never : T;
 
+/** The type refuses a promise, but a function typed `any` or a hand-made thenable gets past it, so it is refused here too. */
+function runSynchronously<T>(fn: () => NotAPromise<T>): T {
+	const result = fn();
+	if (typeof (result as { then?: unknown } | null | undefined)?.then === "function") {
+		throw new Error(
+			"withConfigLock: the function must be synchronous. The lock is let go when it returns, so whatever a promise does later would run without the lock.",
+		);
+	}
+	return result;
+}
+
 /**
  * Run `fn` while holding the config lock. Re-entrant within one process, so a
  * caller that already holds it can call `updateProfile` without waiting for itself.
  */
 export function withConfigLock<T>(fn: () => NotAPromise<T>, options: { waitMs?: number } = {}): T {
 	if (depth > 0) {
-		return fn();
+		return runSynchronously(fn);
 	}
 	const { token, release } = acquire(options.waitMs ?? CONFIG_LOCK_WAIT_MS);
 	depth = 1;
 	heldToken = token;
 	try {
-		return fn();
+		return runSynchronously(fn);
 	} finally {
 		depth = 0;
 		heldToken = null;
