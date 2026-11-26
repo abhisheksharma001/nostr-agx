@@ -27,6 +27,8 @@ import { dirname, join } from "node:path";
  *     config.json                         profiles: API base, org, relays, allowlist
  *                                         (never a key since 0.4; a 0.3 key is
  *                                         migrated out on the next write)
+ *     config.json.lock                    held for the milliseconds one write of
+ *                                         config.json takes (see config-lock.ts)
  *     credentials.json                    API keys, one per profile, each bound
  *                                         to the one origin it may be sent to
  *     profiles/<name>/identity.json       the secret key
