@@ -10,9 +10,9 @@ import { isOwnSecretKey, refuseOwnSecretKey } from "../lib/peer.js";
 import { agx, sandbox } from "../test/helpers.js";
 
 // A secret key is also 64 hex characters, so `agx` cannot tell one from a public key by its shape. The one
-// secret key it does know is its own: the profile's identity file. Given as a peer, that key must be refused
-// without being shown, or it is stored in config.json, printed back as an npub that decodes to the same
-// bytes, sent as the recipient of a message, or put in a request to a relay.
+// secret key it compares is the active profile's own, from that profile's identity file. Given as a peer, that
+// key must be refused without being shown, or it is stored in config.json or held.jsonl, printed back as an npub
+// that decodes to the same bytes, sent as the recipient of a message, or put in a request to a relay.
 
 const mocks = vi.hoisted(() => ({
 	createTransport: vi.fn(),
@@ -263,7 +263,7 @@ describe("input that is still accepted", () => {
 		expect(getProfile("default").allow).toContain(mine.publicKey);
 	});
 
-	it("another profile's secret key cannot be told from a public key, so it is not refused", async () => {
+	it("the secret key of another profile is not recognised, so it is used like a public key: only the active profile's own is compared", async () => {
 		const run = await agx("identity", "allow", other.secretKeyHex);
 		expect(run.code).toBe(0);
 		expect(getProfile("default").allow).toContain(other.secretKeyHex);
