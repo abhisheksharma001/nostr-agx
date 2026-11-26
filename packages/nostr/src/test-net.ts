@@ -115,8 +115,8 @@ export async function startFakeSocks5(): Promise<FakeSocks5> {
 		socket.on("close", () => sockets.delete(socket));
 		let pending = Buffer.alloc(0);
 		let greeted = false;
-		socket.on("data", (chunk) => {
-			pending = Buffer.concat([pending, chunk]);
+		socket.on("data", (chunk: Buffer | string) => {
+			pending = Buffer.concat([pending, Buffer.from(chunk)]);
 			if (!greeted) {
 				if (pending.length < 2 || pending.length < 2 + pending[1]!) {
 					return;
