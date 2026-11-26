@@ -64,7 +64,7 @@ export function createUiSendTransport(
 			return pending;
 		},
 		retryInSeconds(): number {
-			return !pending && failures > 0 ? Math.max(0, Math.ceil((retryAt - performance.now()) / 1000)) : 0;
+			return Math.max(0, Math.ceil((retryAt - performance.now()) / 1000));
 		},
 		close(): Promise<void> {
 			closing ??= (async () => {
