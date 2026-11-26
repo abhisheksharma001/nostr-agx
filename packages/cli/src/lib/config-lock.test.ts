@@ -216,6 +216,35 @@ describe("withConfigLock", () => {
 			expect(holder).not.toBe("other-writer");
 		}, PATIENT_TEST_MS);
 
+		it("waits 5 seconds when no limit is given, then refuses (on a clock the test moves, so nothing really waits)", () => {
+			// A command that calls `withConfigLock` or `updateProfile` with no options gets the default wait. Every test
+			// above passes its own, so without this nothing would notice a default that is far too short.
+			writeLock({ pid: liveProcess(), host: hostname(), token: "other" });
+			vi.useFakeTimers({ toFake: ["Date"] });
+			const pause = vi.spyOn(Atomics, "wait").mockImplementation((_array, _index, _value, ms) => {
+				vi.advanceTimersByTime(ms ?? 0);
+				return "timed-out";
+			});
+			let error: unknown;
+			let waited = 0;
+			try {
+				const started = Date.now();
+				try {
+					withConfigLock(() => "ran");
+				} catch (caught) {
+					error = caught;
+				}
+				waited = Date.now() - started;
+			} finally {
+				pause.mockRestore();
+				vi.useRealTimers();
+			}
+			expect(error).toBeInstanceOf(AgxCliError);
+			expect((error as AgxCliError).message).toContain("for more than 5 seconds");
+			expect(waited).toBeGreaterThanOrEqual(5_000);
+			expect(waited).toBeLessThan(6_000);
+		});
+
 		it("waits on a fresh lock from another host", () => {
 			writeLock({ pid: 1, host: "some-other-container", token: "far" });
 			expect(() => withConfigLock(() => undefined, { waitMs: 100 })).toThrow(/config lock/i);
