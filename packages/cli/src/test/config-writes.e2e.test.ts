@@ -1,8 +1,8 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createIdentity } from "../lib/identity.js";
 import { startRelay } from "../relay/server.js";
@@ -64,6 +64,31 @@ function startServe(relayPort: number, ...args: string[]): { child: ChildProcess
 		child.on("close", (code) => resolve({ code, stdout }));
 	});
 	return { child, done, output: () => stdout };
+}
+
+/** One `agx` command that can be started now and awaited later, with extra environment variables for it alone. */
+function startAgx(extraEnv: Record<string, string>, ...args: string[]): { child: ChildProcess; done: Promise<Run> } {
+	const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1" };
+	for (const key of Object.keys(env)) {
+		if (key.startsWith("AGX_")) {
+			delete env[key];
+		}
+	}
+	env.AGX_HOME = home;
+	Object.assign(env, extraEnv);
+	const child = spawn(process.execPath, [AGX, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+	let stdout = "";
+	child.stdout?.on("data", (chunk: Buffer) => {
+		stdout += chunk.toString();
+	});
+	child.stderr?.on("data", (chunk: Buffer) => {
+		stdout += chunk.toString();
+	});
+	const done = new Promise<Run>((resolve, reject) => {
+		child.on("error", reject);
+		child.on("close", (code) => resolve({ code, stdout }));
+	});
+	return { child, done };
 }
 
 async function until(condition: () => boolean, timeoutMs: number): Promise<void> {
@@ -239,6 +264,67 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 			serve.child.kill("SIGINT");
 			await serve.done;
 			await relay.close();
+		}
+	}, 120_000);
+
+	// A command stopped for longer than the lock's age limit (30 seconds) has its lock taken by the next
+	// one. A preload stands in for the stop: it holds the first command back when it flushes its new
+	// file (after it is written, before it is renamed into place), and the test makes the lock look old,
+	// so nothing waits for 30 real seconds.
+	it("a command whose lock was taken over while it was stopped saves nothing, says so, and keeps the other command's change", async () => {
+		const scratch = mkdtempSync(join(tmpdir(), "agx-e2e-stopped-"));
+		try {
+			const mark = join(scratch, "stopped");
+			const go = join(scratch, "go");
+			const preload = join(scratch, "stop-at-flush.mjs");
+			writeFileSync(
+				preload,
+				[
+					'import fs from "node:fs";',
+					'import { syncBuiltinESMExports } from "node:module";',
+					"const real = fs.fsyncSync;",
+					"let stopped = false;",
+					"fs.fsyncSync = function (fd) {",
+					"  if (!stopped) {",
+					"    stopped = true;",
+					"    fs.writeFileSync(process.env.STOP_MARK, String(process.pid));",
+					"    const sleeper = new Int32Array(new SharedArrayBuffer(4));",
+					"    const giveUpAt = Date.now() + 60000;",
+					"    while (!fs.existsSync(process.env.STOP_GO) && Date.now() < giveUpAt) Atomics.wait(sleeper, 0, 0, 20);",
+					"  }",
+					"  return real.call(this, fd);",
+					"};",
+					"syncBuiltinESMExports();",
+					"",
+				].join("\n"),
+			);
+			const x = createIdentity().npub;
+			const y = createIdentity().npub;
+
+			const stopped = startAgx(
+				{ NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, STOP_MARK: mark, STOP_GO: go },
+				"identity",
+				"allow",
+				x,
+			);
+			await until(() => existsSync(mark), 30_000);
+			// It holds the lock and has not saved. Make the lock old, as if it had been stopped for a minute.
+			const past = new Date(Date.now() - 60_000);
+			utimesSync(join(home, "config.json.lock"), past, past);
+
+			const other = await agx("identity", "allow", y);
+			expect(other.code, other.stdout).toBe(0);
+
+			writeFileSync(go, "");
+			const first = await stopped.done;
+			expect(first.code, first.stdout).not.toBe(0);
+			expect(first.stdout).toMatch(/was not saved/);
+
+			const have = await allowed();
+			expect({ stopped: have.has(x), other: have.has(y) }).toEqual({ stopped: false, other: true });
+			expect(readdirSync(home).filter((name) => name.endsWith(".tmp") || name.startsWith("config.json.lock"))).toEqual([]);
+		} finally {
+			rmSync(scratch, { recursive: true, force: true });
 		}
 	}, 120_000);
 });
