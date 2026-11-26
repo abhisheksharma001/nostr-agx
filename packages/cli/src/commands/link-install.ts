@@ -461,27 +461,35 @@ function staleLockText(lock: string): string | null {
  * first install had made in the meantime, leaving two installs inside at once. So the removal is done only
  * while holding a second, very short-lived lock file (`<lock>.takeover`), and only when the lock is still
  * exactly the one that was judged: an install that gets the second lock late finds a different lock, or none,
- * and leaves it alone. Returns whether the lock that was judged is gone.
+ * and leaves it alone. A second file left by an install that died is removed the same careful way (only if
+ * it is still the one that was judged), and an install only ever removes a second file that is its own.
+ * Returns whether the lock that was judged is gone.
  */
-function takeOverLeftOverLock(lock: string, judged: string, afterJudged: (() => void) | undefined): boolean {
-	afterJudged?.();
+function takeOverLeftOverLock(lock: string, judged: string, deps: LinkInstallDeps): boolean {
+	deps.afterLockJudged?.();
 	const takeover = `${lock}.takeover`;
+	const mine = `${JSON.stringify({ pid: process.pid, token: randomBytes(8).toString("hex") })}\n`;
 	try {
 		const fd = openSync(takeover, "wx", 0o600);
 		try {
-			writeFileSync(fd, `${JSON.stringify({ pid: process.pid })}\n`);
+			writeFileSync(fd, mine);
 		} finally {
 			closeSync(fd);
 		}
 	} catch {
 		// Another install is doing it. If that one died halfway, its file is cleared and the next round gets it.
-		if (staleLockText(takeover) !== null) {
-			rmSync(takeover, { force: true });
+		const judgedTakeover = staleLockText(takeover);
+		if (judgedTakeover !== null) {
+			deps.afterTakeoverJudged?.();
+			if (readText(takeover) === judgedTakeover) {
+				rmSync(takeover, { force: true });
+			}
 		}
 		return false;
 	}
 	try {
-		if (readFileSync(lock, "utf8") !== judged) {
+		deps.duringTakeover?.();
+		if (readText(lock) !== judged) {
 			return false;
 		}
 		rmSync(lock);
@@ -489,7 +497,9 @@ function takeOverLeftOverLock(lock: string, judged: string, afterJudged: (() => 
 	} catch {
 		return false;
 	} finally {
-		rmSync(takeover, { force: true });
+		if (readText(takeover) === mine) {
+			rmSync(takeover, { force: true });
+		}
 	}
 }
 
@@ -525,7 +535,7 @@ function withLock<T>(target: string, deps: LinkInstallDeps, run: (stillMine: () 
 				throw writeFailure(target, error);
 			}
 			const stale = staleLockText(lock);
-			if (stale !== null && takeOverLeftOverLock(lock, stale, deps.afterLockJudged)) {
+			if (stale !== null && takeOverLeftOverLock(lock, stale, deps)) {
 				continue;
 			}
 			if (Date.now() >= deadline) {
