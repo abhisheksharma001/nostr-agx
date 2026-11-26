@@ -273,9 +273,12 @@ type WebSocketConstructor = new (
  *    `ws` builds its HTTP request synchronously in the constructor and records
  *    it on `this._req`, so the moment `super()` returns we can tell whether the
  *    options were forwarded. A subclass that dropped them (e.g. a constructor
- *    that calls `super(address, protocols)` with its own options) gets its
- *    direct connection destroyed and a {@link RelayProxyError} thrown — fail
- *    closed, not fail open.
+ *    that calls `super(address, protocols)` with its own options) is refused
+ *    with a {@link RelayProxyError} — fail closed, not fail open. The check
+ *    is made once, here, with a stand-in agent and a local socket path, so no
+ *    relay is dialed to find out. It is repeated on every dial as well: a
+ *    class that dropped the agent only for some addresses would otherwise
+ *    start a direct connection that this check could only cut short.
  */
 export function wrapWebSocket(
 	base: WebSocketImpl | undefined,
@@ -292,6 +295,9 @@ export function wrapWebSocket(
 		);
 	}
 	const agent = options.agent;
+	if (agent !== undefined) {
+		assertAgentForwarded(Base as WebSocketConstructor, options);
+	}
 	return class extends (Base as WebSocketConstructor) {
 		constructor(
 			address: string | URL,
@@ -302,29 +308,77 @@ export function wrapWebSocket(
 			if (agent === undefined) {
 				return;
 			}
-			// Only a `ws`-derived implementation records its request; anything
-			// else (test doubles, a global WebSocket) gives us nothing to check.
-			const req = (
-				this as { _req?: { agent?: unknown; destroy(cause?: Error): void } }
-			)._req;
+			const req = recordedRequest(this);
 			if (!req || req.agent === agent) {
 				return;
 			}
 			// The base already started dialing DIRECTLY. Destroy that request
-			// before throwing — and quiet `ws`'s own error emission on this
-			// instance first, or the discarded EventEmitter crashes the process
-			// with an unhandled 'error' event.
-			(this as unknown as { on(event: string, listener: () => void): void }).on(
-				"error",
-				() => {},
-			);
-			req.destroy();
-			throw new RelayProxyError(
-				"The WebSocket implementation ignored the proxy agent.",
-				"The WebSocket constructor must forward its third argument (the options) to super — see withHandshakeTimeout in @nostr-agx/cli for the shape to copy.",
-			);
+			// before throwing.
+			abandonRequest(this, req);
+			throw droppedAgentError();
 		}
 	} as WebSocketImpl;
+}
+
+/** The HTTP request `ws` started for an instance, as far as this file looks. */
+interface RecordedRequest {
+	agent?: unknown;
+	destroy(cause?: Error): void;
+}
+
+/** Only a `ws`-derived implementation records its request; anything else (test
+ * doubles, a global WebSocket) gives us nothing to check. */
+function recordedRequest(instance: object): RecordedRequest | undefined {
+	return (instance as { _req?: RecordedRequest })._req;
+}
+
+/** Destroy a request the base class started. `ws`'s own error emission on the
+ * instance is quieted first, or the discarded EventEmitter crashes the process
+ * with an unhandled 'error' event. */
+function abandonRequest(instance: object, req: RecordedRequest): void {
+	(instance as { on(event: string, listener: () => void): void }).on(
+		"error",
+		() => {},
+	);
+	req.destroy();
+}
+
+function droppedAgentError(): RelayProxyError {
+	return new RelayProxyError(
+		"The WebSocket implementation ignored the proxy agent.",
+		"The WebSocket constructor must forward its third argument (the options) to super — see withHandshakeTimeout in @nostr-agx/cli for the shape to copy.",
+	);
+}
+
+/** A socket path nothing listens on. A class that drops the options dials this
+ * and finds nothing, so checking a class never touches the network. */
+const CHECK_ADDRESS = "ws+unix:///agx-relay-proxy-check.sock:/";
+
+/**
+ * Check, once, that a WebSocket class forwards its options: build one socket
+ * with a stand-in agent that never connects, and see whether the request `ws`
+ * recorded carries it. A class that cannot be checked (it records no request,
+ * or refuses the check address) is left to the check on each dial.
+ */
+function assertAgentForwarded(
+	Base: WebSocketConstructor,
+	options: Record<string, unknown>,
+): void {
+	const standIn = { addRequest(): void {} };
+	let probe: object;
+	try {
+		probe = new Base(CHECK_ADDRESS, undefined, { ...options, agent: standIn });
+	} catch {
+		return;
+	}
+	const req = recordedRequest(probe);
+	if (!req) {
+		return;
+	}
+	abandonRequest(probe, req);
+	if (req.agent !== standIn) {
+		throw droppedAgentError();
+	}
 }
 
 /** A configuration or provider failure while setting up relay routing. */
