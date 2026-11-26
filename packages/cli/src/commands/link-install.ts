@@ -135,8 +135,12 @@ function load(file: string): Loaded {
 		stat = lstatSync(file);
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "ENOENT" || code === "ENOTDIR") {
+		if (code === "ENOENT") {
 			return { target: file, text: null, mode: null, links: 0 };
+		}
+		if (code === "ENOTDIR") {
+			// A folder on the way is a file: a dry run would say "would create", and the real run could not. Both say so now.
+			throw refusal(`A folder on the way to ${file} is a file, not a folder, so it cannot be created there.`, "Check what is at that path, then run this again.");
 		}
 		throw refusal(`Cannot look at ${file} (${code ?? "error"}).`, "Check the permissions of that file and run this again.");
 	}
