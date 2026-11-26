@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import {
 	chmodSync,
 	existsSync,
@@ -142,6 +142,28 @@ let relay: RunningRelay;
 let socks: SocksProxy;
 let launcher: string;
 
+/**
+ * Ends the stand-in launcher this test started, if it still runs: the pid it
+ * wrote is only used when that process is still running this test's own script.
+ */
+function endStandIn(): void {
+	let pid: number;
+	try {
+		pid = Number(readFileSync(join(home, "launcher-pid"), "utf8").trim());
+	} catch {
+		return;
+	}
+	if (!Number.isInteger(pid) || pid <= 1) return;
+	try {
+		const command = execFileSync("ps", ["-ww", "-o", "command=", "-p", String(pid)], {
+			encoding: "utf8",
+		});
+		if (command.includes(launcher)) process.kill(pid, "SIGKILL");
+	} catch {
+		// Not running any more (ps finds no such process, or kill gets ESRCH).
+	}
+}
+
 function start(...args: string[]): {
 	child: ChildProcess;
 	done: Promise<Run>;
@@ -258,6 +280,7 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 	});
 
 	afterEach(async () => {
+		endStandIn();
 		await socks.close();
 		await relay.close();
 		rmSync(home, { recursive: true, force: true });
@@ -407,29 +430,30 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 	}, 90_000);
 
 	/**
-	 * A launcher that ends when it is sent SIGINT, as the real one does, and
-	 * writes its pid where the test can read it.
+	 * A launcher that ends when it is sent SIGINT, as the real one does (or when
+	 * the process that started it is gone), and writes its pid where the test
+	 * can read it.
 	 */
 	function interruptibleLauncher(): string {
 		const pidFile = join(home, "launcher-pid");
 		writeFileSync(
 			launcher,
-			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho $$ > ${JSON.stringify(pidFile)}\ntrap 'exit 0' INT\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\nwhile :; do sleep 1 & wait $!; done\n`,
+			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho $$ > ${JSON.stringify(pidFile)}\ntrap 'exit 0' INT\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\np=$PPID\nwhile kill -0 $p 2>/dev/null; do sleep 1 & wait $!; done\n`,
 			{ mode: 0o755 },
 		);
 		return pidFile;
 	}
 
 	/**
-	 * A launcher that reports its proxy, waits until `trigger` exists, runs
-	 * `after` (shell lines, each ending in a newline) and ends with code 7. It
-	 * writes its pid where the test can read it.
+	 * A launcher that reports its proxy, waits until `trigger` exists (or the
+	 * process that started it is gone), runs `after` (shell lines, each ending in
+	 * a newline) and ends with code 7. It writes its pid where the test can read it.
 	 */
 	function waitingLauncher(trigger: string, after = ""): string {
 		const pidFile = join(home, "launcher-pid");
 		writeFileSync(
 			launcher,
-			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho $$ > ${JSON.stringify(pidFile)}\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\nwhile [ ! -e ${JSON.stringify(trigger)} ]; do sleep 0.1; done\n${after}exit 7\n`,
+			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho $$ > ${JSON.stringify(pidFile)}\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\np=$PPID\nwhile [ ! -e ${JSON.stringify(trigger)} ] && kill -0 $p 2>/dev/null; do sleep 0.1; done\n${after}exit 7\n`,
 			{ mode: 0o755 },
 		);
 		return pidFile;
