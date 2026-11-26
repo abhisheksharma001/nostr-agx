@@ -609,8 +609,9 @@ export function linkInstallCommand(options: LinkInstallOptions, deps: LinkInstal
 	}
 	if (profile !== undefined && !isHookProfileName(profile)) {
 		throw usageError(
-			`"${profile}" is not a profile name a hook can use.`,
-			"Use a name made of letters, digits, dots, dashes and underscores, starting with a letter or digit.",
+			// The value is not shown, not even a part of it: one that is close to a key could be one.
+			"That --profile value is not a profile name a hook can use. Nothing was changed.",
+			"Use a name of up to 64 characters made of letters, digits, dots, dashes and underscores, starting with a letter or digit.",
 		);
 	}
 	// The hook command is plain `agx hook ...`: it does not carry these, so an agent started without them reads another profile.
