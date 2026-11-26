@@ -35,7 +35,57 @@ function discoveryCalls(source: string): string[] {
 	return calls;
 }
 
-const passesWebSocket = (args: string) => /\b(ws|WebSocket|webSocket)\b/.test(args);
+/** The arguments of a call, split at the commas that are not inside brackets,
+ * braces, parentheses or a string. */
+function splitArguments(args: string): string[] {
+	const parts: string[] = [];
+	let depth = 0;
+	let quote = "";
+	let start = 0;
+	for (let i = 0; i < args.length; i += 1) {
+		const ch = args[i] as string;
+		if (quote) {
+			if (ch === "\\") {
+				i += 1;
+			} else if (ch === quote) {
+				quote = "";
+			}
+		} else if (ch === '"' || ch === "'" || ch === "`") {
+			quote = ch;
+		} else if ("([{".includes(ch)) {
+			depth += 1;
+		} else if (")]}".includes(ch)) {
+			depth -= 1;
+		} else if (ch === "," && depth === 0) {
+			parts.push(args.slice(start, i).trim());
+			start = i + 1;
+		}
+	}
+	const last = args.slice(start).trim();
+	return last ? [...parts, last] : parts;
+}
+
+/** A value that is a WebSocket class, as far as source text shows: it names one
+ * and is not `undefined` or `null`. */
+const isWebSocketValue = (value: string) =>
+	!/^(undefined|null)$/.test(value) && /\b(ws|WebSocket|webSocket)\b/.test(value);
+
+/** Does the call hand the class over where the function takes it? The functions
+ * that take an object read `ws` from it; the others take it as the fourth
+ * argument, after the signer. */
+function passesWebSocket(args: string): boolean {
+	const parts = splitArguments(args);
+	const first = parts[0] ?? "";
+	if (first.startsWith("{")) {
+		return splitArguments(first.slice(1, first.lastIndexOf("}"))).some(
+			(property) => {
+				const named = /^ws\s*(?::\s*([\s\S]+))?$/.exec(property);
+				return named !== null && isWebSocketValue(named[1] ?? "ws");
+			},
+		);
+	}
+	return isWebSocketValue(parts[3] ?? "");
+}
 
 function exampleFiles(dir: URL): URL[] {
 	return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -62,6 +112,31 @@ describe("finding discovery calls in example code", () => {
 			"await resolvePeerCard(pk, [RELAY], undefined, WebSocket);",
 			"await resolvePeerCard(pk, [RELAY], signer, transport.webSocket);",
 			"await fetchByAuthor({ relays, author, kinds: [1], ws: WebSocket });",
+		]) {
+			const [args] = discoveryCalls(source);
+			expect(passesWebSocket(args ?? ""), source).toBe(true);
+		}
+	});
+
+	it("does not count a ws that is empty, or a class in the wrong place", () => {
+		for (const source of [
+			"await fetchByAuthor({ relays, author, ws: undefined });",
+			"await fetchByAuthor({ relays, author, ws: null });",
+			"await fetchByAuthor({ relays, author, kinds: [1] });",
+			"await resolvePeerCard(pk, [RELAY], undefined, undefined);",
+			"await resolvePeerCard(pk, [RELAY], WebSocket);",
+			"await resolvePeerCard(pk, [WebSocket]);",
+		]) {
+			const [args] = discoveryCalls(source);
+			expect(passesWebSocket(args ?? ""), source).toBe(false);
+		}
+	});
+
+	it("counts the shorthand and a call that spans lines", () => {
+		for (const source of [
+			"await fetchByAuthor({ relays, author, ws });",
+			"await resolveNip05({\n\tpubkey,\n\trelays,\n\tws: WebSocket,\n});",
+			"await resolvePeerCard(\n\tpk,\n\t[RELAY, 'a,b'],\n\tundefined,\n\tWebSocket,\n);",
 		]) {
 			const [args] = discoveryCalls(source);
 			expect(passesWebSocket(args ?? ""), source).toBe(true);
