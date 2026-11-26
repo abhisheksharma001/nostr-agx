@@ -109,14 +109,11 @@ function load(file: string): Loaded {
 			throw refusal(`${file} is a link to a file that does not exist.`, "Fix or remove the link, then run this again.");
 		}
 	}
-	const real = statSync(target);
-	if (!real.isFile()) {
-		throw refusal(`${target} is not a regular file.`, "Move it out of the way, then run this again.");
-	}
 	try {
-		return { target, text: readFileSync(target, "utf8"), mode: real.mode & 0o777 };
+		// A folder, or a file with no read permission, fails here.
+		return { target, text: readFileSync(target, "utf8"), mode: statSync(target).mode & 0o777 };
 	} catch {
-		throw refusal(`Cannot read ${target}.`, "Check the permissions of that file and run this again.");
+		throw refusal(`Cannot read ${target} as a file.`, "Check what is there and its permissions, then run this again.");
 	}
 }
 
