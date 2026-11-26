@@ -1014,6 +1014,145 @@ describe("a TS_NO_LOGS_NO_SUPPORT value in the environment", () => {
 	});
 });
 
+/** Run `run` while writes to this process's stderr are kept in `writes` instead of printed. */
+async function withStderrWrites<T>(run: (writes: string[]) => Promise<T>): Promise<T> {
+	const writes: string[] = [];
+	const spy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+		writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString());
+		return true;
+	}) as typeof process.stderr.write);
+	try {
+		return await run(writes);
+	} finally {
+		spy.mockRestore();
+	}
+}
+
+/**
+ * A stand-in launcher that writes each of `parts` to its stderr (waiting
+ * `delayMs` after it), then reports a proxy and waits for stdin to close.
+ */
+async function stderrWritingBinary(
+	parts: [text: string, delayMs: number][],
+	ending: "run" | "exit3" = "run",
+): Promise<{ dir: string; path: string }> {
+	const dir = await mkdtemp(join(tmpdir(), "agx-launcher-stderr-"));
+	const path = join(dir, "fake-agx-tailscale");
+	await writeFile(
+		path,
+		`#!${process.execPath}\n` +
+			`const parts = ${JSON.stringify(parts)};\n` +
+			`(async () => {\n` +
+			`  for (const [text, delayMs] of parts) {\n` +
+			`    process.stderr.write(text);\n` +
+			`    await new Promise((resolve) => setTimeout(resolve, delayMs));\n` +
+			`  }\n` +
+			(ending === "exit3"
+				? `  process.exit(3);\n`
+				: `  console.log("socks5://agx:secret@127.0.0.1:43250");\n` +
+					`  process.stdin.resume();\n` +
+					`  process.stdin.on("end", () => process.exit(0));\n`) +
+			`})();\n`,
+		{ mode: 0o755 },
+	);
+	await chmod(path, 0o755);
+	return { dir, path };
+}
+
+describe("what the launcher writes on its stderr", () => {
+	/** The URL the launcher's own proxy logging prints, with credentials in it. */
+	const PROXY_LINE =
+		'2026/11/26 23:10:00 tshttpproxy: using proxy "http://puser:ppass@127.0.0.1:9" for URL: "https://controlplane.tailscale.com/key?v=130"\n';
+	const PROXY_LINE_MASKED =
+		'2026/11/26 23:10:00 tshttpproxy: using proxy "http://***@127.0.0.1:9" for URL: "https://controlplane.tailscale.com/key?v=130"\n';
+
+	/** Start a launcher, let it run for a moment, stop it, and return what reached stderr. */
+	async function stderrOf(fake: { path: string }): Promise<string[]> {
+		return withStderrWrites(async (writes) => {
+			const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			await proxy.stop();
+			return writes;
+		});
+	}
+
+	it.skipIf(!posix)("reaches this process's stderr with a URL's user name and password masked", async () => {
+		const fake = await stderrWritingBinary([[PROXY_LINE, 0]]);
+		try {
+			const writes = await stderrOf(fake);
+			expect(writes.join("")).toBe(PROXY_LINE_MASKED);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("masks a user name alone, an encoded password and a SOCKS5 address too", async () => {
+		const fake = await stderrWritingBinary([
+			[
+				"a https://tok3nvalue@proxy.invalid:8080/x b\n" +
+					"c http://u:p%40ss%2Fw0rd@h.invalid:1 d\n" +
+					'e "socks5://agx:hunter2@127.0.0.1:1080" f\n',
+				0,
+			],
+		]);
+		try {
+			const text = (await stderrOf(fake)).join("");
+			expect(text).toBe(
+				"a https://***@proxy.invalid:8080/x b\n" +
+					"c http://***@h.invalid:1 d\n" +
+					'e "socks5://***@127.0.0.1:1080" f\n',
+			);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("is masked even when the launcher writes the URL in two pieces", async () => {
+		const fake = await stderrWritingBinary([
+			['tshttpproxy: using proxy "http://pu', 250],
+			['ser:ppass@127.0.0.1:9" for URL: "x"\n', 0],
+		]);
+		try {
+			const writes = await stderrOf(fake);
+			expect(writes.join("")).toBe('tshttpproxy: using proxy "http://***@127.0.0.1:9" for URL: "x"\n');
+			// Whole lines only, so no piece of a credential is ever written alone.
+			for (const piece of writes) expect(piece.endsWith("\n")).toBe(true);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("is passed on unchanged when it holds no credentials", async () => {
+		const text =
+			"2026/11/26 23:10:01 plain line\n" +
+			"mail a@b.invalid or git@github.com:org/repo\n" +
+			'proxy "https://example.invalid:3128/path?x=1#frag" for me\n' +
+			"no newline at the end";
+		const fake = await stderrWritingBinary([[text, 0]]);
+		try {
+			expect((await stderrOf(fake)).join("")).toBe(text);
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("reaches stderr before a failed start is reported", async () => {
+		// The launcher says why it is ending and ends before it reports an address:
+		// the caller must find that line already written when the error arrives.
+		const fake = await stderrWritingBinary([[PROXY_LINE, 0]], "exit3");
+		try {
+			await withStderrWrites(async (writes) => {
+				await expect(
+					startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 }),
+				).rejects.toThrow(/exited before reporting/);
+				expect(writes.join("")).toBe(PROXY_LINE_MASKED);
+			});
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("the log upload switch", () => {
 	async function launchedEnv(
 		parent: Record<string, string | undefined>,
