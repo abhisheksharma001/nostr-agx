@@ -37,6 +37,7 @@ import {
 	TailscaleError,
 	type TailscaleOAuthOptions,
 } from "../src/index";
+import { redactProxyUrl } from "../src/proxy-url";
 import { requiredRelay, runAgents } from "./run-agents";
 
 interface Options {
@@ -247,7 +248,7 @@ async function main(): Promise<void> {
 			stateDir,
 			ephemeral: true,
 		});
-		console.info(`tailnet node ${opts.hostname} ready; relay proxy ${tailscale.url}`);
+		console.info(`tailnet node ${opts.hostname} ready; relay proxy ${redactProxyUrl(tailscale.url)}`);
 		console.info(`relay ${relay}`);
 		await runAgents({ relay, relayProxy: tailscale.url });
 	} finally {
