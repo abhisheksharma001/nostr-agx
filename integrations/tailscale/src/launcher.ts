@@ -19,7 +19,8 @@ const DEFAULT_TIMEOUT_MS = 120_000;
  * where it lives (HOME; USERPROFILE and SystemRoot, which a Windows process
  * looks for, not tried on Windows), where it may write temporary files
  * (TMPDIR), the proxy a host sits behind (the HTTP_PROXY family, in both cases)
- * and Tailscale's own log setting.
+ * and Tailscale's own log setting. A proxy address that holds a login is not
+ * passed on (see PROXY_ADDRESS_VARIABLES).
  */
 const INHERITED_ENV = [
 	"HOME",
