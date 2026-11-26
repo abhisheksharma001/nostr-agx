@@ -72,6 +72,44 @@ describe("createUiSendTransport", () => {
 		expect(mocks.stop).toHaveBeenCalledOnce();
 	});
 
+	it("starts again on the next send after a failed start", async () => {
+		mocks.createTransport.mockRejectedValueOnce(new Error("launcher could not start"));
+		const ui = holder();
+		await expect(ui.get()).rejects.toThrow(/launcher could not start/);
+
+		const transport = await ui.get().catch((error: unknown) => error);
+		expect(mocks.createTransport, "the failed start was kept instead of tried again").toHaveBeenCalledTimes(2);
+		expect(transport).toMatchObject({ stop: mocks.stop });
+		expect(await ui.get()).toBe(transport);
+		expect(mocks.createTransport).toHaveBeenCalledTimes(2);
+
+		await ui.close();
+		expect(mocks.stop).toHaveBeenCalledOnce();
+	});
+
+	it("gives sends that wait on the same failed start the same failure", async () => {
+		let fail!: (error: Error) => void;
+		mocks.createTransport.mockImplementationOnce(
+			() => new Promise((_resolve, reject) => { fail = reject; }),
+		);
+		const ui = holder();
+		const first = ui.get();
+		const second = ui.get();
+		expect(mocks.createTransport).toHaveBeenCalledOnce();
+		fail(new Error("launcher could not start"));
+		await expect(first).rejects.toThrow(/could not start/);
+		await expect(second).rejects.toThrow(/could not start/);
+		expect(mocks.createTransport).toHaveBeenCalledOnce();
+	});
+
+	it("closes cleanly after a failed start", async () => {
+		mocks.createTransport.mockRejectedValueOnce(new Error("launcher could not start"));
+		const ui = holder();
+		await expect(ui.get()).rejects.toThrow();
+		await expect(ui.close()).resolves.toBeUndefined();
+		expect(mocks.stop).not.toHaveBeenCalled();
+	});
+
 	it("starts nothing when no send happened", async () => {
 		const ui = holder();
 		await ui.close();
