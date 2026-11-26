@@ -247,11 +247,11 @@ describe("agx ui and Tailscale", () => {
 			const ui = await startUi();
 			await until(() => starts > 0, "the first start attempt");
 			const failed = await ui.send("one");
-			expect(failed.status).toBe(500);
+			expect(failed.status).toBe(502);
 			launcherFails = false;
 			const startsBefore = starts;
 			const early = await ui.send("two");
-			expect(early.status).toBe(500);
+			expect(early.status).toBe(502);
 			expect(starts, "the launcher was started again inside the pause").toBe(startsBefore);
 			vi.advanceTimersByTime(30_000);
 			const retried = await ui.send("three");
@@ -259,6 +259,39 @@ describe("agx ui and Tailscale", () => {
 			expect(retried.status, retried.body).toBe(502);
 			await ui.stop();
 			expect(stops, "every launcher that started was stopped").toBe(started);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
+describe("agx ui when Tailscale cannot start", () => {
+	it("tells the person Tailscale is not available and when the next try is, without the launcher's own words", async () => {
+		await storeTailscaleOptIn();
+		launcherFails = true;
+		vi.useFakeTimers({ toFake: ["performance"] });
+		try {
+			const ui = await startUi();
+			await until(() => starts > 0, "the first start attempt");
+			const first = await ui.send("one");
+			expect(first.status, first.body).toBe(502);
+			const error = (JSON.parse(first.body) as { error: { code: string; message: string } }).error;
+			expect(error.code).toBe("send_failed");
+			expect(error.message).toMatch(/Tailscale is not available/);
+			expect(error.message).toMatch(/about 30 seconds/);
+
+			vi.advanceTimersByTime(12_000);
+			const later = await ui.send("two");
+			expect(later.status, later.body).toBe(502);
+			expect((JSON.parse(later.body) as { error: { message: string } }).error.message).toMatch(/about 18 seconds/);
+
+			for (const text of [first.body, later.body]) {
+				expect(text).not.toContain("fake launcher");
+				expect(text).not.toContain(KEY);
+				expect(text).not.toContain(PROXY_USER);
+				expect(text).not.toContain(PROXY_PASS);
+			}
+			await ui.stop();
 		} finally {
 			vi.useRealTimers();
 		}
