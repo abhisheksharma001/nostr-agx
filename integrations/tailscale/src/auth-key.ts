@@ -427,6 +427,9 @@ async function requestJson(
 	try {
 		response = await fetchImpl(url, {
 			...init,
+			// Never follow a redirect: the secret and the minted key are only for
+			// the address that was configured (and a redirect can leave https).
+			redirect: "error",
 			signal: AbortSignal.timeout(timeoutMs),
 		});
 	} catch (error) {
