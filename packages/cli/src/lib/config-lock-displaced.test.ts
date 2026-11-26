@@ -1,10 +1,10 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getProfile, saveProfile, updateProfile } from "./config.js";
-import { configLockPath } from "./config-lock.js";
+import { configLockPath, withConfigLock } from "./config-lock.js";
 import { AgxCliError, EXIT } from "./errors.js";
 import { createIdentity } from "./identity.js";
 import { configPath } from "./paths.js";
@@ -154,5 +154,108 @@ describe("a config write whose lock was taken over while it was stopped", () => 
 		saveProfile("default", { ...getProfile("default"), allow: [C] });
 
 		expect(getProfile("default").allow).toEqual([C]);
+	});
+});
+
+function errorOf(run: () => void): unknown {
+	try {
+		run();
+	} catch (caught) {
+		return caught;
+	}
+	return undefined;
+}
+
+// Nothing in the program saves from inside a lock that is already held (a nested call takes no lock of
+// its own), so these two tests guard the way the check must keep working if something ever does.
+describe("the check also holds when the save is made in a nested lock call", () => {
+	it("refuses a save made inside a nested lock call", () => {
+		updateProfile("default", { allow: [A] });
+		whileStopped(() => {
+			rmSync(configLockPath());
+			otherCommandSaves(B);
+		});
+
+		const error = errorOf(() => {
+			withConfigLock(() => {
+				// updateProfile takes the lock again: a nested call, which holds nothing new.
+				updateProfile("default", (current) => ({ allow: [...current.allow, C] }));
+			});
+		});
+
+		expect(error).toBeInstanceOf(AgxCliError);
+		expect((error as AgxCliError).message).toMatch(/was not saved/);
+		expect(getProfile("default").allow).toEqual([A, B]);
+		expect(tempFiles()).toEqual([]);
+	});
+
+	it("refuses a save made after a nested lock call has returned", () => {
+		updateProfile("default", { allow: [A] });
+		whileStopped(() => {
+			rmSync(configLockPath());
+			otherCommandSaves(B);
+		});
+
+		const error = errorOf(() => {
+			withConfigLock(() => {
+				withConfigLock(() => undefined);
+				saveProfile("default", { ...getProfile("default"), allow: [A, C] });
+			});
+		});
+
+		expect(error).toBeInstanceOf(AgxCliError);
+		expect((error as AgxCliError).message).toMatch(/was not saved/);
+		expect(getProfile("default").allow).toEqual([A, B]);
+		expect(tempFiles()).toEqual([]);
+	});
+});
+
+// A lock is always linked in whole, so another command's lock is never unreadable. If the file at the
+// lock path cannot be read as a lock record, it is not ours, and the save is refused. The thing at the
+// lock path is never removed.
+const canHideFile = process.platform !== "win32" && process.getuid?.() !== 0;
+const unreadableLocks: { shape: string; put: (path: string) => void; stillThere: (path: string) => boolean }[] = [
+	{ shape: "an empty file", put: (path) => writeFileSync(path, ""), stillThere: (path) => readFileSync(path, "utf8") === "" },
+	{
+		shape: "text that is not JSON",
+		put: (path) => writeFileSync(path, "not json\n"),
+		stillThere: (path) => readFileSync(path, "utf8") === "not json\n",
+	},
+	{
+		shape: "JSON that is not a lock record",
+		put: (path) => writeFileSync(path, '{"hello":1}\n'),
+		stillThere: (path) => readFileSync(path, "utf8") === '{"hello":1}\n',
+	},
+	{ shape: "a directory", put: (path) => mkdirSync(path), stillThere: (path) => statSync(path).isDirectory() },
+	...(canHideFile
+		? [
+				{
+					shape: "a lock record in a file nobody can read",
+					put: (path: string) => {
+						writeFileSync(path, `${JSON.stringify({ pid: process.pid, host: hostname(), token: "the-other-command" })}\n`);
+						chmodSync(path, 0o000);
+					},
+					stillThere: (path: string) => (statSync(path).mode & 0o777) === 0,
+				},
+			]
+		: []),
+];
+
+describe("a save is refused when the lock path holds something that is not a readable lock record", () => {
+	it.each(unreadableLocks)("refuses, writes nothing and leaves $shape in place", ({ put, stillThere }) => {
+		updateProfile("default", { allow: [A] });
+		whileStopped(() => {
+			rmSync(configLockPath());
+			put(configLockPath());
+			otherCommandSaves(B);
+		});
+
+		const error = errorOf(() => updateProfile("default", (current) => ({ allow: [...current.allow, C] })));
+
+		expect(error).toBeInstanceOf(AgxCliError);
+		expect((error as AgxCliError).message).toMatch(/was not saved/);
+		expect(getProfile("default").allow).toEqual([A, B]);
+		expect(tempFiles()).toEqual([]);
+		expect(stillThere(configLockPath())).toBe(true);
 	});
 });
