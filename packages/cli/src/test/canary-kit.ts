@@ -398,14 +398,18 @@ export function listenPortOf(args: unknown[]): number | null {
 }
 
 /**
- * Stops every outgoing TCP connection (HTTP, WebSocket and TLS all pass through
- * `Socket.connect`) that is not to this machine, every host-name lookup (a
- * server asked to listen on a name looks it up too) and every connection to a
- * port that is never to be touched, before anything is sent, and records it.
- * A host name looked up would be sent to a resolver, so a key used as a name is
- * a leak the canary can see. A server asked to listen on a port that is never to
- * be touched is stopped the same way. Returns the attempts and the function that
- * puts everything back.
+ * Stops every outgoing TCP connection that is not to this machine (HTTP, WebSocket and TLS all pass
+ * through `Socket.connect`), every connection to a port that is never to be touched, and every host-name
+ * lookup made through `dns.lookup` or `dns.promises.lookup`, before anything is sent, and records it. A
+ * host name looked up would be sent to a resolver, so a key used as a name is a leak the canary can see.
+ * A server asked to listen on a port that is never to be touched is stopped the same way.
+ *
+ * Not watched: the other resolver calls (`dns.resolve*`, `dns.Resolver`) and child processes. No code of
+ * the program uses either today (a test of this file reads the source and says so when that changes).
+ * `syncBuiltinESMExports()` makes a name imported with `import { lookup } from "node:dns/promises"`
+ * the guard's function too: without it such a lookup goes to the system resolver unrecorded.
+ *
+ * Returns the attempts and the function that puts everything back.
  */
 export function guardConnections(): { attempts: ConnectAttempt[]; restore: () => void } {
 	const attempts: ConnectAttempt[] = [];

@@ -1,8 +1,9 @@
 import dns from "node:dns";
 import { lookup as namedLookup } from "node:dns/promises";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { createServer, Server as HttpServer } from "node:http";
 import net, { type AddressInfo } from "node:net";
@@ -645,17 +646,20 @@ async function runOnce(
 	const started = performance.now();
 	const box = sandbox();
 	homesMade.push(box.home);
-	// What a command writes under the temp directory lands here (and is looked through), not next to somebody's files.
-	const scratch = mkdtempSync(join(tmpdir(), "agx-canary-tmp-"));
-	homesMade.push(scratch);
-	process.env.TMPDIR = scratch;
+	let scratch = "";
+	let restoreStdin = (): void => undefined;
 	const cwd = process.cwd();
-	const { args, stdin } = lineFor(box.home);
-	const restoreStdin = setStdinForTests(stdin);
-	const requestsBefore = world.index.requests.length;
-	const relayBefore = world.relayLog.length;
-	const attemptsBefore = world.attempts.length;
 	try {
+		// What a command writes under the temp directory lands here (and is looked through), not next to somebody's files.
+		scratch = mkdtempSync(join(tmpdir(), "agx-canary-tmp-"));
+		homesMade.push(scratch);
+		process.env.TMPDIR = scratch;
+		pointHomeAt(box.home);
+		const { args, stdin } = lineFor(box.home);
+		restoreStdin = setStdinForTests(stdin);
+		const requestsBefore = world.index.requests.length;
+		const relayBefore = world.relayLog.length;
+		const attemptsBefore = world.attempts.length;
 		// A relative path a command is given lands in the throwaway home, not in the repository.
 		process.chdir(box.home);
 		saveIdentity("default", planted.identity);
@@ -775,7 +779,9 @@ async function runOnce(
 		restoreStdin();
 		process.chdir(cwd);
 		box.restore();
-		rmSync(scratch, { recursive: true, force: true });
+		if (scratch !== "") {
+			rmSync(scratch, { recursive: true, force: true });
+		}
 	}
 }
 
@@ -798,8 +804,82 @@ function assertRelayPinned(args: string[]): void {
 	}
 }
 
+/**
+ * The places a program takes for "the user's home" and its settings. All of them are inside the throwaway
+ * home, so a program that writes under `~/.claude` or `~/.config` lands where it is looked through, and
+ * not in the files of the person running the test.
+ */
+const HOME_VARIABLES = ["HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA", "CLAUDE_CONFIG_DIR", "CODEX_HOME"] as const;
+
+/** Names of variables that say where a home, a settings folder or a temporary folder is. */
+const HOME_LIKE = /^(HOME|USERPROFILE|APPDATA|LOCALAPPDATA|XDG_[A-Z_]+|[A-Z_]*CONFIG_DIR|[A-Z_]*_HOME|TMPDIR|TMP|TEMP)$/;
+
+function pointHomeAt(home: string): void {
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	process.env.XDG_CONFIG_HOME = join(home, ".config");
+	process.env.XDG_DATA_HOME = join(home, ".local", "share");
+	process.env.XDG_CACHE_HOME = join(home, ".cache");
+	process.env.XDG_STATE_HOME = join(home, ".local", "state");
+	process.env.APPDATA = join(home, "AppData", "Roaming");
+	process.env.LOCALAPPDATA = join(home, "AppData", "Local");
+	process.env.CLAUDE_CONFIG_DIR = join(home, ".claude");
+	process.env.CODEX_HOME = join(home, ".codex");
+	// A real Tailscale key in the environment would be the one the command reads.
+	delete process.env.TS_AUTHKEY;
+}
+
+/** Every source file of the packages the program is made of, apart from tests, and the folder `packages` is in. */
+function sourceFiles(): { root: string; files: string[] } {
+	const root = fileURLToPath(new URL("../../..", import.meta.url));
+	const files: string[] = [];
+	const walk = (dir: string): void => {
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			const path = join(dir, entry.name);
+			if (entry.isDirectory()) {
+				if (entry.name !== "test" && entry.name !== "node_modules") {
+					walk(path);
+				}
+			} else if (/\.ts$/.test(entry.name) && !/\.(test|d)\.ts$/.test(entry.name)) {
+				files.push(path);
+			}
+		}
+	};
+	for (const pkg of ["cli", "nostr", "core"]) {
+		walk(join(root, pkg, "src"));
+	}
+	files.sort();
+	if (files.length < 50) {
+		throw new Error(`found ${files.length} source files under ${root}: the folders have moved`);
+	}
+	return { root, files };
+}
+
+/** The home of the person running the test, as it is before any run changes it. */
+const REAL_HOME = homedir();
+
 /** Every throwaway home a run made: all must be gone when the matrix is done. */
 const homesMade: string[] = [];
+
+/**
+ * Removes the folders this file made, and only those (never a pattern): when the file ends, when the process
+ * ends, and when it is told to stop. A run that is killed in the middle would otherwise leave them behind.
+ */
+function removeMade(): void {
+	for (const folder of homesMade) {
+		rmSync(folder, { recursive: true, force: true });
+	}
+}
+
+function removeMadeOnSignal(signal: NodeJS.Signals): void {
+	removeMade();
+	process.kill(process.pid, signal);
+}
+
+process.once("exit", removeMade);
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+	process.once(signal, () => removeMadeOnSignal(signal));
+}
 
 const WAITS_MS = 1_500;
 
@@ -872,7 +952,8 @@ function unclassified(nodes: CommandNode[]): string[] {
 		seen.add(node.label);
 		const entry = SLOT_TABLE[node.label];
 		if (!entry) {
-			problems.push(`command "${node.label}" is not in SLOT_TABLE`);
+			const slots = node.slots.map((slot) => `${slot.name}${slot.takesValue ? " (takes a value)" : " (flag)"}`);
+			problems.push(`command "${node.label}" is not in SLOT_TABLE; its slots: ${slots.length > 0 ? slots.join(", ") : "none"}`);
 			continue;
 		}
 		const names = new Set(node.slots.map((slot) => slot.name));
@@ -1198,6 +1279,92 @@ async function reached(plan: Plan, result: MatrixResult): Promise<boolean> {
 	return first.summary === second.summary && first.summary !== marked.summary;
 }
 
+/** One verdict is asked for per slot of a command in scope, per `--profile` and per HTTP probe, with the reason the table gives for it. */
+function reachExpected(plans: readonly Plan[], probes: readonly HttpProbe[], gatewayInScope: boolean): Map<string, string | null> {
+	const expected = new Map<string, string | null>();
+	for (const plan of plans) {
+		if (plan.target.type === "slot") {
+			expected.set(`${plan.command} | ${plan.slot}`, plan.target.spec.unproven ?? null);
+		} else if (plan.target.type === "profile") {
+			expected.set(`${plan.command} | ${plan.slot}`, SLOT_TABLE[plan.command]?.profileUnproven ?? null);
+		}
+	}
+	if (gatewayInScope) {
+		for (const probe of probes) {
+			expected.set(`${GATEWAY_API} | ${probe.slot}`, probe.unproven ?? null);
+		}
+	}
+	return expected;
+}
+
+/** Every `unproven` and `profileUnproven` text the table holds for a command in scope, and for the HTTP probes. */
+function reachTexts(probes: readonly HttpProbe[], gatewayInScope: boolean): Map<string, string[]> {
+	const texts = new Map<string, string[]>();
+	const add = (command: string, text: string | undefined): void => {
+		if (text !== undefined) {
+			texts.set(command, [...(texts.get(command) ?? []), text]);
+		}
+	};
+	for (const [command, entry] of Object.entries(SLOT_TABLE)) {
+		if (!inScopeName(command)) {
+			continue;
+		}
+		add(command, entry.profileUnproven);
+		for (const raw of Object.values(entry.slots)) {
+			add(command, specOf(raw).unproven);
+		}
+	}
+	if (gatewayInScope) {
+		for (const probe of probes) {
+			add(GATEWAY_API, probe.unproven);
+		}
+	}
+	return texts;
+}
+
+/**
+ * What is wrong with the reach verdicts: a slot that has none (so its clean result proves nothing), one that has
+ * two, a verdict for something that is not probed, a reason that is not the table's, and a text of the table that
+ * no verdict carries.
+ */
+function reachProblems(expected: ReadonlyMap<string, string | null>, texts: ReadonlyMap<string, readonly string[]>, reach: MatrixResult["reach"]): string[] {
+	const problems: string[] = [];
+	const seen = new Map<string, number>();
+	for (const slot of reach) {
+		const named = `${slot.command} | ${slot.slot}`;
+		seen.set(named, (seen.get(named) ?? 0) + 1);
+		if (!expected.has(named)) {
+			problems.push(`a verdict for a slot that is not probed: ${named}`);
+		} else if (expected.get(named) !== slot.reason) {
+			problems.push(`the reason of ${named} is not the one in SLOT_TABLE`);
+		}
+		if (slot.reason === "") {
+			problems.push(`\`unproven\` has no reason: ${named}`);
+		} else if (!slot.reached && slot.reason === null) {
+			problems.push(`never reached, so its clean result means nothing: ${named} (give the command what it needs in SLOT_TABLE, or say why it cannot be reached with \`unproven\`)`);
+		} else if (slot.reached && slot.reason !== null) {
+			problems.push(`reached after all, remove \`unproven\`: ${named} (${slot.reason})`);
+		}
+	}
+	for (const named of expected.keys()) {
+		const count = seen.get(named) ?? 0;
+		if (count === 0) {
+			problems.push(`no verdict on whether the command used it: ${named}`);
+		} else if (count > 1) {
+			problems.push(`${count} verdicts for one slot: ${named}`);
+		}
+	}
+	for (const [command, list] of texts) {
+		const carried = new Set(reach.filter((slot) => slot.command === command).map((slot) => slot.reason));
+		for (const text of list) {
+			if (!carried.has(text)) {
+				problems.push(`a reason in SLOT_TABLE that no verdict of "${command}" carries: ${text.slice(0, 60)}`);
+			}
+		}
+	}
+	return problems;
+}
+
 let matrix: Promise<MatrixResult> | null = null;
 
 function runMatrix(): Promise<MatrixResult> {
@@ -1330,6 +1497,7 @@ afterAll(async () => {
 	restoreGuard?.();
 	await world?.relay.close();
 	await world?.index.close();
+	removeMade();
 });
 
 // ============================================================= the known leaks
@@ -1360,14 +1528,15 @@ const SHAPED: readonly Form[] = ["nsec", "ncryptsec", "nostr", "sentence", "NSEC
 /** The profile's own key, as 64 hex characters: a check for `nsec1` does not see it. */
 const OWN: readonly Form[] = ["hex", "HEX"];
 
+/** Why a line is listed. REASON_RULES, below, says where each reason may stand. */
 const WHY = {
-	pr61: "open PR #61 (as of 2026-11-26) hides a run of 56 or more hex digits, in any case, in an unknown command or option",
-	tooMany: "the parser's 'too many arguments' quotes every extra word; open PR #61 (as of 2026-11-26) leaves it on purpose except for `gateway`",
+	pr61: "open PR #61 hides a run of 56 or more hex digits, in any case, in an unknown command or option",
+	tooMany: "the parser's 'too many arguments' quotes every extra word; open PR #61 leaves it on purpose except for `gateway`",
 	parserEscaped: "a parser error quotes a %xx-escaped key as typed; no check decodes %xx yet",
-	pr64_66: "open PRs #64 and #66 (as of 2026-11-26) refuse a profile name that holds nsec1, in any case",
+	pr64_66: "open PRs #64 and #66 refuse a profile name that holds nsec1, in any case",
 	profileName: "a hex or %xx-escaped profile name is a valid folder name; no rule yet says what a profile name may hold",
-	pr65: "open PR #65 (as of 2026-11-26) refuses a value that holds nsec1, in any case",
-	pr75: "open PR #75 (as of 2026-11-26) refuses and hides a value that holds a key, also %xx-escaped",
+	pr65: "open PR #65 refuses a value that holds nsec1, in any case",
+	pr75: "open PR #75 refuses and hides a value that holds a key, also %xx-escaped",
 	messageText: "open decision: should message text and subjects stop for a key (the UI asks first)?",
 	afterStop: "a task keeps its agent as typed in the task file; the profile's own key as hex is a valid public key",
 	sendDecision: "open decision: should `agx send` refuse a key in the message, subject or context id?",
@@ -1375,6 +1544,28 @@ const WHY = {
 	escaped: "a key written as %xx escapes does not match the nsec1 shape check; a matcher that decodes %xx would catch it",
 	unchecked: "no open PR covers this slot yet",
 } as const;
+
+const PARSER_SLOT = /^<unknown (command|option|subcommand)>$/;
+const PROFILE_SLOT = /^(--profile|<profile>)$/;
+const ELSEWHERE = ["hex", "HEX", "escaped"] as const;
+
+/**
+ * Where a reason may stand: the commands, the slots and the key forms its text speaks of (for a pull request, what
+ * its diff changes). A line whose reason does not fit its command, slot or forms fails the test of the lists, so a
+ * reason cannot be copied onto a line it says nothing about. Reasons that are open decisions say nothing checkable.
+ */
+const REASON_RULES: ReadonlyArray<{ reason: string; command?: RegExp; slot?: RegExp; forms?: readonly Form[] }> = [
+	{ reason: WHY.pr61, slot: PARSER_SLOT, forms: OWN },
+	{ reason: WHY.tooMany, slot: /^<extra argument>$/, forms: ELSEWHERE },
+	{ reason: WHY.parserEscaped, slot: PARSER_SLOT, forms: ["escaped"] },
+	{ reason: WHY.pr64_66, slot: PROFILE_SLOT, forms: SHAPED },
+	{ reason: WHY.profileName, slot: PROFILE_SLOT, forms: ELSEWHERE },
+	{ reason: WHY.pr65, command: /^(search|peers (accept|refuse|ignore|block)|listing (get|publish|set-visibility|delist|delete|set-policy))$/, slot: /^(\[query\]|\[listingId\]|--peer)$/, forms: SHAPED },
+	{ reason: WHY.pr75, command: /^gateway \(HTTP API\)$/ },
+	{ reason: WHY.ownHex, forms: OWN },
+	{ reason: WHY.escaped, forms: ["escaped"] },
+	{ reason: WHY.unchecked, forms: SHAPED },
+];
 
 /** Slots whose job is to take a secret and keep it: the value is expected in a file or a request. */
 const INTENDED: readonly KnownLeak[] = [
@@ -2206,6 +2397,20 @@ function expand(entries: readonly KnownLeak[], universe: Universe): { tuples: Ma
 		if (entry.reason.trim() === "") {
 			problems.push(`no reason given for ${where}: say why it is listed`);
 		}
+		const rule = REASON_RULES.find((candidate) => candidate.reason === entry.reason);
+		if (rule) {
+			const forms = entry.forms === ALL ? FORMS : entry.forms;
+			if (rule.command && !rule.command.test(entry.command)) {
+				problems.push(`the reason of ${where} is for commands like ${rule.command}: "${entry.reason}"`);
+			}
+			if (rule.slot && !rule.slot.test(entry.slot)) {
+				problems.push(`the reason of ${where} is for slots like ${rule.slot}: "${entry.reason}"`);
+			}
+			const wrong = rule.forms ? forms.filter((form) => !rule.forms?.includes(form)) : [];
+			if (wrong.length > 0) {
+				problems.push(`the reason of ${where} does not cover the forms ${wrong.join(", ")}: "${entry.reason}"`);
+			}
+		}
 		if (!universe.slots.has(where)) {
 			problems.push(`"${entry.command}" has no slot "${entry.slot}" that is probed`);
 			continue;
@@ -2224,6 +2429,26 @@ function expand(entries: readonly KnownLeak[], universe: Universe): { tuples: Ma
 	return { tuples, problems };
 }
 
+/** Slots that are not of class `secret` and still take one: `config set` is given an API key as a value, and keeps it. */
+const SECRET_BY_VALUE: ReadonlySet<string> = new Set(["config set | [value] (key=apiKey)"]);
+
+/** INTENDED is for a slot whose job is to take a secret and keep it: its class in the slot table is `secret`, or it is listed above. */
+function intendedProblems(entries: readonly KnownLeak[], nodes: CommandNode[]): string[] {
+	const classes = new Map<string, string>();
+	for (const plan of plansFor(nodes)) {
+		classes.set(`${plan.command} | ${plan.slot}`, plan.target.type === "slot" ? plan.target.spec.kind : plan.target.type);
+	}
+	const problems: string[] = [];
+	for (const entry of entries) {
+		const where = `${entry.command} | ${entry.slot}`;
+		const kind = classes.get(where);
+		if (kind !== undefined && kind !== "secret" && !SECRET_BY_VALUE.has(where)) {
+			problems.push(`${where} is in INTENDED but its class in SLOT_TABLE is "${kind}", not "secret": a leak there belongs in KNOWN_LEAKS`);
+		}
+	}
+	return problems;
+}
+
 /** `CANARY_ONLY=search,listing list` runs only the commands whose name starts with one of those texts. */
 function inScopeName(text: string): boolean {
 	const only = process.env.CANARY_ONLY;
@@ -2235,28 +2460,36 @@ function inScope(tuples: Map<string, string>): Map<string, string> {
 	return new Map([...tuples].filter(([tuple]) => inScopeName(tuple)));
 }
 
+/**
+ * One line per slot and reason, sorted: what is wrong there, by channel and in each the forms. The
+ * lines of a slot are the lines of one entry, so a fix finds its own at once.
+ */
+function perSlot(tuples: Iterable<readonly [string, string | null]>, text: (slot: string, where: string, reason: string | null) => string): string[] {
+	const groups = new Map<string, { slot: string; reason: string | null; channels: Map<string, string[]> }>();
+	for (const [tuple, reason] of [...tuples].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+		const parts = tuple.split(" | ");
+		const channel = parts.pop() as string;
+		const form = parts.pop() as string;
+		const slot = parts.join(" | ");
+		const group = groups.get(`${slot}\u0000${reason}`) ?? { slot, reason, channels: new Map<string, string[]>() };
+		group.channels.set(channel, [...(group.channels.get(channel) ?? []), form]);
+		groups.set(`${slot}\u0000${reason}`, group);
+	}
+	return [...groups.values()].map((group) => text(group.slot, [...group.channels].sort(([a], [b]) => (a < b ? -1 : 1)).map(([channel, forms]) => `${channel}: ${forms.sort().join(", ")}`).join("; "), group.reason));
+}
+
 /** What the run found against what is listed; every line says what to do. */
 function compare(found: ReadonlySet<string>, known: Map<string, string>, intended: Map<string, string>): string[] {
-	const problems: string[] = [];
-	for (const tuple of found) {
-		if (!known.has(tuple) && !intended.has(tuple)) {
-			problems.push(`new leak, not in KNOWN_LEAKS: ${tuple}`);
-		}
-	}
-	for (const [tuple, reason] of known) {
-		if (intended.has(tuple)) {
-			problems.push(`in both KNOWN_LEAKS and INTENDED: ${tuple}`);
-		}
-		if (!found.has(tuple)) {
-			problems.push(`no longer leaks, remove it from KNOWN_LEAKS: ${tuple} (${reason})`);
-		}
-	}
-	for (const [tuple, reason] of intended) {
-		if (!found.has(tuple)) {
-			problems.push(`no longer stored or sent, remove it from INTENDED: ${tuple} (${reason})`);
-		}
-	}
-	return problems;
+	const fresh = [...found].filter((tuple) => !known.has(tuple) && !intended.has(tuple)).map((tuple) => [tuple, null] as const);
+	const both = [...known.keys()].filter((tuple) => intended.has(tuple)).map((tuple) => [tuple, null] as const);
+	const gone = [...known].filter(([tuple]) => !found.has(tuple));
+	const notIntended = [...intended].filter(([tuple]) => !found.has(tuple));
+	return [
+		...perSlot(fresh, (slot, where) => `new leak, not in KNOWN_LEAKS: ${slot} (${where})`),
+		...perSlot(both, (slot, where) => `in both KNOWN_LEAKS and INTENDED: ${slot} (${where})`),
+		...perSlot(gone, (slot, where, reason) => `no longer leaks, remove it from KNOWN_LEAKS: ${slot} (${where}); listed because: ${reason}`),
+		...perSlot(notIntended, (slot, where, reason) => `no longer stored or sent, remove it from INTENDED: ${slot} (${where}); listed because: ${reason}`),
+	];
 }
 
 // ================================================================== the controls
@@ -2347,6 +2580,10 @@ describe("the secret-key canary", () => {
 		expect(expand(INTENDED, universe).problems).toEqual([]);
 	});
 
+	it("keeps INTENDED to the slots that take a secret", () => {
+		expect(intendedProblems(INTENDED, walkProgram(buildProgram()))).toEqual([]);
+	});
+
 	it("finds no leak that is not listed, and no listed leak that is gone", async () => {
 		const result = await runMatrix();
 		const universe = universeOf(walkProgram(buildProgram()));
@@ -2366,18 +2603,9 @@ describe("the secret-key canary", () => {
 
 	it("reached every slot that comes out clean, or says why it could not", async () => {
 		const result = await runMatrix();
-		const problems: string[] = [];
-		for (const slot of result.reach) {
-			const named = `${slot.command} | ${slot.slot}`;
-			if (slot.reason === "") {
-				problems.push(`\`unproven\` has no reason: ${named}`);
-			} else if (!slot.reached && slot.reason === null) {
-				problems.push(`never reached, so its clean result means nothing: ${named} (give the command what it needs in SLOT_TABLE, or say why it cannot be reached with \`unproven\`)`);
-			} else if (slot.reached && slot.reason !== null) {
-				problems.push(`reached after all, remove \`unproven\`: ${named} (${slot.reason})`);
-			}
-		}
-		expect(problems).toEqual([]);
+		const plans = plansFor(walkProgram(buildProgram())).filter((plan) => inScopeName(plan.command));
+		const gateway = inScopeName(GATEWAY_API);
+		expect(reachProblems(reachExpected(plans, HTTP_PROBES, gateway), reachTexts(HTTP_PROBES, gateway), result.reach)).toEqual([]);
 	}, LONG);
 
 	it("leaves a command waiting only where the slot table says it waits", async () => {
@@ -2504,7 +2732,7 @@ describe("the secret-key canary", () => {
 			const search = program.commands.find((command) => command.name() === "search") as Command;
 			search.option("--new-flag <text>").argument("[more]");
 			const problems = unclassified(walkProgram(program));
-			expect(problems).toContain('command "throwaway" is not in SLOT_TABLE');
+			expect(problems).toContain('command "throwaway" is not in SLOT_TABLE; its slots: <value> (takes a value), --extra (takes a value)');
 			expect(problems).toContain('"search" --new-flag takes a value and has no class in SLOT_TABLE');
 			expect(problems).toContain('"search" [more] takes a value and has no class in SLOT_TABLE');
 		});
@@ -2596,6 +2824,39 @@ describe("the secret-key canary", () => {
 			}
 		});
 
+		it("credits a file to a request only when it holds the key more often than before", async () => {
+			const box = sandbox();
+			const lines: string[] = [];
+			let writes = 0;
+			const echo = createServer((req, res) => {
+				// Always the same file, with new text each time: a request that replaces the copy of the key it finds, and adds none.
+				writeFileSync(join(box.home, "held.txt"), `asked: ${decodeURIComponent(req.url ?? "")} (${(writes += 1)})`);
+				res.end("done");
+			});
+			await new Promise<void>((resolve) => echo.listen(0, "127.0.0.1", resolve));
+			try {
+				const probe = HTTP_PROBES.find((candidate) => candidate.slot === "GET /v1/tasks/:id") as HttpProbe;
+				const wrong: string[] = [];
+				for (const form of FORMS) {
+					// A key of its own for every form: the file still holds the last form's key, which is not this one.
+					const planted = plant(form, `replace|${form}`);
+					const watch: HttpWatch = { url: `http://127.0.0.1:${(echo.address() as AddressInfo).port}`, key: "none", home: box.home, lines, skip: new Set(), tree: readTree(box.home) };
+					const first = await sendProbe(watch, probe, planted);
+					const second = await sendProbe(watch, probe, planted);
+					if (!first.channels.has("file-content")) {
+						wrong.push(`${form}: the request that wrote the first copy was not credited`);
+					}
+					if (second.channels.has("file-content")) {
+						wrong.push(`${form}: the request that replaced the copy was credited`);
+					}
+				}
+				expect(wrong).toEqual([]);
+			} finally {
+				await new Promise<void>((resolve) => echo.close(() => resolve()));
+				box.restore();
+			}
+		});
+
 		it("sees a lookup that code makes through a named import, and refuses it", async () => {
 			// `subscriptions.ts` does `import { lookup } from "node:dns/promises"`: a name imported like that is the guard's
 			// only if the guard says so to Node (`syncBuiltinESMExports`). Checked first, so that no lookup goes out when it is not.
@@ -2653,6 +2914,89 @@ describe("the secret-key canary", () => {
 		});
 	});
 
+	describe("the cleanup and the home", () => {
+		it("knows what the connection guard does not watch: other resolver calls and child processes", () => {
+			const { root, files } = sourceFiles();
+			const resolvers: string[] = [];
+			const children: string[] = [];
+			for (const file of files) {
+				const text = readFileSync(file, "utf8");
+				if (/\bnew (?:dns\.)?(?:promises\.)?Resolver\b|\bdns\.(?:promises\.)?resolve|\bresolve(?:4|6|Any|Srv|Txt|Mx|Cname|Ns)\(|["']node:dns["']|["']node:dns\/promises["']/.test(text)) {
+					resolvers.push(relative(root, file));
+				}
+				if (/["']node:child_process["']/.test(text)) {
+					children.push(relative(root, file));
+				}
+			}
+			// A new use of either is a way out the guard does not see: add it to the guard, or write here why it is harmless.
+			// Both of these use `lookup` of `node:dns/promises`: `subscriptions.ts` through a named import and `ssrf.ts` through a
+			// dynamic one, read when it is first needed. The guard's `syncBuiltinESMExports()` is what makes either see the guard.
+			expect(resolvers).toEqual(["cli/src/lib/gateway/subscriptions.ts", "nostr/src/ssrf.ts"]);
+			expect(children).toEqual(["cli/src/commands/ui.ts", "cli/src/lib/browser.ts", "cli/src/relay/cert.ts"]);
+		});
+
+		it("gives every run a home of its own, and the tester's home is not in it", async () => {
+			let seen: { agx: string; os: string; env: Record<string, string | undefined> } | null = null;
+			const observed = await runOnce(() => ({ args: [], stdin: null }), plant("nsec", "home"), false, {
+				run: async () => {
+					seen = { agx: process.env.AGX_HOME as string, os: homedir(), env: { ...process.env } };
+					return 0;
+				},
+			});
+			expect(observed.threw).toBeNull();
+			const run = seen as unknown as { agx: string; os: string; env: Record<string, string | undefined> };
+			expect(run.agx).not.toBe("");
+			expect(REAL_HOME.startsWith(run.agx)).toBe(false);
+			expect(run.os).toBe(run.agx);
+			// Every variable a program takes for a home or a settings folder is in the throwaway home, so none leads to the tester's.
+			const outside = HOME_VARIABLES.filter((name) => !(run.env[name] ?? "").startsWith(run.agx));
+			expect(outside).toEqual([]);
+			expect(Object.entries(run.env).filter(([name, value]) => (HOME_VARIABLES as readonly string[]).includes(name) && value?.startsWith(REAL_HOME))).toEqual([]);
+			expect(run.env.TS_AUTHKEY).toBeUndefined();
+		});
+
+		it("knows every place in the source that asks where a home or a settings folder is", () => {
+			const { root, files } = sourceFiles();
+			const asks: string[] = [];
+			const names = new Set<string>();
+			for (const file of files) {
+				const text = readFileSync(file, "utf8");
+				if (/\bhomedir\(/.test(text)) {
+					asks.push(relative(root, file));
+				}
+				for (const match of text.matchAll(/process\.env\.([A-Za-z_0-9]+)/g)) {
+					const name = match[1] as string;
+					if (!name.startsWith("AGX_") && HOME_LIKE.test(name)) {
+						names.add(name);
+					}
+				}
+			}
+			// A new place, or a new variable: decide whether a run must give it the throwaway home (`pointHomeAt`), then list it here.
+			expect(asks).toEqual(["cli/src/lib/paths.ts"]);
+			expect([...names].filter((name) => !(HOME_VARIABLES as readonly string[]).includes(name) && name !== "TMPDIR")).toEqual([]);
+		});
+
+		it("removes the folders this file made, and only those", () => {
+			const parent = mkdtempSync(join(tmpdir(), "agx-canary-check-"));
+			const mine = join(parent, "mine");
+			const other = join(parent, "other");
+			mkdirSync(mine);
+			mkdirSync(other);
+			writeFileSync(join(mine, "file"), "x");
+			const known = homesMade.length;
+			homesMade.push(mine);
+			try {
+				removeMade();
+				expect(existsSync(mine)).toBe(false);
+				expect(existsSync(other)).toBe(true);
+				expect(existsSync(parent)).toBe(true);
+			} finally {
+				homesMade.splice(known);
+				rmSync(parent, { recursive: true, force: true });
+			}
+		});
+	});
+
 	describe("the lists", () => {
 		const universe = { slots: new Set(["a | --x", "a | --y", "b | --x"]) };
 		const line = (command: string, slot: string, reason = "why"): KnownLeak => ({ command, slot, forms: ["nsec"], channels: ["stdout"], reason });
@@ -2672,6 +3016,47 @@ describe("the secret-key canary", () => {
 			expect(expand([line("a", "--y"), line("a", "--x")], universe).problems).toEqual(['out of order: "a | --x" comes before "a | --y"']);
 			expect(expand([line("a", "--x"), line("a", "--y"), line("b", "--x")], universe).problems).toEqual([]);
 		});
+
+		it("asks that a reason about a pull request fits the slot and the forms it is on", () => {
+			const real = { slots: new Set(["search | [query]", "search | --limit", "gateway (HTTP API) | GET /v1/tasks/:id", "search | <unknown option>"]) };
+			const on = (command: string, slot: string, reason: string, forms: KnownLeak["forms"] = ["nsec"]): KnownLeak => ({ command, slot, forms, channels: ["stdout"], reason });
+			expect(expand([on("search", "[query]", WHY.pr65)], real).problems).toEqual([]);
+			expect(expand([on("search", "<unknown option>", WHY.pr61, OWN)], real).problems).toEqual([]);
+			// the reason of one pull request on the slot of another
+			expect(expand([on("search", "[query]", WHY.pr61)], real).problems).toHaveLength(2);
+			expect(expand([on("search", "--limit", WHY.pr65)], real).problems).toHaveLength(1);
+			// a pull request that is about one command, on another
+			expect(expand([on("search", "[query]", WHY.pr75)], real).problems).toHaveLength(1);
+			expect(expand([on(GATEWAY_API, "GET /v1/tasks/:id", WHY.pr75)], real).problems).toEqual([]);
+			// the forms the pull request does not touch
+			expect(expand([on("search", "[query]", WHY.pr65, ["hex"])], real).problems).toHaveLength(1);
+			expect(expand([on("search", "[query]", WHY.ownHex, ["nsec"])], real).problems).toHaveLength(1);
+		});
+
+		it("lets INTENDED hold only a slot that takes a secret", () => {
+			const nodes = walkProgram(buildProgram());
+			const intended = (command: string, slot: string): KnownLeak => ({ command, slot, forms: ["nsec"], channels: ["request"], reason: "kept on purpose" });
+			expect(intendedProblems([intended("identity import", "[secret]")], nodes)).toEqual([]);
+			expect(intendedProblems([intended("search", "[query]")], nodes)).toEqual([expect.stringContaining('its class in SLOT_TABLE is "text", not "secret"')]);
+			expect(intendedProblems([intended("search", "--profile")], nodes)).toEqual([expect.stringContaining('is "profile", not "secret"')]);
+		});
+
+		it("asks for one verdict per slot, an honest reason on it and a verdict behind every reason in the table", () => {
+			const expected = new Map<string, string | null>([["a | --x", null], ["a | --y", "why not"]]);
+			const texts = new Map<string, string[]>([["a", ["why not"]]]);
+			const verdict = (slot: string, reached: boolean, reason: string | null) => ({ command: "a", slot, reached, reason });
+			const fine = [verdict("--x", true, null), verdict("--y", false, "why not")];
+			expect(reachProblems(expected, texts, fine)).toEqual([]);
+			expect(reachProblems(expected, texts, [verdict("--x", true, null)])).toEqual(["no verdict on whether the command used it: a | --y", "a reason in SLOT_TABLE that no verdict of \"a\" carries: why not"]);
+			expect(reachProblems(expected, texts, [...fine, verdict("--x", true, null)])).toEqual(["2 verdicts for one slot: a | --x"]);
+			expect(reachProblems(expected, texts, [...fine, verdict("--z", true, null)])).toEqual(["a verdict for a slot that is not probed: a | --z"]);
+			expect(reachProblems(expected, texts, [verdict("--x", true, null), verdict("--y", false, null)])).toEqual([
+				"the reason of a | --y is not the one in SLOT_TABLE",
+				"never reached, so its clean result means nothing: a | --y (give the command what it needs in SLOT_TABLE, or say why it cannot be reached with `unproven`)",
+				"a reason in SLOT_TABLE that no verdict of \"a\" carries: why not",
+			]);
+			expect(reachProblems(expected, texts, [verdict("--x", false, null), verdict("--y", false, "why not")])).toHaveLength(1);
+		});
 	});
 
 	describe("the comparison with the lists", () => {
@@ -2684,19 +3069,28 @@ describe("the secret-key canary", () => {
 		});
 
 		it("reports a leak that is not listed", () => {
-			expect(compare(new Set([leak, other]), listed(leak), listed())).toEqual([`new leak, not in KNOWN_LEAKS: ${other}`]);
+			expect(compare(new Set([leak, other]), listed(leak), listed())).toEqual(["new leak, not in KNOWN_LEAKS: a | --y (request: hex)"]);
 		});
 
 		it("reports a listed leak that is gone, and says to remove it", () => {
-			expect(compare(new Set([other]), listed(leak), listed(other))).toEqual([`no longer leaks, remove it from KNOWN_LEAKS: ${leak} (why)`]);
+			expect(compare(new Set([other]), listed(leak), listed(other))).toEqual(["no longer leaks, remove it from KNOWN_LEAKS: a | --x (stdout: nsec); listed because: why"]);
 		});
 
 		it("reports an intended slot that no longer stores or sends the key, and says to remove it", () => {
-			expect(compare(new Set([leak]), listed(leak), listed(other))).toEqual([`no longer stored or sent, remove it from INTENDED: ${other} (why)`]);
+			expect(compare(new Set([leak]), listed(leak), listed(other))).toEqual(["no longer stored or sent, remove it from INTENDED: a | --y (request: hex); listed because: why"]);
 		});
 
 		it("reports a combination that is in both lists", () => {
-			expect(compare(new Set([leak]), listed(leak), listed(leak))).toEqual([`in both KNOWN_LEAKS and INTENDED: ${leak}`]);
+			expect(compare(new Set([leak]), listed(leak), listed(leak))).toEqual(["in both KNOWN_LEAKS and INTENDED: a | --x (stdout: nsec)"]);
+		});
+
+		it("says it once for a slot, with its channels and forms, in order", () => {
+			const found = new Set(["b | --x | hex | request", "a | --x | nsec | stdout", "a | --x | hex | stdout", "a | --x | nsec | stderr", "a | --y | nsec | stdout"]);
+			expect(compare(found, listed(), listed())).toEqual([
+				"new leak, not in KNOWN_LEAKS: a | --x (stderr: nsec; stdout: hex, nsec)",
+				"new leak, not in KNOWN_LEAKS: a | --y (stdout: nsec)",
+				"new leak, not in KNOWN_LEAKS: b | --x (request: hex)",
+			]);
 		});
 	});
 
