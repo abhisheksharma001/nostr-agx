@@ -275,8 +275,9 @@ describe("agx tailscale while another agx command is writing config.json", () =>
 		await enabledProfile();
 		held = await holdConfigLockUntilSomeoneWaits("c.profiles.default.tailscale.enabled = false;");
 
-		await agx("tailscale", "up", "--hostname", "agx-new");
+		const run = await agx("tailscale", "up", "--hostname", "agx-new");
 
+		expect(run.code, run.stderr).toBe(0);
 		expect(await held.sawWaiter).toBe(true);
 		expect(getProfile("default").tailscale).toMatchObject({ enabled: false, hostname: "agx-new" });
 	});
