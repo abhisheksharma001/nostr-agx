@@ -412,11 +412,49 @@ function staleLockText(lock: string): string | null {
 }
 
 /**
+ * Remove a lock that was judged left over, so that only one install does it at a time. Installs that judged
+ * the same lock left over would otherwise each remove it, and the second removal could take a lock that the
+ * first install had made in the meantime, leaving two installs inside at once. So the removal is done only
+ * while holding a second, very short-lived lock file (`<lock>.takeover`), and only when the lock is still
+ * exactly the one that was judged: an install that gets the second lock late finds a different lock, or none,
+ * and leaves it alone. Returns whether the lock that was judged is gone.
+ */
+function takeOverLeftOverLock(lock: string, judged: string, afterJudged: (() => void) | undefined): boolean {
+	afterJudged?.();
+	const takeover = `${lock}.takeover`;
+	try {
+		const fd = openSync(takeover, "wx", 0o600);
+		try {
+			writeFileSync(fd, `${JSON.stringify({ pid: process.pid })}\n`);
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		// Another install is doing it. If that one died halfway, its file is cleared and the next round gets it.
+		if (staleLockText(takeover) !== null) {
+			rmSync(takeover, { force: true });
+		}
+		return false;
+	}
+	try {
+		if (readFileSync(lock, "utf8") !== judged) {
+			return false;
+		}
+		rmSync(lock);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		rmSync(takeover, { force: true });
+	}
+}
+
+/**
  * Run `run` while this process holds a lock file beside `target`, so two installs at once cannot both read
  * the file and then each replace it with a version that lacks the other's entries. Waits a bounded time
  * for another install, and takes over a lock that is left over from one that died.
  */
-function withLock<T>(target: string, waitMs: number, run: () => T): T {
+function withLock<T>(target: string, waitMs: number, run: () => T, afterLockJudged: (() => void) | undefined): T {
 	const folder = dirname(target);
 	const lock = join(folder, `.${basename(target)}.agx-lock`);
 	try {
@@ -429,7 +467,7 @@ function withLock<T>(target: string, waitMs: number, run: () => T): T {
 		try {
 			const fd = openSync(lock, "wx", 0o600);
 			try {
-				writeFileSync(fd, `${JSON.stringify({ pid: process.pid })}\n`);
+				writeFileSync(fd, `${JSON.stringify({ pid: process.pid, token: randomBytes(8).toString("hex") })}\n`);
 			} finally {
 				closeSync(fd);
 			}
@@ -439,15 +477,7 @@ function withLock<T>(target: string, waitMs: number, run: () => T): T {
 				throw writeFailure(target, error);
 			}
 			const stale = staleLockText(lock);
-			if (stale !== null) {
-				// Only the lock that was judged left over is removed: one another run made since stays.
-				try {
-					if (readFileSync(lock, "utf8") === stale) {
-						rmSync(lock, { force: true });
-					}
-				} catch {
-					// Gone already.
-				}
+			if (stale !== null && takeOverLeftOverLock(lock, stale, afterLockJudged)) {
 				continue;
 			}
 			if (Date.now() >= deadline) {
@@ -524,13 +554,18 @@ export function linkInstallCommand(options: LinkInstallOptions, deps: LinkInstal
 	if (state.action !== "unchanged" && !dryRun) {
 		deps.afterFirstRead?.();
 		// Under the lock the file is read and planned again, so a change made since the first read is kept.
-		state = withLock(state.loaded.target, deps.lockWaitMs ?? LOCK_WAIT_MS, () => {
-			const fresh = prepare(host, file, profile);
-			if (fresh.action !== "unchanged") {
-				writeFile(fresh.loaded.target, serialize(fresh.result.next, fresh.loaded.text), fresh.loaded.mode);
-			}
-			return fresh;
-		});
+		state = withLock(
+			state.loaded.target,
+			deps.lockWaitMs ?? LOCK_WAIT_MS,
+			() => {
+				const fresh = prepare(host, file, profile);
+				if (fresh.action !== "unchanged") {
+					writeFile(fresh.loaded.target, serialize(fresh.result.next, fresh.loaded.text), fresh.loaded.mode);
+				}
+				return fresh;
+			},
+			deps.afterLockJudged,
+		);
 	}
 	const { action, result } = state;
 
