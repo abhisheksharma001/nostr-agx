@@ -21,6 +21,8 @@ const LONGEST_PAUSE_MS = 300_000;
  */
 export interface UiSendTransport {
 	get(): Promise<NostrTransport>;
+	/** Whole seconds (rounded up) until a failed start is tried again; 0 when it is not waiting. */
+	retryInSeconds(): number;
 	close(): Promise<void>;
 }
 
@@ -60,6 +62,9 @@ export function createUiSendTransport(
 				});
 			}
 			return pending;
+		},
+		retryInSeconds(): number {
+			return !pending && failures > 0 ? Math.max(0, Math.ceil((retryAt - performance.now()) / 1000)) : 0;
 		},
 		close(): Promise<void> {
 			closing ??= (async () => {

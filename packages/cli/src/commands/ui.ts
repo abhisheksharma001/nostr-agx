@@ -14,6 +14,7 @@ import { info, json, kv, ok, say, warn } from "../lib/output.js";
 import { profileDir } from "../lib/paths.js";
 import { toDisplayNpub, toHexPubkey } from "../lib/peer.js";
 import { MessageStore } from "../lib/store/message-store.js";
+import { tailscaleRequested } from "../lib/tailscale/index.js";
 import type { AgentLookup, ApiDeps } from "../lib/ui/api.js";
 import { createAgxStore } from "../lib/ui/agx-store.js";
 import { type AgxSync, createAgxSync } from "../lib/ui/agx-sync.js";
@@ -167,7 +168,20 @@ export async function uiCommand(options: UiOptions): Promise<void> {
 				if (options.devStore) {
 					return { ok: false, detail: "Sending is off with --dev-store." };
 				}
-				const transport = await sendTransport.get();
+				let transport: Awaited<ReturnType<typeof sendTransport.get>>;
+				try {
+					transport = await sendTransport.get();
+				} catch (error) {
+					if (!tailscaleRequested(profile)) {
+						throw error;
+					}
+					// The launcher's own error goes to the terminal through the pull, not into the page.
+					const seconds = sendTransport.retryInSeconds();
+					return {
+						ok: false,
+						detail: `Tailscale is not available, so nothing was sent.${seconds > 0 ? ` The next try is in about ${seconds} seconds.` : ""}`,
+					};
+				}
 				const res = await transport.publishMessage(toHexPubkey(to, "recipient"), {
 					text: body,
 					subject: subject ?? null,
