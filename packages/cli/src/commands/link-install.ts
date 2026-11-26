@@ -14,7 +14,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { AgxCliError, EXIT, usageError } from "../lib/errors.js";
 import { type HookEvent, type HookHost, isHookProfileName } from "../lib/hook.js";
 import { heading, info, json, ok, say, table, warn } from "../lib/output.js";
@@ -90,8 +90,17 @@ function configFile(host: HookHost): string {
 	const home = homedir();
 	if (host === "claude") {
 		// $CLAUDE_CONFIG_DIR replaces ~/.claude: "All settings, session history, and plugins are stored under this
-		// path" (https://code.claude.com/docs/en/env-vars, read 2026-11-26).
+		// path" (https://code.claude.com/docs/en/env-vars, read 2026-11-27). The documentation shows the shell
+		// expanding a leading ~ and says to write the absolute path in a settings file; it does not say what Claude Code
+		// does with a relative value, and this command's working folder is not necessarily Claude Code's. So only an
+		// absolute path is followed, and any other value is refused, without being shown.
 		const configDir = process.env.CLAUDE_CONFIG_DIR;
+		if (configDir && !isAbsolute(configDir)) {
+			throw refusal(
+				"CLAUDE_CONFIG_DIR is set, but not to an absolute path, so agx cannot tell which folder Claude Code reads.",
+				"Set CLAUDE_CONFIG_DIR to an absolute path (a shell expands ~ only when it is not in quotes), or unset it to use ~/.claude.",
+			);
+		}
 		return join(configDir ? resolve(configDir) : join(home, ".claude"), "settings.json");
 	}
 	if (host === "cursor") {
