@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -143,7 +143,7 @@ describe.skipIf(!existsSync(AGX))("agx link install: four installs at the same m
 		for (let trial = 0; trial < STALE_TRIALS; trial++) {
 			const home = freshHome();
 			try {
-				writeFileSync(join(home, ".claude", ".settings.json.agx-lock"), `${JSON.stringify({ pid: deadPid(), token: "left-by-an-install-that-died" })}\n`);
+				writeFileSync(join(home, ".claude", ".settings.json.agx-lock"), `${JSON.stringify({ pid: deadPid(), host: hostname(), token: "left-by-an-install-that-died" })}\n`);
 				const profiles = [undefined, "p1", "p2", "p3"];
 				const runs = await Promise.all(
 					profiles.map((profile) => start(home, [...(profile === undefined ? [] : ["--profile", profile]), "link", "install", "--agent", "claude"])),

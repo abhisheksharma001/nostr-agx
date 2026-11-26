@@ -16,7 +16,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { hexToBytes } from "@nostr-agx/nostr";
 import { nip19 } from "nostr-tools";
@@ -495,7 +495,7 @@ describe("agx link install: an existing file", () => {
 		expect((readJson("dotfiles/claude-settings.json") as { hooks: Record<string, unknown> }).hooks.SessionStart).toBeDefined();
 	});
 
-	it("leaves the old file and no temporary file when the folder cannot be written", async () => {
+	it("refuses, leaving the old file and no temporary file, when the folder cannot be written", async () => {
 		put(FILE.claude, CLAUDE_BEFORE);
 		const before = tree(userHome);
 		chmodSync(path(".claude"), 0o555);
@@ -504,9 +504,10 @@ describe("agx link install: an existing file", () => {
 				return;
 			}
 			const run = await install("claude");
-			expect(run.code).toBe(EXIT.generic);
-			expect(run.stderr).toContain(path(FILE.claude));
-			expect(run.stderr.toLowerCase()).toContain("not replaced");
+			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr).toContain(path(".claude"));
+			expect(run.stderr.toLowerCase()).toContain("not writable");
+			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
 		} finally {
 			chmodSync(path(".claude"), 0o755);
 		}
@@ -841,6 +842,10 @@ describe("agx link install: an agx entry in any other form", () => {
 
 const TAB = String.fromCharCode(9);
 const LF = String.fromCharCode(10);
+const CR = String.fromCharCode(13);
+/** Two characters that a JavaScript regular expression counts as white space and a shell does not. */
+const NBSP = String.fromCharCode(0xa0);
+const BOM = String.fromCharCode(0xfeff);
 
 describe("agx link install: which commands count as an agx entry", () => {
 	/** Spellings of a command that runs agx (or this CLI's npm package), in any case. Every one must be refused. */
@@ -903,6 +908,26 @@ describe("agx link install: which commands count as an agx entry", () => {
 		"agx`x`",
 		'agx"x"',
 		"agx'x'",
+		// after the fourth review: a colon or a brace before the name, a brace after it, TypeScript and .com endings, a line continuation
+		"deno run -A npm:@nostr-agx/cli hook stop",
+		"deno run -A npm:agx",
+		"deno run -A npm:agx hook stop --host claude",
+		'powershell -Command "& {agx hook stop}"',
+		'pwsh -c "&{agx hook}"',
+		"pwsh -c '&{npx @nostr-agx/cli hook}'",
+		"tsx packages/cli/src/bin/agx.ts hook stop --host claude",
+		"node --import tsx packages/cli/src/bin/agx.ts hook",
+		"node packages/cli/dist/agx.js hook stop --host claude",
+		"x/agx.ts",
+		"x/agx.mts hook",
+		"x/agx.cts hook",
+		"x/agx.com hook",
+		"agx.com",
+		"AGX.TS hook",
+		"C:agx.exe hook",
+		`agx${BS}${LF}  hook stop`,
+		`agx${BS}${CR}${LF}  hook stop`,
+		`agx^${CR}${LF} hook`,
 		// upper and mixed case
 		"NPX -Y AGX@LATEST HOOK",
 		"npx @NOSTR-AGX/CLI hook",
@@ -937,10 +962,22 @@ describe("agx link install: which commands count as an agx entry", () => {
 		`node -e "require('@nostr-agx/nostr')"`,
 		"npx @nostr-agx/cli-helper run",
 		"npx @nostr-agx/climate",
+		// the .ts ending is not the start of .tsx
+		"agx.tsx hook",
 	];
 
 	/** Cautious false positives, kept on purpose: a folder named exactly agx, or the word agx in quotes or as an argument. */
-	const CAUTIOUS = ["cd ~/agx && ./run.sh", "echo 'agx'", "grep agx log"];
+	const CAUTIOUS = [
+		"cd ~/agx && ./run.sh",
+		"echo 'agx'",
+		"grep agx log",
+		// `agx@` is the start of a version (`npx agx@latest`), so whatever follows the @ is taken as one: a user called agx is refused too
+		"ssh agx@buildbox notify",
+		"mail -s done agx@example.com",
+		// JavaScript counts these two as white space and a shell does not: refused, which is the safe side
+		`x${NBSP}agx`,
+		`agx${BOM}hook`,
+	];
 
 	it.each([...RUNS_AGX, ...CAUTIOUS])("refuses %j (command 2 of 3): exit 3, the host and the position named, the text not printed", async (existing) => {
 		const text = JSON.stringify({ hooks: { Stop: [group("./first.sh"), group(existing), group("./third.sh")] } }, null, 2);
@@ -965,6 +1002,18 @@ describe("agx link install: which commands count as an agx entry", () => {
 		const stop = (readJson(FILE.claude) as { hooks: { Stop: unknown[] } }).hooks.Stop;
 		expect(stop).toEqual([group("./first.sh"), group(other), group("./third.sh"), group(command("stop", "claude"))]);
 	});
+
+	// Documented limits (docs/hooks.md): a command that builds the name from a variable, or names the package with no agx word, is not seen.
+	it.each(["$" + "{AGX_BIN:-agx} hook stop --host claude", "npm exec --package=@nostr-agx/cli hook"])(
+		"does not see %j: it adds its own entry after it, as the documentation says",
+		async (hidden) => {
+			put(FILE.claude, JSON.stringify({ hooks: { Stop: [group(hidden)] } }, null, 2));
+			const run = await install("claude");
+			expect(run.code).toBe(EXIT.ok);
+			const stop = (readJson(FILE.claude) as { hooks: { Stop: unknown[] } }).hooks.Stop;
+			expect(stop).toEqual([group(hidden), group(command("stop", "claude"))]);
+		},
+	);
 });
 
 describe("agx link install: a file where a folder belongs", () => {
@@ -992,6 +1041,52 @@ describe("agx link install: a file where a folder belongs", () => {
 		expect(dry.code).toBe(EXIT.config);
 		expect(real.code).toBe(EXIT.config);
 		expect(tree(userHome)).toEqual(before);
+	});
+});
+
+describe("agx link install: a folder agx cannot write into", () => {
+	afterEach(() => {
+		// A folder this test made read-only has to be writable again for the sandbox to be removed.
+		try {
+			chmodSync(path(".claude"), 0o755);
+		} catch {
+			// not there, or a link
+		}
+	});
+
+	it.each([
+		["~/.claude is a link to a folder that does not exist", "does not exist", () => symlinkSync(path("nowhere"), path(".claude"))],
+		[
+			"CLAUDE_CONFIG_DIR is a link to a folder that does not exist",
+			"does not exist",
+			() => {
+				symlinkSync(path("nowhere"), path("config-link"));
+				process.env.CLAUDE_CONFIG_DIR = path("config-link");
+			},
+		],
+		["~/.claude exists, is read-only and has no file yet", "not writable", () => mkdirSync(path(".claude"), { mode: 0o555 })],
+	])("%s: a dry run and a real run both refuse, the same way, and nothing is changed", async (_label, words, setUp) => {
+		if (words === "not writable" && process.getuid?.() === 0) {
+			return;
+		}
+		setUp();
+		const before = tree(userHome);
+		const dry = await install("claude", "--dry-run");
+		const real = await install("claude");
+		expect(dry.code).toBe(EXIT.config);
+		expect(real.code).toBe(EXIT.config);
+		for (const run of [dry, real]) {
+			expect(run.stderr.toLowerCase()).toContain(words);
+			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		}
+		expect(real.stderr).toBe(dry.stderr);
+		expect(tree(userHome)).toEqual(before);
+	});
+
+	it("a dry run does not refuse a folder that is not there yet when the folder above it can be written", async () => {
+		const run = await install("claude", "--dry-run");
+		expect(run.code).toBe(EXIT.ok);
+		expect(tree(userHome)).toEqual([]);
 	});
 });
 
@@ -1227,7 +1322,7 @@ describe("agx link install: two installs at once, and a lock that was left behin
 	}
 
 	function lockFor(pid: number): void {
-		put(LOCK, `${JSON.stringify({ pid, token: "left-by-a-test" })}\n`);
+		put(LOCK, `${JSON.stringify({ pid, host: hostname(), token: "left-by-a-test" })}\n`);
 	}
 
 	it("leaves no lock file behind after a write, a refusal or a failed write", async () => {
@@ -1286,7 +1381,7 @@ describe("agx link install: two installs at once, and a lock that was left behin
 		put(FILE.claude, "{}");
 		lockFor(deadPid());
 		const live = liveProcess();
-		const theirs = `${JSON.stringify({ pid: live, token: "made-in-between" })}\n`;
+		const theirs = `${JSON.stringify({ pid: live, host: hostname(), token: "made-in-between" })}\n`;
 		let error: unknown;
 		try {
 			linkInstallCommand(
@@ -1357,7 +1452,7 @@ describe("agx link install: two installs at once, and a lock that was left behin
 
 	it("an install that was displaced leaves the lock of the install that displaced it where it is", () => {
 		put(FILE.claude, "{}");
-		const theirs = `${JSON.stringify({ pid: liveProcess(), token: "the-install-that-took-over" })}\n`;
+		const theirs = `${JSON.stringify({ pid: liveProcess(), host: hostname(), token: "the-install-that-took-over" })}\n`;
 		const error = threw(undefined, {
 			beforePublish: () => {
 				rmSync(path(LOCK));
@@ -1396,8 +1491,8 @@ describe("agx link install: two installs at once, and a lock that was left behin
 	it("leaves a takeover file alone that another install made between this one judging the old one left over and removing it", () => {
 		put(FILE.claude, "{}");
 		lockFor(deadPid());
-		put(`${LOCK}.takeover`, `${JSON.stringify({ pid: deadPid(), token: "left-by-an-install-that-died" })}\n`);
-		const theirs = `${JSON.stringify({ pid: liveProcess(), token: "made-in-between" })}\n`;
+		put(`${LOCK}.takeover`, `${JSON.stringify({ pid: deadPid(), host: hostname(), token: "left-by-an-install-that-died" })}\n`);
+		const theirs = `${JSON.stringify({ pid: liveProcess(), host: hostname(), token: "made-in-between" })}\n`;
 		const error = threw(undefined, {
 			lockWaitMs: 400,
 			afterTakeoverJudged: () => {
@@ -1413,7 +1508,7 @@ describe("agx link install: two installs at once, and a lock that was left behin
 	it("does not remove a takeover file that is not its own when it has taken a lock over", () => {
 		put(FILE.claude, "{}");
 		lockFor(deadPid());
-		const theirs = `${JSON.stringify({ pid: liveProcess(), token: "another-takeover" })}\n`;
+		const theirs = `${JSON.stringify({ pid: liveProcess(), host: hostname(), token: "another-takeover" })}\n`;
 		const error = threw(undefined, { duringTakeover: () => writeFileSync(path(`${LOCK}.takeover`), theirs) });
 		expect(error).toBeUndefined();
 		expect(read(`${LOCK}.takeover`)).toBe(theirs);
@@ -1423,7 +1518,7 @@ describe("agx link install: two installs at once, and a lock that was left behin
 	it("names the takeover file as well when a takeover that is going on blocks it", () => {
 		put(FILE.claude, "{}");
 		lockFor(deadPid());
-		put(`${LOCK}.takeover`, `${JSON.stringify({ pid: liveProcess(), token: "going-on" })}\n`);
+		put(`${LOCK}.takeover`, `${JSON.stringify({ pid: liveProcess(), host: hostname(), token: "going-on" })}\n`);
 		const error = threw(undefined, { lockWaitMs: 300 });
 		expect(error?.exitCode).toBe(EXIT.config);
 		expect(error?.message).toContain(path(LOCK));
@@ -1457,7 +1552,7 @@ describe("agx link install: two installs at once, and a lock that was left behin
 	it("takes over a lock even when the short-lived file used for taking over was left by an install that died", async () => {
 		put(FILE.claude, "{}");
 		lockFor(deadPid());
-		put(`${LOCK}.takeover`, `${JSON.stringify({ pid: deadPid() })}\n`);
+		put(`${LOCK}.takeover`, `${JSON.stringify({ pid: deadPid(), host: hostname() })}\n`);
 		const run = await install("claude");
 		expect(run.code).toBe(EXIT.ok);
 		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
@@ -1467,7 +1562,7 @@ describe("agx link install: two installs at once, and a lock that was left behin
 	it("leaves a left-over lock and a takeover that a live install is making alone, and refuses after the bounded wait", () => {
 		put(FILE.claude, "{}");
 		lockFor(deadPid());
-		const takeover = `${JSON.stringify({ pid: liveProcess() })}\n`;
+		const takeover = `${JSON.stringify({ pid: liveProcess(), host: hostname() })}\n`;
 		put(`${LOCK}.takeover`, takeover);
 		const before = tree(userHome);
 		let error: unknown;
@@ -1493,6 +1588,136 @@ describe("agx link install: two installs at once, and a lock that was left behin
 		expect(stdout).toContain("Updated");
 		expect(readJson(FILE.claude)).toEqual(expected("claude"));
 		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
+	});
+
+	// A home folder shared between computers: a process number means nothing on another computer, so only the age of its lock counts.
+	function lockFrom(host: string | undefined, pid: number): void {
+		const record = host === undefined ? { pid, token: "left-by-a-test" } : { pid, host, token: "left-by-a-test" };
+		put(LOCK, `${JSON.stringify(record)}\n`);
+	}
+
+	const NOT_THIS_COMPUTER: [string, string | undefined][] = [
+		["another computer", "some-other-computer"],
+		["no computer name (a lock in the earlier format)", undefined],
+	];
+
+	it("writes this computer's name into its lock, beside its process number, and into its takeover file", () => {
+		put(FILE.claude, "{}");
+		lockFor(deadPid());
+		let lock: unknown;
+		let takeover: unknown;
+		const error = threw(undefined, {
+			duringTakeover: () => {
+				takeover = JSON.parse(read(`${LOCK}.takeover`));
+			},
+			beforePublish: () => {
+				lock = JSON.parse(read(LOCK));
+			},
+		});
+		expect(error).toBeUndefined();
+		expect(lock).toMatchObject({ pid: process.pid, host: hostname() });
+		expect(takeover).toMatchObject({ pid: process.pid, host: hostname() });
+	});
+
+	it.each(NOT_THIS_COMPUTER)("a lock from %s whose process number is not running here is not taken over at once: it waits, then refuses, and leaves the lock", (_label, host) => {
+		put(FILE.claude, "{}");
+		lockFrom(host, deadPid());
+		const before = read(LOCK);
+		const started = Date.now();
+		const error = threw(undefined, { lockWaitMs: 400 });
+		expect(error?.exitCode).toBe(EXIT.config);
+		expect(error?.message).toContain(path(LOCK));
+		expect(Date.now() - started).toBeGreaterThanOrEqual(300);
+		expect(read(LOCK)).toBe(before);
+		expect(read(FILE.claude)).toBe("{}");
+	});
+
+	it.each(NOT_THIS_COMPUTER)("a lock from %s is taken over once it is older than the limit, even when its process number is not running here", async (_label, host) => {
+		put(FILE.claude, "{}");
+		lockFrom(host, deadPid());
+		const old = new Date(Date.now() - 65_000);
+		utimesSync(path(LOCK), old, old);
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
+		expect(readJson(FILE.claude)).toEqual(expected("claude"));
+	});
+
+	it("does not clear at once a takeover file from another computer whose process number is not running here", () => {
+		put(FILE.claude, "{}");
+		lockFor(deadPid());
+		const theirs = `${JSON.stringify({ pid: deadPid(), host: "some-other-computer", token: "from-elsewhere" })}\n`;
+		put(`${LOCK}.takeover`, theirs);
+		const error = threw(undefined, { lockWaitMs: 400 });
+		expect(error?.exitCode).toBe(EXIT.config);
+		expect(read(`${LOCK}.takeover`)).toBe(theirs);
+		expect(read(FILE.claude)).toBe("{}");
+	});
+
+	// A named pipe where a lock belongs: reading it waits for a writer, forever. A second process opens it for writing after two
+	// seconds, so that a read that does wait ends late and the test fails instead of hanging.
+	function writerLater(pipe: string): void {
+		holder = spawn(process.execPath, ["-e", `setTimeout(() => require("node:fs").writeFileSync(process.argv[1], "x"), 2000)`, pipe], { stdio: "ignore" });
+	}
+
+	function makePipe(rel: string): void {
+		const made = spawnSync("mkfifo", [path(rel)]);
+		if (made.status !== 0) {
+			throw new Error("mkfifo failed");
+		}
+	}
+
+	it.skipIf(process.platform === "win32")("refuses at once, with exit 3, a lock that is a named pipe, and leaves it", () => {
+		put(FILE.claude, "{}");
+		makePipe(LOCK);
+		writerLater(path(LOCK));
+		const started = Date.now();
+		const error = threw(undefined, { lockWaitMs: 400 });
+		expect(Date.now() - started).toBeLessThan(1500);
+		expect(error?.exitCode).toBe(EXIT.config);
+		expect(error?.message).toContain(path(LOCK));
+		expect(error?.message.toLowerCase()).toContain("not a regular file");
+		expect(error?.message.toLowerCase()).toContain("nothing was changed");
+		expect(lstatSync(path(LOCK)).isFIFO()).toBe(true);
+		expect(read(FILE.claude)).toBe("{}");
+	});
+
+	it.skipIf(process.platform === "win32")("refuses at once, with exit 3, a takeover file that is a named pipe, and leaves it", () => {
+		put(FILE.claude, "{}");
+		lockFor(deadPid());
+		makePipe(`${LOCK}.takeover`);
+		writerLater(path(`${LOCK}.takeover`));
+		const started = Date.now();
+		const error = threw(undefined, { lockWaitMs: 400 });
+		expect(Date.now() - started).toBeLessThan(1500);
+		expect(error?.exitCode).toBe(EXIT.config);
+		expect(error?.message).toContain(path(`${LOCK}.takeover`));
+		expect(error?.message.toLowerCase()).toContain("not a regular file");
+		expect(lstatSync(path(`${LOCK}.takeover`)).isFIFO()).toBe(true);
+		expect(read(FILE.claude)).toBe("{}");
+	});
+
+	it("refuses at once, with exit 3, a takeover file that is a link to nothing, and names it", () => {
+		put(FILE.claude, "{}");
+		lockFor(deadPid());
+		symlinkSync(path("nowhere"), path(`${LOCK}.takeover`));
+		const started = Date.now();
+		const error = threw(undefined, { lockWaitMs: 2000 });
+		expect(Date.now() - started).toBeLessThan(1000);
+		expect(error?.exitCode).toBe(EXIT.config);
+		expect(error?.message).toContain(path(`${LOCK}.takeover`));
+		expect(error?.message.toLowerCase()).toContain("not a regular file");
+		expect(lstatSync(path(`${LOCK}.takeover`)).isSymbolicLink()).toBe(true);
+	});
+
+	it("names a takeover file that is a link to nothing, in the message and in what to delete, when it blocks a wait for a live install", () => {
+		put(FILE.claude, "{}");
+		lockFor(liveProcess());
+		symlinkSync(path("nowhere"), path(`${LOCK}.takeover`));
+		const error = threw(undefined, { lockWaitMs: 300 });
+		expect(error?.exitCode).toBe(EXIT.config);
+		expect(error?.message).toContain(path(LOCK));
+		expect(error?.message).toContain(path(`${LOCK}.takeover`));
+		expect(error?.remediation).toContain(path(`${LOCK}.takeover`));
 	});
 
 	it("reads the file again once it holds the lock, so what another tool saved in between is kept", async () => {
