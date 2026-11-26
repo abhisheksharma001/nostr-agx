@@ -212,8 +212,8 @@ is never logged.
     end of its line) and any `Basic` followed by base64 text; a plain word that follows `Basic`
     is hidden too. Also changed: bytes that are not valid UTF-8 come out as the replacement character
     U+FFFD, a last line without a newline is written without one (so it runs into the next thing
-    written to stderr), and at most 64 KiB of one line is kept: a longer line is written as its
-    first 64 KiB, masked, followed by ` [line cut]`, and the rest of that line is dropped. The
+    written to stderr), and at most 65,536 characters (64 KiB) of one line are kept: a longer line is
+    written as its first 65,536 characters, masked, followed by ` [line cut]`, and the rest of that line is dropped. The
     launcher's stdout is not forwarded: it carries only the SOCKS5 address, which this package reads
     and never prints. The masking cannot cover a login in your own environment, which anything that
     can read your process's environment still sees.
