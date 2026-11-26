@@ -115,6 +115,30 @@ function removeRunStateDir(dir: string): void {
 	rmSync(dir, { recursive: true, force: true });
 }
 
+/**
+ * Make sure a run's state dir does not outlive the process. The caller removes
+ * it with the returned function once the node is stopped; if that never
+ * happens, it is removed (synchronously, best effort) when the process ends.
+ * "exit" runs for process.exit(), including serve's second Ctrl-C, for an
+ * uncaught exception and for an unhandled rejection. A signal with no handler,
+ * SIGKILL, running out of memory and process.abort() end a process without it.
+ */
+function removeRunStateDirAtExit(dir: string): () => void {
+	const atExit = (): void => {
+		try {
+			removeRunStateDir(dir);
+		} catch {
+			// Nothing more can be done while the process is ending.
+		}
+	};
+	process.on("exit", atExit);
+	return () => {
+		removeRunStateDir(dir);
+		// A removal that failed above stays registered, so the exit tries once more.
+		process.off("exit", atExit);
+	};
+}
+
 function envValue(name: string): string | null {
 	const value = process.env[name]?.trim();
 	return value ? value : null;
@@ -184,6 +208,7 @@ export async function startTailscaleForProfile(
 	// An explicit state dir is the operator asking to reuse a node. Otherwise
 	// give this run its own and delete it when the node is stopped.
 	const runStateDir = config.stateDir ? undefined : createRunStateDir();
+	const removeRunDir = runStateDir ? removeRunStateDirAtExit(runStateDir) : undefined;
 	if (runStateDir) {
 		config.stateDir = runStateDir;
 	}
@@ -193,7 +218,7 @@ export async function startTailscaleForProfile(
 		if (options.onTailscaleExit) {
 			proxy.onExit(options.onTailscaleExit);
 		}
-		if (!runStateDir) {
+		if (!removeRunDir) {
 			return proxy;
 		}
 		let stopping: Promise<void> | undefined;
@@ -204,16 +229,14 @@ export async function startTailscaleForProfile(
 					try {
 						await proxy.stop();
 					} finally {
-						removeRunStateDir(runStateDir);
+						removeRunDir();
 					}
 				})();
 				return stopping;
 			},
 		};
 	} catch (error) {
-		if (runStateDir) {
-			removeRunStateDir(runStateDir);
-		}
+		removeRunDir?.();
 		throw asCliError(error);
 	}
 }

@@ -123,6 +123,71 @@ describe("startTailscaleForProfile state directory", () => {
 	});
 });
 
+describe("startTailscaleForProfile when the process ends", () => {
+	const exitListeners = (): Set<NodeJS.ExitListener> => new Set(process.listeners("exit"));
+	const addedSince = (before: Set<NodeJS.ExitListener>): NodeJS.ExitListener[] =>
+		process.listeners("exit").filter((listener) => !before.has(listener));
+
+	it("removes the fresh dir at exit when stop() was never called", async () => {
+		let seen: { stateDir?: string } | undefined;
+		restoreStarter = setTailscaleStarterForTests(async (options) => {
+			seen = options;
+			return { url: PROXY_URL, stop: async () => undefined };
+		});
+		const before = exitListeners();
+		const handle = await startTailscaleForProfile("default", effectiveProfile("default"));
+		try {
+			const dir = seen!.stateDir!;
+			const added = addedSince(before);
+			expect(added).toHaveLength(1);
+			expect(existsSync(dir)).toBe(true);
+			// What the process does as it ends, e.g. after process.exit().
+			added[0]!(0);
+			expect(existsSync(dir)).toBe(false);
+		} finally {
+			await handle.stop();
+		}
+		expect(addedSince(before)).toHaveLength(0);
+	});
+
+	it("leaves no exit listener after stop(), after a failed start, or for a dir the user chose", async () => {
+		const before = exitListeners();
+		restoreStarter = setTailscaleStarterForTests(async () => ({
+			url: PROXY_URL,
+			stop: async () => undefined,
+		}));
+		const handle = await startTailscaleForProfile("default", effectiveProfile("default"));
+		expect(addedSince(before)).toHaveLength(1);
+		await handle.stop();
+		expect(addedSince(before)).toHaveLength(0);
+
+		restoreStarter();
+		restoreStarter = setTailscaleStarterForTests(async () => {
+			throw new Error("launcher failed");
+		});
+		await expect(
+			startTailscaleForProfile("default", effectiveProfile("default")),
+		).rejects.toThrow(/launcher failed/);
+		expect(addedSince(before)).toHaveLength(0);
+
+		const persistent = join(box.home, "keep-this-state-at-exit");
+		mkdirSync(persistent, { recursive: true, mode: 0o700 });
+		restoreStarter();
+		restoreStarter = setTailscaleStarterForTests(async () => ({
+			url: PROXY_URL,
+			stop: async () => undefined,
+		}));
+		const base = effectiveProfile("default");
+		const kept = await startTailscaleForProfile("default", {
+			...base,
+			tailscale: { ...base.tailscale, stateDir: persistent },
+		});
+		expect(addedSince(before)).toHaveLength(0);
+		await kept.stop();
+		expect(existsSync(persistent)).toBe(true);
+	});
+});
+
 describe("startTailscaleForProfile launcher exit", () => {
 	it("tells onTailscaleExit when the launcher ends on its own", async () => {
 		let notify:
