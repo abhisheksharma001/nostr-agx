@@ -52,6 +52,12 @@ const TAILSCALE_BOOLEANS = new Set([
 	"false",
 	"False",
 ]);
+/**
+ * What sits between `://` and `@` in a URL (`user:password` or a bare token). The
+ * Tailscale code in the launcher logs the proxy URL it uses, credentials
+ * included, on the launcher's stderr.
+ */
+const URL_CREDENTIALS = /([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@"'\\]+@/gi;
 const BINARY_NAME = process.platform === "win32" ? "agx-tailscale.exe" : "agx-tailscale";
 
 /**
@@ -281,20 +287,22 @@ export async function startBundledTailscale(
 	try {
 		child = spawn(executable, args, {
 			env,
-			stdio: ["pipe", "pipe", "inherit"],
+			// stderr is piped, not inherited, so relayStderr can mask credentials in it.
+			stdio: ["pipe", "pipe", "pipe"],
 			windowsHide: true,
 		});
 	} catch (error) {
 		removeOwnedStateDir();
 		throw error;
 	}
-	const { stdin, stdout } = child;
-	if (!stdin || !stdout) {
+	const { stdin, stdout, stderr } = child;
+	if (!stdin || !stdout || !stderr) {
 		child.kill();
 		throw new Error("The bundled agx-tailscale launcher did not get usable stdio pipes");
 	}
 	stdout.setEncoding("utf8");
 	stdin.on("error", () => {});
+	const stderrWritten = relayStderr(stderr);
 	// A launcher that could not be started has no pid and never emits `exit`.
 	child.on("error", () => {
 		if (child.pid === undefined) removeOwnedStateDir();
@@ -333,6 +341,8 @@ export async function startBundledTailscale(
 		url = await waitForAddress(child, stdout, timeoutMs, executable);
 	} catch (error) {
 		child.kill();
+		// What the launcher wrote on its way out reaches stderr before the error.
+		await soon(stderrWritten);
 		throw error;
 	}
 
@@ -365,7 +375,7 @@ export async function startBundledTailscale(
 		port,
 		stop(): Promise<void> {
 			stopRequested = true;
-			stopping ??= stopChild(child, stdin, exited);
+			stopping ??= stopChild(child, stdin, exited).then(() => soon(stderrWritten));
 			return stopping;
 		},
 		listenerErrors,
@@ -386,6 +396,35 @@ export async function startBundledTailscale(
 			};
 		},
 	};
+}
+
+/**
+ * Write the launcher's stderr to this process's stderr, one whole line at a time
+ * and with the credentials of any URL masked. Settles once that stderr has ended.
+ */
+function relayStderr(source: Readable): Promise<void> {
+	const mask = (text: string): string => text.replace(URL_CREDENTIALS, "$1***@");
+	let pending = "";
+	source.setEncoding("utf8");
+	source.on("data", (chunk: string) => {
+		pending += chunk;
+		const end = pending.lastIndexOf("\n");
+		if (end === -1) return;
+		process.stderr.write(mask(pending.slice(0, end + 1)));
+		pending = pending.slice(end + 1);
+	});
+	return new Promise<void>((resolve) => {
+		source.once("close", () => {
+			if (pending) process.stderr.write(mask(pending));
+			pending = "";
+			resolve();
+		});
+	});
+}
+
+/** Wait for `done`, but for at most a second. */
+function soon(done: Promise<void>): Promise<void> {
+	return Promise.race([done, new Promise<void>((resolve) => setTimeout(resolve, 1_000).unref())]);
 }
 
 function waitForAddress(
