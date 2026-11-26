@@ -632,3 +632,52 @@ describe("the launcher's environment", () => {
 		}
 	});
 });
+
+describe("the log upload switch", () => {
+	async function launchedEnv(
+		parent: Record<string, string | undefined>,
+		options: { disableLogUpload?: boolean },
+	): Promise<Record<string, string>> {
+		const fake = await envDumpingBinary();
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			await withParentEnv(parent, async () => {
+				proxy = await startBundledTailscale({
+					binary: fake.path,
+					timeoutMs: 5_000,
+					...options,
+				});
+			});
+			return await savedEnv(fake.envFile);
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	}
+
+	it.skipIf(!posix)("turns the upload off for the launcher when asked to", async () => {
+		const env = await launchedEnv({ TS_NO_LOGS_NO_SUPPORT: undefined }, { disableLogUpload: true });
+		expect(env.TS_NO_LOGS_NO_SUPPORT).toBe("true");
+	});
+
+	it.skipIf(!posix)("prefers the option to a different value in the environment", async () => {
+		const env = await launchedEnv({ TS_NO_LOGS_NO_SUPPORT: "false" }, { disableLogUpload: true });
+		expect(env.TS_NO_LOGS_NO_SUPPORT).toBe("true");
+	});
+
+	it("rejects a switch that is not a boolean, before starting anything", async () => {
+		await expect(
+			startBundledTailscale({
+				binary: join(tmpdir(), "no-such-launcher"),
+				disableLogUpload: "false" as unknown as boolean,
+			}),
+		).rejects.toThrow(/disableLogUpload must be a boolean/);
+	});
+
+	it.skipIf(!posix)("leaves the launcher's default alone when the option is off or absent", async () => {
+		for (const options of [{}, { disableLogUpload: false }]) {
+			const env = await launchedEnv({ TS_NO_LOGS_NO_SUPPORT: undefined }, options);
+			expect(env).not.toHaveProperty("TS_NO_LOGS_NO_SUPPORT");
+		}
+	});
+});

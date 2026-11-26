@@ -68,6 +68,12 @@ describe("startTailscaleRelayProxy", () => {
 		});
 	});
 
+	it("passes the log upload switch through to the launcher", async () => {
+		const { start } = fakeStart();
+		await startTailscaleRelayProxy({ authKey: KEY, disableLogUpload: true, start });
+		expect(start).toHaveBeenCalledWith(expect.objectContaining({ disableLogUpload: true }));
+	});
+
 	it("fails before starting when no auth key is available", async () => {
 		const { start } = fakeStart();
 		const error = await startTailscaleRelayProxy({
