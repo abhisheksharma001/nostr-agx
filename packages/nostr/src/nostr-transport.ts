@@ -176,8 +176,10 @@ export class NostrTransport implements AgxTransport {
 	 * writes it and the lookup reads it at dial time, so the constructor must
 	 * keep the map itself, never copy it. */
 	private readonly peerDnsPins: Map<string, string[]>;
-	/** The proxy this transport dials through, when one is configured. */
-	private relayProxy?: RelayProxyHandle;
+	/** The proxy this transport dials through, when one is configured. A `#`
+	 * field, so `util.inspect` and `JSON.stringify` of the transport do not show
+	 * its address, which may carry a user name and password. */
+	#relayProxy?: RelayProxyHandle;
 	/** Set once `stop()` has released the proxy, so a restart fails clearly. */
 	private proxyReleased = false;
 	private onMessageHandlers = new Set<(msg: AgxIncomingMessage) => void | Promise<void>>();
@@ -248,14 +250,14 @@ export class NostrTransport implements AgxTransport {
 		// Shared, not copied: the pinned lookup closes over this exact map, so
 		// entries `recordPeerPins` adds later have to be visible to it.
 		this.peerDnsPins = peerDnsPins;
-		this.relayProxy = proxy;
+		this.#relayProxy = proxy;
 	}
 
 	/** The SOCKS5 URL in use, if any, with any user name and password replaced:
 	 * safe for logs and diagnostics. The credentials stay inside the transport,
 	 * which hands them to the SOCKS client itself. */
 	get relayProxyUrl(): string | undefined {
-		const url = this.relayProxy?.url;
+		const url = this.#relayProxy?.url;
 		return url === undefined ? undefined : redactProxyUrl(url);
 	}
 
@@ -1073,12 +1075,12 @@ export class NostrTransport implements AgxTransport {
 		// it is closed. A borrowed URL points at a proxy someone else owns, so it
 		// is left running and this transport can start again; an owned handle is
 		// stopped, which makes this transport single-use.
-		const proxy = this.relayProxy;
+		const proxy = this.#relayProxy;
 		let stopError: unknown;
 		if (proxy) {
 			const borrowed = isBorrowedRelayProxy(proxy);
 			if (!borrowed) {
-				this.relayProxy = undefined;
+				this.#relayProxy = undefined;
 				this.proxyReleased = true;
 			}
 			try {
