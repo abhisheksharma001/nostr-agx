@@ -1,7 +1,9 @@
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	existsSync,
+	linkSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -11,14 +13,16 @@ import {
 	rmSync,
 	statSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { EXIT } from "../lib/errors.js";
+import { AgxCliError, EXIT } from "../lib/errors.js";
 import { setStdinForTests } from "../lib/stdin.js";
-import { agx, type CliRun, jsonDocuments, sandbox } from "../test/helpers.js";
+import { agx, type CliRun, capture, jsonDocuments, sandbox } from "../test/helpers.js";
+import { linkInstallCommand } from "./link-install.js";
 
 /**
  * `agx link install --agent <host>` writes one coding agent's hook entries (the
@@ -33,8 +37,11 @@ import { agx, type CliRun, jsonDocuments, sandbox } from "../test/helpers.js";
  *
  * File locations and shapes, from each host's documentation (read 2026-11-26):
  *   Claude Code  https://code.claude.com/docs/en/hooks   ~/.claude/settings.json, "hooks"
+ *                https://code.claude.com/docs/en/env-vars   CLAUDE_CONFIG_DIR: "Override the configuration
+ *                directory (default: ~/.claude). All settings, session history, and plugins are stored under this path."
  *   Cursor       https://cursor.com/docs/hooks            ~/.cursor/hooks.json, "version" and "hooks"
  *   Codex        https://developers.openai.com/codex/hooks   $CODEX_HOME/hooks.json, else ~/.codex/hooks.json
+ * (the Claude Code environment-variable page was read live on 2026-11-26 at about 22:30 IST).
  */
 
 type Host = "claude" | "cursor" | "codex";
@@ -45,11 +52,17 @@ let savedEnv: Record<string, string | undefined>;
 
 beforeEach(() => {
 	box = sandbox();
-	savedEnv = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CODEX_HOME: process.env.CODEX_HOME };
+	savedEnv = {
+		HOME: process.env.HOME,
+		USERPROFILE: process.env.USERPROFILE,
+		CODEX_HOME: process.env.CODEX_HOME,
+		CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
+	};
 	userHome = mkdtempSync(join(tmpdir(), "agx-linkhome-"));
 	process.env.HOME = userHome;
 	process.env.USERPROFILE = userHome;
 	delete process.env.CODEX_HOME;
+	delete process.env.CLAUDE_CONFIG_DIR;
 	// The one guard that matters: never go on if home is not the throwaway folder.
 	if (resolve(homedir()) !== resolve(userHome) || !resolve(userHome).startsWith(resolve(tmpdir()) + sep)) {
 		throw new Error(`refusing to run: homedir() is ${homedir()}, not the throwaway ${userHome}`);
@@ -476,8 +489,11 @@ describe("agx link install: never replaces an entry that is not its own", () => 
 		const before = tree(userHome);
 		const run = await install("claude");
 		expect(run.code).toBe(EXIT.config);
-		expect(run.stderr).toContain(existing);
+		// Which file and which event, and that the entry is not shown: never the entry's own text.
 		expect(run.stderr).toContain(path(FILE.claude));
+		expect(run.stderr).toContain("Stop");
+		expect(run.stderr.toLowerCase()).toContain("not shown");
+		expect(`${run.stdout}${run.stderr}`).not.toContain(existing);
 		expect(run.stderr.toLowerCase()).toContain("nothing was changed");
 		expect(tree(userHome)).toEqual(before);
 		expect(read(FILE.claude)).toBe(text);
@@ -513,8 +529,8 @@ describe("agx link install: never replaces an entry that is not its own", () => 
 		expect(tree(userHome)).toEqual(before);
 	});
 
-	it("does not mistake another tool's hook for an agx entry", async () => {
-		put(FILE.claude, JSON.stringify({ hooks: { Stop: [group("my-agx-notifier stop"), group("echo agx hook stop")] } }));
+	it("control: another tool's hook that does not mention agx is kept, and a mention under another event is no obstacle", async () => {
+		put(FILE.claude, JSON.stringify({ hooks: { Stop: [group("notify-send done"), group("./check.sh")], PreToolUse: [group("echo agx was here")] } }));
 		const run = await install("claude");
 		expect(run.code).toBe(EXIT.ok);
 		expect((readJson(FILE.claude) as { hooks: { Stop: unknown[] } }).hooks.Stop).toHaveLength(3);
@@ -540,6 +556,496 @@ describe("agx link install: never replaces an entry that is not its own", () => 
 			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
 		}
 		expect(tree(userHome)).toEqual(before);
+	});
+});
+
+describe("agx link install: CLAUDE_CONFIG_DIR", () => {
+	it("writes settings.json under the folder Claude Code is told to use, and not under ~/.claude", async () => {
+		const dir = path("work-account/claude");
+		process.env.CLAUDE_CONFIG_DIR = dir;
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.ok);
+		expect(readJson("work-account/claude/settings.json")).toEqual(expected("claude"));
+		expect(existsSync(path(".claude"))).toBe(false);
+		expect(run.stdout).toContain(join(dir, "settings.json"));
+		const doc = jsonDocuments((await agx("--json", "link", "install", "--agent", "claude")).stdout)[0] as { file: string; action: string };
+		expect(doc.file).toBe(join(dir, "settings.json"));
+		expect(doc.action).toBe("unchanged");
+	});
+
+	it("keeps what that folder's settings.json already holds, and says how to undo in that folder", async () => {
+		put("work-account/claude/settings.json", JSON.stringify({ theme: "dark", hooks: { Stop: [group("./done.sh")] } }, null, 2));
+		process.env.CLAUDE_CONFIG_DIR = path("work-account/claude");
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.ok);
+		const after = readJson("work-account/claude/settings.json") as { theme: string; hooks: { Stop: unknown[] } };
+		expect(after.theme).toBe("dark");
+		expect(after.hooks.Stop).toEqual([group("./done.sh"), group(command("stop", "claude"))]);
+		expect(undoLines(run)[0]).toContain(path("work-account/claude/settings.json"));
+		expect(existsSync(path(".claude"))).toBe(false);
+	});
+
+	it("treats an empty value as not set", async () => {
+		process.env.CLAUDE_CONFIG_DIR = "";
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		expect(readJson(FILE.claude)).toEqual(expected("claude"));
+	});
+
+	it("does not move Cursor's or Codex's file", async () => {
+		process.env.CLAUDE_CONFIG_DIR = path("work-account/claude");
+		expect((await install("cursor")).code).toBe(EXIT.ok);
+		expect((await install("codex")).code).toBe(EXIT.ok);
+		expect(readJson(FILE.cursor)).toEqual(expected("cursor"));
+		expect(readJson(FILE.codex)).toEqual(expected("codex"));
+		expect(existsSync(path("work-account"))).toBe(false);
+	});
+});
+
+describe("agx link install: an agx entry in any other form", () => {
+	const MENTIONS: [string, string][] = [
+		["a quoted path with a space", '"/opt/My Tools/agx" hook stop --host claude'],
+		["npx", "npx agx hook stop --host claude"],
+		["pnpm exec", "pnpm exec agx hook stop --host claude"],
+		["env with a variable", "env AGX_HOME=/x agx hook stop --host claude"],
+		["an agx.js script", "/usr/local/bin/agx.js hook stop --host claude"],
+		["sh -c", "sh -c 'agx hook stop --host claude'"],
+		["upper case", "AGX hook stop --host claude"],
+		["only an environment variable", "AGX_HOME=/x ./other.sh"],
+		["a folder named for agx", "/home/me/agx-tools/notify.sh"],
+		["another tool that only says agx", "echo agx hook stop"],
+	];
+
+	it.each(MENTIONS)("refuses when Stop has a command with %s: a different agx entry, not a second copy", async (_label, existing) => {
+		const text = JSON.stringify({ hooks: { Stop: [group(existing)] } }, null, 2);
+		put(FILE.claude, text);
+		const before = tree(userHome);
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.config);
+		expect(run.stderr).toContain(path(FILE.claude));
+		expect(run.stderr).toContain("Stop");
+		expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		expect(`${run.stdout}${run.stderr}`).not.toContain(existing);
+		expect(tree(userHome)).toEqual(before);
+		expect(read(FILE.claude)).toBe(text);
+	});
+
+	it("Cursor and Codex refuse the same way, and name the event that has it", async () => {
+		put(FILE.cursor, JSON.stringify({ version: 1, hooks: { sessionStart: [{ command: "npx agx hook session-start --host cursor" }] } }));
+		put(FILE.codex, JSON.stringify({ hooks: { UserPromptSubmit: [group("sh -c 'agx hook prompt --host codex'")] } }));
+		const before = tree(userHome);
+		const cursor = await install("cursor");
+		expect(cursor.code).toBe(EXIT.config);
+		expect(cursor.stderr).toContain("sessionStart");
+		const codex = await install("codex");
+		expect(codex.code).toBe(EXIT.config);
+		expect(codex.stderr).toContain("UserPromptSubmit");
+		expect(tree(userHome)).toEqual(before);
+	});
+
+	it("an entry that is exactly the one it would write is left as it is, next to other tools' hooks", async () => {
+		put(FILE.claude, JSON.stringify({ hooks: { Stop: [group("./done.sh"), group(command("stop", "claude"))] } }, null, 2));
+		const run = await agx("--json", "link", "install", "--agent", "claude");
+		expect(run.code).toBe(EXIT.ok);
+		const stop = (readJson(FILE.claude) as { hooks: { Stop: unknown[] } }).hooks.Stop;
+		expect(stop).toEqual([group("./done.sh"), group(command("stop", "claude"))]);
+	});
+});
+
+describe("agx link install: a refusal never prints the entry in the way", () => {
+	it("names the file and the event and says the entry is not shown, for a command that holds a secret and terminal control codes", async () => {
+		const esc = String.fromCharCode(27);
+		const bel = String.fromCharCode(7);
+		const hostile = `AGX_API_KEY=sk-live-SECRET-9d41 agx --profile x hook stop --host claude ${esc}[2J${esc}]0;PWNED${bel}\nSECOND-LINE`;
+		const text = JSON.stringify({ hooks: { Stop: [group(hostile)] } }, null, 2);
+		put(FILE.claude, text);
+		const before = tree(userHome);
+		for (const args of [[], ["--dry-run"]]) {
+			const run = await install("claude", ...args);
+			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr).toContain(path(FILE.claude));
+			expect(run.stderr).toContain("Stop");
+			expect(run.stderr.toLowerCase()).toContain("not shown");
+			for (const text of [run.stdout, run.stderr]) {
+				for (const forbidden of ["SECRET", "sk-live", "PWNED", "SECOND-LINE", "--profile x", esc, bel]) {
+					expect(text).not.toContain(forbidden);
+				}
+			}
+		}
+		const json = await agx("--json", "link", "install", "--agent", "claude");
+		expect(json.code).toBe(EXIT.config);
+		expect(`${json.stdout}${json.stderr}`).not.toMatch(/SECRET|sk-live|PWNED|SECOND-LINE/);
+		expect(tree(userHome)).toEqual(before);
+		expect(read(FILE.claude)).toBe(text);
+	});
+});
+
+describe("agx link install: content a rewrite would change", () => {
+	const hooksFile = (extra: string): string => `{\n  ${extra},\n  "hooks": { "Stop": [] }\n}\n`;
+
+	it("keeps CRLF line endings when the file uses them, including its closing one", async () => {
+		const crlf = ['{', '\t"permissions": { "allow": ["Bash(ls)"] },', '\t"hooks": {}', '}', ''].join("\r\n");
+		put(FILE.claude, crlf);
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		const after = read(FILE.claude);
+		expect(after).toContain("agx hook stop --host claude");
+		expect(after.replaceAll("\r\n", "")).not.toContain("\n");
+		expect(after.endsWith("}\r\n")).toBe(true);
+		expect(after.split("\r\n").length).toBeGreaterThan(5);
+		expect((readJson(FILE.claude) as { permissions: unknown }).permissions).toEqual({ allow: ["Bash(ls)"] });
+	});
+
+	it("keeps CRLF in a file with no closing line break, and still writes LF to an LF file", async () => {
+		put(FILE.cursor, '{\r\n  "version": 1,\r\n  "hooks": {}\r\n}');
+		expect((await install("cursor")).code).toBe(EXIT.ok);
+		expect(read(FILE.cursor).replaceAll("\r\n", "")).not.toContain("\n");
+		expect(read(FILE.cursor).endsWith("}")).toBe(true);
+		put(FILE.codex, '{\n  "hooks": {}\n}\n');
+		expect((await install("codex")).code).toBe(EXIT.ok);
+		expect(read(FILE.codex)).not.toContain("\r");
+	});
+
+	it.each([
+		["a whole number too large to keep", "12345678901234567890"],
+		["a number too large for any double", "1e400"],
+		["a number too small to keep", "1e-400"],
+		["a long decimal that would be shortened", "0.1000000000000000055511151231257827"],
+		["a huge integer", "123456789012345678901234567890"],
+	])("refuses a file with %s, names the file, echoes nothing from it and changes nothing", async (_label, number) => {
+		const text = hooksFile(`"big": ${number}`);
+		put(FILE.claude, text);
+		const before = tree(userHome);
+		for (const args of [[], ["--dry-run"]]) {
+			const run = await install("claude", ...args);
+			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr).toContain(path(FILE.claude));
+			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+			expect(run.stderr).not.toContain(number);
+		}
+		expect(tree(userHome)).toEqual(before);
+		expect(read(FILE.claude)).toBe(text);
+	});
+
+	it("keeps every number whose value survives, whatever its spelling", async () => {
+		const text = hooksFile('"timeout": 1.0, "n": 1e5, "safe": 9007199254740991, "neg": -0.5, "cap": 1E3, "zero": -0, "tiny": 0.000001, "exp": 2.5e-3');
+		put(FILE.claude, text);
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		const after = readJson(FILE.claude) as Record<string, unknown>;
+		const before = JSON.parse(text) as Record<string, unknown>;
+		for (const key of ["timeout", "n", "safe", "neg", "cap", "zero", "tiny", "exp"]) {
+			expect(after[key]).toBe(before[key]);
+		}
+	});
+
+	it("does not mistake text inside a string for a number or a repeated key", async () => {
+		const text = JSON.stringify({ note: 'a "x": 1, "x": 2 and 1e400 and 12345678901234567890', hooks: { Stop: [] } }, null, 2);
+		put(FILE.claude, text);
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.ok);
+		expect((readJson(FILE.claude) as { note: string }).note).toBe('a "x": 1, "x": 2 and 1e400 and 12345678901234567890');
+	});
+
+	it.each([
+		["at the top", '{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "./keep.sh"}]}]}, "hooks": {}}'],
+		["inside hooks", '{"hooks": {"Stop": [], "Stop": []}}'],
+		["in another object", '{"permissions": {"a": 1, "b": 2, "a": 3}, "hooks": {}}'],
+		["inside a list", '{"list": [{"k": 1, "k": 2}], "hooks": {}}'],
+	])("refuses a file that repeats a key %s, because a rewrite would drop one of them", async (_label, text) => {
+		put(FILE.claude, text);
+		const before = tree(userHome);
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.config);
+		expect(run.stderr).toContain(path(FILE.claude));
+		expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		expect(tree(userHome)).toEqual(before);
+		expect(read(FILE.claude)).toBe(text);
+	});
+
+	it("sees a repeated key even when one of them is spelled with an escape", async () => {
+		const escaped = `{"${String.fromCharCode(92)}u0068ooks": {}, "hooks": {}}`;
+		put(FILE.claude, escaped);
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.config);
+		expect(read(FILE.claude)).toBe(escaped);
+	});
+
+	it("control: the same key name in different objects is fine", async () => {
+		put(FILE.claude, '{"a": {"x": 1}, "b": {"x": 2}, "list": [{"k": 1}, {"k": 2}], "hooks": {}}');
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		expect((readJson(FILE.claude) as { b: unknown }).b).toEqual({ x: 2 });
+	});
+
+	it("checks a big file in reasonable time, and one nested very deeply is refused or edited, never a crash", async () => {
+		const numbers = Array.from({ length: 200_000 }, (_, index) => index * 3).join(",");
+		put(FILE.claude, `{"data": [${numbers}], "hooks": {}}`);
+		const started = Date.now();
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		expect(Date.now() - started).toBeLessThan(8000);
+
+		put(FILE.cursor, `{"deep": ${"[".repeat(50_000)}${"]".repeat(50_000)}, "hooks": {}}`);
+		const run = await install("cursor");
+		expect([EXIT.ok, EXIT.config]).toContain(run.code);
+	});
+});
+
+describe("agx link install: a file that should not be replaced", () => {
+	it("refuses a read-only file (and says so on a dry run) instead of replacing it", async () => {
+		const text = JSON.stringify({ permissions: {} }, null, 2);
+		put(FILE.claude, text, 0o444);
+		const before = tree(userHome);
+		for (const args of [[], ["--dry-run"]]) {
+			const run = await install("claude", ...args);
+			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr).toContain(path(FILE.claude));
+			expect(run.stderr.toLowerCase()).toContain("read-only");
+			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		}
+		expect(tree(userHome)).toEqual(before);
+		expect(read(FILE.claude)).toBe(text);
+		expect(statSync(path(FILE.claude)).mode & 0o777).toBe(0o444);
+	});
+
+	it("still says a read-only file is already installed when it is, since nothing would be written", async () => {
+		await install("claude");
+		chmodSync(path(FILE.claude), 0o444);
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.ok);
+		expect(run.stdout.toLowerCase()).toContain("already installed");
+	});
+
+	it("refuses a file that has another hard link, because replacing it would leave the other name with the old content", async () => {
+		const text = JSON.stringify({ permissions: {} }, null, 2);
+		put(FILE.claude, text);
+		linkSync(path(FILE.claude), path("backup-of-settings.json"));
+		const before = tree(userHome);
+		for (const args of [[], ["--dry-run"]]) {
+			const run = await install("claude", ...args);
+			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr).toContain(path(FILE.claude));
+			expect(run.stderr.toLowerCase()).toContain("hard link");
+			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		}
+		expect(tree(userHome)).toEqual(before);
+		expect(statSync(path(FILE.claude)).nlink).toBe(2);
+	});
+
+	it("control: a file with one link is replaced, and writing a file whose name is a symbolic link still works", async () => {
+		put(FILE.claude, "{}");
+		expect(statSync(path(FILE.claude)).nlink).toBe(1);
+		expect((await install("claude")).code).toBe(EXIT.ok);
+	});
+});
+
+describe("agx link install: two installs at once, and a lock that was left behind", () => {
+	const LOCK = ".claude/.settings.json.agx-lock";
+	let holder: ReturnType<typeof spawn> | undefined;
+
+	afterEach(() => {
+		// Only the process this test started.
+		if (holder?.pid !== undefined && holder.exitCode === null) {
+			holder.kill("SIGKILL");
+		}
+		holder = undefined;
+	});
+
+	function liveProcess(): number {
+		holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+		if (holder.pid === undefined) {
+			throw new Error("the helper process did not start");
+		}
+		return holder.pid;
+	}
+
+	function deadPid(): number {
+		const done = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
+		return Number(done.stdout);
+	}
+
+	function lockFor(pid: number): void {
+		put(LOCK, `${JSON.stringify({ pid, token: "left-by-a-test" })}\n`);
+	}
+
+	it("leaves no lock file behind after a write, a refusal or a failed write", async () => {
+		await install("claude");
+		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
+		put(FILE.cursor, JSON.stringify({ hooks: { stop: [{ command: "npx agx hook stop" }] } }));
+		await install("cursor");
+		expect(readdirSync(path(".cursor"))).toEqual(["hooks.json"]);
+	});
+
+	it("takes over a lock whose process is gone, at once", async () => {
+		put(FILE.claude, JSON.stringify({ hooks: { Stop: [group("./done.sh")] } }, null, 2));
+		lockFor(deadPid());
+		const started = Date.now();
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.ok);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
+		expect((readJson(FILE.claude) as { hooks: Record<string, unknown[]> }).hooks.Stop).toHaveLength(2);
+	});
+
+	it("takes over a lock that is old, even when a process with that number exists (a number can be reused)", async () => {
+		put(FILE.claude, "{}");
+		lockFor(liveProcess());
+		const old = new Date(Date.now() - 10 * 60 * 1000);
+		utimesSync(path(LOCK), old, old);
+		const started = Date.now();
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		expect(Date.now() - started).toBeLessThan(2000);
+		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
+	});
+
+	it("takes over a lock file it cannot read, once it is old", async () => {
+		put(FILE.claude, "{}");
+		put(LOCK, "not json at all");
+		const old = new Date(Date.now() - 10 * 60 * 1000);
+		utimesSync(path(LOCK), old, old);
+		expect((await install("claude")).code).toBe(EXIT.ok);
+	});
+
+	it("waits a bounded time for a live install and then refuses, changing nothing and leaving that lock alone", () => {
+		put(FILE.claude, "{}");
+		lockFor(liveProcess());
+		const before = tree(userHome);
+		const started = Date.now();
+		let error: unknown;
+		try {
+			linkInstallCommand({ agent: "claude" }, { lockWaitMs: 400 });
+		} catch (caught) {
+			error = caught;
+		}
+		const waited = Date.now() - started;
+		expect(error).toBeInstanceOf(AgxCliError);
+		expect((error as AgxCliError).exitCode).toBe(EXIT.config);
+		expect((error as AgxCliError).message.toLowerCase()).toContain("nothing was changed");
+		expect(waited).toBeGreaterThanOrEqual(300);
+		expect(waited).toBeLessThan(4000);
+		expect(tree(userHome)).toEqual(before);
+	});
+
+	it("goes on when the other install finishes while it waits", async () => {
+		put(FILE.claude, "{}");
+		const pid = liveProcess();
+		lockFor(pid);
+		// The other "install" removes its lock after a moment.
+		spawn(process.execPath, ["-e", `setTimeout(() => require("node:fs").unlinkSync(${JSON.stringify(path(LOCK))}), 300)`], { stdio: "ignore" });
+		const started = Date.now();
+		const { stdout } = await capture(async () => linkInstallCommand({ agent: "claude" }));
+		expect(Date.now() - started).toBeGreaterThanOrEqual(200);
+		expect(stdout).toContain("Updated");
+		expect(readJson(FILE.claude)).toEqual(expected("claude"));
+		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
+	});
+
+	it("reads the file again once it holds the lock, so what another tool saved in between is kept", async () => {
+		put(FILE.claude, JSON.stringify({ hooks: { Stop: [group("./first.sh")] } }, null, 2));
+		const changed = { theme: "dark", hooks: { Stop: [group("./first.sh"), group("./second.sh")] } };
+		await capture(async () =>
+			linkInstallCommand({ agent: "claude" }, { afterFirstRead: () => writeFileSync(path(FILE.claude), JSON.stringify(changed, null, 2)) }),
+		);
+		const after = readJson(FILE.claude) as { theme: string; hooks: Record<string, unknown[]> };
+		expect(after.theme).toBe("dark");
+		expect(after.hooks.Stop).toEqual([group("./first.sh"), group("./second.sh"), group(command("stop", "claude"))]);
+		expect(after.hooks.SessionStart).toEqual([group(command("session-start", "claude"))]);
+	});
+
+	it("says it is already installed when another install finished the same entries in between, and adds nothing twice", async () => {
+		put(FILE.claude, "{}");
+		const { stdout } = await capture(async () =>
+			linkInstallCommand({ agent: "claude" }, { afterFirstRead: () => writeFileSync(path(FILE.claude), JSON.stringify(expected("claude"), null, 2)) }),
+		);
+		expect(stdout.toLowerCase()).toContain("already installed");
+		expect(readJson(FILE.claude)).toEqual(expected("claude"));
+	});
+
+	it("refuses, and changes nothing, when what another tool wrote in between is a different agx entry", async () => {
+		put(FILE.claude, "{}");
+		const other = { hooks: { Stop: [group("agx --profile other hook stop --host claude")] } };
+		const before = JSON.stringify(other, null, 2);
+		let error: unknown;
+		try {
+			linkInstallCommand({ agent: "claude" }, { afterFirstRead: () => writeFileSync(path(FILE.claude), before) });
+		} catch (caught) {
+			error = caught;
+		}
+		expect((error as AgxCliError).exitCode).toBe(EXIT.config);
+		expect(read(FILE.claude)).toBe(before);
+		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
+	});
+});
+
+describe("agx link install: what it writes and how", () => {
+	it("gives a new file mode 0644 whatever the umask, and keeps an existing file's mode", async () => {
+		const before = process.umask(0o077);
+		try {
+			expect((await install("claude")).code).toBe(EXIT.ok);
+			expect(statSync(path(FILE.claude)).mode & 0o777).toBe(0o644);
+			put(FILE.codex, "{}", 0o640);
+			expect((await install("codex")).code).toBe(EXIT.ok);
+			expect(statSync(path(FILE.codex)).mode & 0o777).toBe(0o640);
+		} finally {
+			process.umask(before);
+		}
+	});
+
+	it("quotes the undo line for the shell when the home folder has spaces and quotes, and the line removes the file", async () => {
+		const home = join(userHome, "it's a home");
+		mkdirSync(home);
+		process.env.HOME = home;
+		process.env.USERPROFILE = home;
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.ok);
+		const file = join(home, ".claude", "settings.json");
+		expect(existsSync(file)).toBe(true);
+		const line = undoLines(run)[0] as string;
+		expect(line).toBe(`Undo: rm '${join(home, ".claude", "settings.json").replaceAll("'", "'\\''")}'`);
+		const removed = spawnSync("sh", ["-c", line.slice("Undo: ".length)], { encoding: "utf8" });
+		expect(removed.status).toBe(0);
+		expect(existsSync(file)).toBe(false);
+		const doc = jsonDocuments((await agx("--json", "link", "install", "--agent", "claude")).stdout)[0] as { undo: string };
+		expect(doc.undo).toBe(`rm '${file.replaceAll("'", "'\\''")}'`);
+	});
+});
+
+describe("agx link install: variables the hook will not see", () => {
+	const warning = (run: CliRun): string[] => run.stdout.split("\n").filter((line) => /AGX_(HOME|PROFILE)/.test(line));
+
+	it("warns in one line when AGX_HOME is set, because the hook command does not carry it", async () => {
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.ok);
+		expect(warning(run)).toHaveLength(1);
+		expect(warning(run)[0]).toContain("AGX_HOME");
+		expect(warning(run)[0]).not.toContain("AGX_PROFILE");
+	});
+
+	it("warns when AGX_PROFILE is set and no --profile is given, and names both when both are set", async () => {
+		delete process.env.AGX_HOME;
+		process.env.AGX_PROFILE = "from-env";
+		const only = await install("claude", "--dry-run");
+		expect(warning(only)).toHaveLength(1);
+		expect(warning(only)[0]).toContain("AGX_PROFILE");
+		process.env.AGX_HOME = box.home;
+		const both = await install("claude", "--dry-run");
+		expect(warning(both)).toHaveLength(1);
+		expect(warning(both)[0]).toContain("AGX_HOME");
+		expect(warning(both)[0]).toContain("AGX_PROFILE");
+	});
+
+	it("does not mention AGX_PROFILE when --profile is given, and prints no warning when neither is set", async () => {
+		delete process.env.AGX_HOME;
+		process.env.AGX_PROFILE = "from-env";
+		const given = await install("claude", "--profile", "work", "--dry-run");
+		expect(warning(given)).toEqual([]);
+		delete process.env.AGX_PROFILE;
+		const none = await install("claude", "--dry-run");
+		expect(warning(none)).toEqual([]);
+		expect(none.stderr).toBe("");
+	});
+
+	it("keeps --json output a single document, with no warning in it", async () => {
+		const run = await agx("--json", "link", "install", "--agent", "claude");
+		expect(run.code).toBe(EXIT.ok);
+		expect(jsonDocuments(run.stdout)).toHaveLength(1);
+		expect(run.stdout).not.toContain("AGX_HOME");
 	});
 });
 
