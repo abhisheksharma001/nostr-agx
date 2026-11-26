@@ -1,8 +1,9 @@
-import { existsSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { toNpub } from "@nostr-agx/nostr";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { updateProfile } from "../lib/config.js";
 import { HOOK_TIME_CAP_MS } from "../lib/hook.js";
 import { profileDir } from "../lib/paths.js";
 import { MessageStore } from "../lib/store/message-store.js";
@@ -12,17 +13,20 @@ import { hookCommand } from "./hook.js";
 /**
  * A hook runs inside the host's turn, so it must give up quickly and quietly:
  * after a fixed time cap it prints nothing and returns, whatever it was waiting
- * for. The only thing it can wait for is the host's own input on stdin.
+ * for. The only thing it can wait for is the host's own input on stdin, which a `stop`
+ * hook reads on every host (the loop guard lives in it) and the other events never read.
  */
 
 const PEER = toNpub("11".repeat(32));
+const THREAD = "00000000-0000-4000-8000-00000000000a";
 
 let box: ReturnType<typeof sandbox>;
 
 beforeEach(() => {
 	box = sandbox();
+	updateProfile("default", { allow: [PEER] });
 	const store = new MessageStore(profileDir("default"));
-	store.addInbound({ id: "in-1", peer: PEER, subject: null, contextId: "thread-a", text: "BODY-MARKER-5512", at: new Date().toISOString() });
+	store.addInbound({ id: "in-1", peer: PEER, subject: null, contextId: THREAD, text: "BODY-MARKER-5512", at: new Date().toISOString() });
 	store.flush();
 });
 
@@ -92,12 +96,42 @@ describe("agx hook: the time cap", () => {
 		expect(JSON.parse(stdout)).toHaveProperty("followup_message");
 	});
 
-	it("does not wait for stdin at all for a host whose hook ignores it", async () => {
-		const stream = silentStream();
-		const started = Date.now();
-		const { stdout } = await capture(() => hookCommand("stop", { host: "claude" }, { stdin: stream, capMs: 5000 }));
-		expect(Date.now() - started).toBeLessThan(1500);
-		expect(JSON.parse(stdout)).toMatchObject({ decision: "block" });
-		stream.destroy();
+	it("a Claude Code or Codex stop hook gives up the same way on a host that never closes stdin", async () => {
+		for (const host of ["claude", "codex"] as const) {
+			const stream = silentStream();
+			const started = Date.now();
+			const { stdout, stderr } = await capture(() => hookCommand("stop", { host }, { stdin: stream, capMs: 60 }));
+			expect(Date.now() - started).toBeLessThan(2000);
+			expect(stdout).toBe("");
+			expect(stderr).toBe("");
+			expect(existsSync(join(profileDir("default"), `hook-nudged-${host}.json`))).toBe(false);
+			expect(stream.destroyed).toBe(true);
+		}
+	});
+
+	it("a Claude Code or Codex stop hook nudges when the input arrives before the cap", async () => {
+		for (const host of ["claude", "codex"] as const) {
+			const stream = Readable.from([Buffer.from(JSON.stringify({ hook_event_name: "Stop", stop_hook_active: false }))]);
+			const { stdout } = await capture(() => hookCommand("stop", { host }, { stdin: stream, capMs: 5000 }));
+			expect(JSON.parse(stdout)).toMatchObject({ decision: "block" });
+		}
+	});
+
+	it("never waits for stdin on session-start or prompt, whatever the host", async () => {
+		for (const [event, host] of [
+			["session-start", "claude"],
+			["session-start", "codex"],
+			["session-start", "cursor"],
+			["prompt", "claude"],
+			["prompt", "codex"],
+		] as const) {
+			rmSync(join(profileDir("default"), `hook-nudged-${host}.json`), { force: true });
+			const stream = silentStream();
+			const started = Date.now();
+			const { stdout } = await capture(() => hookCommand(event, { host }, { stdin: stream, capMs: 5000 }));
+			expect(Date.now() - started).toBeLessThan(1500);
+			expect(stdout).not.toBe("");
+			stream.destroy();
+		}
 	});
 });
