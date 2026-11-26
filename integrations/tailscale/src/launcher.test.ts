@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -361,6 +362,209 @@ describe("the default state directory", () => {
 			await rm(named, { recursive: true, force: true });
 		}
 	});
+});
+
+/** The package folder (where `tsx` is installed) and the launcher source a child process loads. */
+const PACKAGE_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const LAUNCHER_SOURCE = fileURLToPath(new URL("./launcher.ts", import.meta.url));
+
+/**
+ * A stand-in launcher that writes a file into its `--state-dir` (as the real one
+ * writes the node's keys), reports a proxy, and ends when its stdin closes.
+ */
+async function stateWritingBinary(): Promise<{ dir: string; path: string }> {
+	const dir = await mkdtemp(join(tmpdir(), "agx-launcher-writer-"));
+	const path = join(dir, "fake-agx-tailscale");
+	await writeFile(
+		path,
+		`#!${process.execPath}\n` +
+			`const args = process.argv.slice(2);\n` +
+			`const dir = args[args.indexOf("--state-dir") + 1];\n` +
+			`require("fs").writeFileSync(require("path").join(dir, "tailscaled.state"), "stand-in state, not a key\\n");\n` +
+			`console.log("socks5://agx:secret@127.0.0.1:43240");\n` +
+			`process.stdin.resume();\n` +
+			`process.stdin.on("end", () => process.exit(0));\n`,
+		{ mode: 0o755 },
+	);
+	await chmod(path, 0o755);
+	return { dir, path };
+}
+
+/** What a host process that started a launcher leaves in its temporary folder. */
+interface EndedHost {
+	code: number | null;
+	signal: NodeJS.Signals | null;
+	/** Folders named like a launcher's own state directory. */
+	leftover: string[];
+	scratch: string;
+}
+
+/**
+ * Run a small host process (loaded with `tsx`) that starts the launcher with
+ * `options` and ends the way `ending` says: "exit" calls process.exit(), "throw"
+ * lets an exception go uncaught, "reject" lets a rejection go unhandled, "stop"
+ * awaits stop() first; any other ending waits to be sent `signal`. The host's
+ * temporary folder is a scratch folder, so what it leaves behind can be listed.
+ */
+async function endHost(
+	ending: "exit" | "throw" | "reject" | "stop" | "signal",
+	options: { stateDir?: string; signal?: NodeJS.Signals } = {},
+): Promise<EndedHost> {
+	const scratch = await mkdtemp(join(tmpdir(), "agx-launcher-host-"));
+	const writer = await stateWritingBinary();
+	const script = join(writer.dir, "host.mts");
+	await writeFile(
+		script,
+		`import { startBundledTailscale } from ${JSON.stringify(LAUNCHER_SOURCE)};\n` +
+			`const [ending, binary, stateDir] = process.argv.slice(2);\n` +
+			`const proxy = await startBundledTailscale({ binary, stateDir: stateDir || undefined, timeoutMs: 20_000 });\n` +
+			`process.stdout.write("READY\\n");\n` +
+			`if (ending === "exit") process.exit(0);\n` +
+			`else if (ending === "throw") setTimeout(() => { throw new Error("host failed"); }, 0);\n` +
+			`else if (ending === "reject") void Promise.reject(new Error("host failed"));\n` +
+			`else if (ending === "stop") { await proxy.stop(); process.exit(0); }\n` +
+			`else setInterval(() => {}, 1_000);\n`,
+	);
+	const host = spawn(
+		process.execPath,
+		["--import", "tsx", script, ending, writer.path, options.stateDir ?? ""],
+		{ cwd: PACKAGE_ROOT, env: { ...process.env, TMPDIR: scratch }, stdio: ["ignore", "pipe", "pipe"] },
+	);
+	let stdout = "";
+	let stderr = "";
+	host.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+	host.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+	const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+		host.once("close", (code, signal) => resolve({ code, signal })),
+	);
+	try {
+		if (ending === "signal") {
+			await within(
+				(async () => {
+					await until(() => stdout.includes("READY") || host.exitCode !== null, 20_000);
+					if (!stdout.includes("READY")) throw new Error(`host never got ready: ${stderr}`);
+				})(),
+				"the host process",
+				25_000,
+			);
+			host.kill(options.signal ?? "SIGTERM");
+		}
+		const result = await within(closed, "the host process ending", 25_000);
+		if (ending !== "signal" && !stdout.includes("READY")) {
+			throw new Error(`host never got ready: ${stderr}`);
+		}
+		const leftover = (await readdir(scratch)).filter((name) => name.startsWith("agx-tailscale-"));
+		return { ...result, leftover, scratch };
+	} finally {
+		if (host.exitCode === null && host.signalCode === null) host.kill("SIGKILL");
+		await rm(writer.dir, { recursive: true, force: true });
+	}
+}
+
+describe("the default state directory when the whole process ends", () => {
+	// What the directory holds is the node's private keys, so it is only ever
+	// the launcher's own, and these endings are the ones a host can end in.
+	it.skipIf(!posix).each([
+		["calls process.exit()", "exit"],
+		["lets an exception go uncaught", "throw"],
+		["lets a promise rejection go unhandled", "reject"],
+	] as const)("is deleted when the host %s", async (_what, ending) => {
+		const ended = await endHost(ending);
+		try {
+			expect(ended.leftover, `left behind in ${ended.scratch}`).toEqual([]);
+		} finally {
+			await rm(ended.scratch, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it.skipIf(!posix)("is deleted when the host awaits stop() and then ends", async () => {
+		const ended = await endHost("stop");
+		try {
+			expect(ended.code).toBe(0);
+			expect(ended.leftover).toEqual([]);
+		} finally {
+			await rm(ended.scratch, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	// Signals with no handler end a process without running its exit listeners,
+	// and nothing can run after SIGKILL. A host that wants the directory removed
+	// there handles the signal itself and calls stop() (or process.exit()).
+	it.skipIf(!posix).each(["SIGINT", "SIGTERM", "SIGHUP", "SIGKILL"] as const)(
+		"is left behind, private, when the host is ended by %s with no handler",
+		async (signal) => {
+			const ended = await endHost("signal", { signal });
+			try {
+				expect(ended.signal).toBe(signal);
+				expect(ended.leftover).toHaveLength(1);
+				const dir = join(ended.scratch, ended.leftover[0]!);
+				expect((await stat(dir)).mode & 0o777).toBe(0o700);
+				expect(existsSync(join(dir, "tailscaled.state"))).toBe(true);
+			} finally {
+				await rm(ended.scratch, { recursive: true, force: true });
+			}
+		},
+		60_000,
+	);
+
+	it.skipIf(!posix)("never deletes a directory the caller named, when the host ends", async () => {
+		const named = await mkdtemp(join(tmpdir(), "agx-launcher-named-state-"));
+		let ended: EndedHost | undefined;
+		try {
+			ended = await endHost("exit", { stateDir: named });
+			expect(ended.leftover).toEqual([]);
+			expect(existsSync(join(named, "tailscaled.state"))).toBe(true);
+		} finally {
+			if (ended) await rm(ended.scratch, { recursive: true, force: true });
+			await rm(named, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it.skipIf(!posix)(
+		"registers one exit listener however many handles run, and drops it with the last one",
+		async () => {
+			const fake = await recordingBinary(RUNNING);
+			const named = await mkdtemp(join(tmpdir(), "agx-launcher-named-state-"));
+			const before = process.listenerCount("exit");
+			const proxies: Awaited<ReturnType<typeof startBundledTailscale>>[] = [];
+			try {
+				// A directory the caller names is never this module's to remove.
+				const kept = await startBundledTailscale({
+					binary: fake.path,
+					stateDir: named,
+					timeoutMs: 5_000,
+				});
+				expect(process.listenerCount("exit")).toBe(before);
+				await kept.stop();
+
+				for (let i = 0; i < 4; i++) {
+					proxies.push(await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 }));
+				}
+				expect(process.listenerCount("exit")).toBe(before + 1);
+				await proxies[0]!.stop();
+				await proxies[1]!.stop();
+				expect(process.listenerCount("exit")).toBe(before + 1);
+				await proxies[2]!.stop();
+				await proxies[3]!.stop();
+				expect(process.listenerCount("exit")).toBe(before);
+
+				// A start that fails leaves no listener behind either.
+				const failing = await recordingBinary("exit 3\n");
+				try {
+					await expect(
+						startBundledTailscale({ binary: failing.path, timeoutMs: 5_000 }),
+					).rejects.toThrow(/exited before reporting/);
+					expect(process.listenerCount("exit")).toBe(before);
+				} finally {
+					await rm(failing.dir, { recursive: true, force: true });
+				}
+			} finally {
+				for (const proxy of proxies) await proxy.stop();
+				await rm(fake.dir, { recursive: true, force: true });
+				await rm(named, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe("the exit notice", () => {
