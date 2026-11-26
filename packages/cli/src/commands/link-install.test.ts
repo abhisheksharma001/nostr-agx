@@ -710,6 +710,7 @@ describe("agx link install: content a rewrite would change", () => {
 		["a number too small to keep", "1e-400"],
 		["a long decimal that would be shortened", "0.1000000000000000055511151231257827"],
 		["a huge integer", "123456789012345678901234567890"],
+		["a number with an exponent that cannot be kept", "5e-324123"],
 	])("refuses a file with %s, names the file, echoes nothing from it and changes nothing", async (_label, number) => {
 		const text = hooksFile(`"big": ${number}`);
 		put(FILE.claude, text);
@@ -726,7 +727,7 @@ describe("agx link install: content a rewrite would change", () => {
 	});
 
 	it("keeps every number whose value survives, whatever its spelling", async () => {
-		const text = hooksFile('"timeout": 1.0, "n": 1e5, "safe": 9007199254740991, "neg": -0.5, "cap": 1E3, "zero": -0, "tiny": 0.000001, "exp": 2.5e-3');
+		const text = hooksFile('"timeout": 1.0, "n": 1e5, "safe": 9007199254740991, "neg": -0.5, "cap": 1E3, "zero": 0, "tiny": 0.000001, "exp": 2.5e-3');
 		put(FILE.claude, text);
 		expect((await install("claude")).code).toBe(EXIT.ok);
 		const after = readJson(FILE.claude) as Record<string, unknown>;
@@ -734,6 +735,15 @@ describe("agx link install: content a rewrite would change", () => {
 		for (const key of ["timeout", "n", "safe", "neg", "cap", "zero", "tiny", "exp"]) {
 			expect(after[key]).toBe(before[key]);
 		}
+	});
+
+	it("refuses negative zero, which JSON.stringify would write as 0", async () => {
+		const text = hooksFile('"offset": -0');
+		put(FILE.claude, text);
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.config);
+		expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		expect(read(FILE.claude)).toBe(text);
 	});
 
 	it("does not mistake text inside a string for a number or a repeated key", async () => {
@@ -774,16 +784,28 @@ describe("agx link install: content a rewrite would change", () => {
 		expect((readJson(FILE.claude) as { b: unknown }).b).toEqual({ x: 2 });
 	});
 
-	it("checks a big file in reasonable time, and one nested very deeply is refused or edited, never a crash", async () => {
+	it("checks a big file in reasonable time, and refuses one nested absurdly deep instead of overflowing the stack", async () => {
 		const numbers = Array.from({ length: 200_000 }, (_, index) => index * 3).join(",");
 		put(FILE.claude, `{"data": [${numbers}], "hooks": {}}`);
 		const started = Date.now();
 		expect((await install("claude")).code).toBe(EXIT.ok);
 		expect(Date.now() - started).toBeLessThan(8000);
 
-		put(FILE.cursor, `{"deep": ${"[".repeat(50_000)}${"]".repeat(50_000)}, "hooks": {}}`);
-		const run = await install("cursor");
-		expect([EXIT.ok, EXIT.config]).toContain(run.code);
+		const deep = `{"deep": ${"[".repeat(50_000)}${"]".repeat(50_000)}, "hooks": {}}`;
+		put(FILE.cursor, deep);
+		for (const args of [[], ["--dry-run"]]) {
+			const run = await install("cursor", ...args);
+			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr).toContain(path(FILE.cursor));
+			expect(run.stderr.toLowerCase()).toContain("nested");
+			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+		}
+		expect(read(FILE.cursor)).toBe(deep);
+	});
+
+	it("still edits a file nested a few levels deep", async () => {
+		put(FILE.cursor, `{"version": 1, "extra": ${"[".repeat(150)}${"]".repeat(150)}, "hooks": {}}`);
+		expect((await install("cursor")).code).toBe(EXIT.ok);
 	});
 });
 

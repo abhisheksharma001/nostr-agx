@@ -1,8 +1,11 @@
 import { randomBytes } from "node:crypto";
 import {
 	chmodSync,
+	closeSync,
+	fsyncSync,
 	lstatSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	realpathSync,
 	renameSync,
@@ -14,7 +17,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { AgxCliError, EXIT, usageError } from "../lib/errors.js";
 import { type HookEvent, type HookHost, isHookProfileName } from "../lib/hook.js";
-import { heading, info, json, ok, say, table } from "../lib/output.js";
+import { heading, info, json, ok, say, table, warn } from "../lib/output.js";
 
 export const LINK_INSTALL_SCHEMA = "agx.link.install/1";
 
@@ -24,6 +27,18 @@ export interface LinkInstallOptions {
 	/** The global `--profile`: written into the hook commands only when given. */
 	profile?: string;
 }
+
+/** Tests only: a shorter wait for another install's lock, and a step between the first read and the lock. */
+export interface LinkInstallDeps {
+	lockWaitMs?: number;
+	afterFirstRead?: () => void;
+}
+
+/** How long to wait for another `agx link install` that is changing the same file. */
+const LOCK_WAIT_MS = 5000;
+
+/** A lock older than this is left over from a run that never finished: its process may be gone, or its number reused. */
+const LOCK_STALE_MS = 60_000;
 
 /**
  * The hook entries each host gets: the host's own name for the event, and the
@@ -72,7 +87,10 @@ function refusal(message: string, remediation: string): AgxCliError {
 function configFile(host: HookHost): string {
 	const home = homedir();
 	if (host === "claude") {
-		return join(home, ".claude", "settings.json");
+		// $CLAUDE_CONFIG_DIR replaces ~/.claude: "All settings, session history, and plugins are stored under this
+		// path" (https://code.claude.com/docs/en/env-vars, read 2026-11-26).
+		const configDir = process.env.CLAUDE_CONFIG_DIR;
+		return join(configDir ? resolve(configDir) : join(home, ".claude"), "settings.json");
 	}
 	if (host === "cursor") {
 		return join(home, ".cursor", "hooks.json");
@@ -88,6 +106,8 @@ interface Loaded {
 	/** Null when there is no file yet. */
 	text: string | null;
 	mode: number | null;
+	/** How many names the file has (hard links); 0 when there is no file. */
+	links: number;
 }
 
 function load(file: string): Loaded {
@@ -97,7 +117,7 @@ function load(file: string): Loaded {
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "ENOENT" || code === "ENOTDIR") {
-			return { target: file, text: null, mode: null };
+			return { target: file, text: null, mode: null, links: 0 };
 		}
 		throw refusal(`Cannot look at ${file} (${code ?? "error"}).`, "Check the permissions of that file and run this again.");
 	}
@@ -111,7 +131,8 @@ function load(file: string): Loaded {
 	}
 	try {
 		// A folder, or a file with no read permission, fails here.
-		return { target, text: readFileSync(target, "utf8"), mode: statSync(target).mode & 0o777 };
+		const stat = statSync(target);
+		return { target, text: readFileSync(target, "utf8"), mode: stat.mode & 0o777, links: stat.nlink };
 	} catch {
 		throw refusal(`Cannot read ${target} as a file.`, "Check what is there and its permissions, then run this again.");
 	}
@@ -130,22 +151,115 @@ function parse(text: string | null, file: string): Json {
 	if (!isObject(value)) {
 		throw refusal(`${file} does not hold a JSON object, so agx will not edit it.`, "Fix the file by hand, or add the entries yourself: see docs/hooks.md.");
 	}
+	// Writing the file back is a JSON rewrite: say no to content that a rewrite would change.
+	const lossy = lossyContent(text);
+	if (lossy === "deep") {
+		throw refusal(`${file} is nested more than ${MAX_DEPTH} levels deep, which is far past any hook file, so agx will not edit it.`, "Add the entries yourself: see docs/hooks.md.");
+	}
+	if (lossy === "number") {
+		throw refusal(`${file} holds a number that agx cannot write back exactly (too large, too small or too precise), so it will not edit it.`, "Add the entries yourself: see docs/hooks.md.");
+	}
+	if (lossy === "key") {
+		throw refusal(`${file} repeats a key inside one object, which a rewrite would collapse into one, so agx will not edit it.`, "Fix the file by hand, or add the entries yourself: see docs/hooks.md.");
+	}
 	return value;
 }
 
-/**
- * Whether a hook command is an agx hook: its first word, after any `NAME=value`
- * prefixes, is a program called `agx` (with or without a folder in front), and
- * `hook` is one of the words after it. Another tool's command that only mentions
- * agx does not count.
- */
-function isAgxHookCommand(command: string): boolean {
-	const words = command.trim().split(/\s+/);
-	while (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0] ?? "")) {
-		words.shift();
+/** A number as `digits` and a power of ten, so that two spellings of one value compare equal. */
+function canonicalNumber(token: string): string {
+	const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(token);
+	if (match === null) {
+		return token;
 	}
-	const program = (words.shift() ?? "").split(/[\\/]/).pop();
-	return program === "agx" && words.includes("hook");
+	const [, sign = "", whole = "", fraction = "", exponent = "0"] = match;
+	const digits = `${whole}${fraction}`.replace(/^0+/, "");
+	if (digits === "") {
+		return "0";
+	}
+	const trimmed = digits.replace(/0+$/, "");
+	return `${sign}${trimmed}e${Number(exponent) - fraction.length + (digits.length - trimmed.length)}`;
+}
+
+/** Whether a number written as `token` comes back with the same value after JSON.parse and JSON.stringify. */
+function numberSurvives(token: string): boolean {
+	const value = Number(token);
+	// JSON.stringify writes -0 as 0.
+	return Number.isFinite(value) && !Object.is(value, -0) && canonicalNumber(token) === canonicalNumber(JSON.stringify(value));
+}
+
+/** No hook file nests this deep; a bigger number is a file built to overflow the stack of whatever rewrites it. */
+const MAX_DEPTH = 200;
+
+const NUMBER_TOKEN = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+const WORD_TOKEN = /true|false|null/y;
+
+/**
+ * What writing this JSON text back would change besides the entries added: a number whose
+ * value does not survive (`12345678901234567890`, `1e400`) or a key repeated in one object (the
+ * parser keeps the last). Assumes the text is valid JSON. One pass, no recursion, so a file nested
+ * very deeply costs time and not the stack.
+ */
+function lossyContent(text: string): "number" | "key" | "deep" | null {
+	const containers: (Set<string> | null)[] = [];
+	let expectKey = false;
+	let i = 0;
+	while (i < text.length) {
+		const char = text[i] as string;
+		if (char === '"') {
+			let end = i + 1;
+			while (text[end] !== '"') {
+				end += text[end] === "\\" ? 2 : 1;
+			}
+			const keys = containers[containers.length - 1];
+			if (expectKey && keys) {
+				const raw = text.slice(i, end + 1);
+				const key = raw.includes("\\") ? (JSON.parse(raw) as string) : raw.slice(1, -1);
+				if (keys.has(key)) {
+					return "key";
+				}
+				keys.add(key);
+				expectKey = false;
+			}
+			i = end + 1;
+		} else if (char === "{" || char === "[") {
+			containers.push(char === "{" ? new Set() : null);
+			if (containers.length > MAX_DEPTH) {
+				return "deep";
+			}
+			expectKey = char === "{";
+			i++;
+		} else if (char === "}" || char === "]") {
+			containers.pop();
+			expectKey = false;
+			i++;
+		} else if (char === ",") {
+			expectKey = containers[containers.length - 1] instanceof Set;
+			i++;
+		} else if (char === "-" || (char >= "0" && char <= "9")) {
+			NUMBER_TOKEN.lastIndex = i;
+			const token = NUMBER_TOKEN.exec(text)?.[0] ?? char;
+			if (!numberSurvives(token)) {
+				return "number";
+			}
+			i += token.length;
+		} else if (char === "t" || char === "f" || char === "n") {
+			WORD_TOKEN.lastIndex = i;
+			i += WORD_TOKEN.exec(text)?.[0].length ?? 1;
+		} else {
+			i++;
+		}
+	}
+	return null;
+}
+
+/**
+ * Whether a hook command mentions agx at all, in any form: a path (with or without spaces), `npx agx`,
+ * `env X=y agx`, `agx.js`, `sh -c '...'`, a folder named for it. Cheap to get wrong in the other
+ * direction, so it errs on the side of refusing: the one thing worse than a refusal is a second copy
+ * of the hook.
+ */
+function mentionsAgx(command: string): boolean {
+	return /agx/i.test(command);
 }
 
 /** The commands registered under one event, however the host nests them. */
@@ -194,10 +308,9 @@ function plan(host: HookHost, data: Json, profile: string | undefined, file: str
 		if (current !== undefined && !Array.isArray(current)) {
 			throw refusal(`"${event}" in ${file} is not a list, so agx will not edit it.`, "Fix the file by hand, or add the entries yourself: see docs/hooks.md.");
 		}
-		const existing = commandsOf(host, current ?? []).filter(isAgxHookCommand);
-		const different = existing.filter((command) => command !== wanted);
-		if (different.length > 0) {
-			conflicts.push(...different.map((command) => `${event}: ${command}`));
+		const existing = commandsOf(host, current ?? []).filter(mentionsAgx);
+		if (existing.some((command) => command !== wanted)) {
+			conflicts.push(event);
 			continue;
 		}
 		if (existing.length > 0) {
@@ -211,9 +324,10 @@ function plan(host: HookHost, data: Json, profile: string | undefined, file: str
 	}
 
 	if (conflicts.length > 0) {
+		// Which event, never the command: it may hold a secret in an environment prefix or terminal control codes.
 		throw refusal(
-			`${file} already has an agx hook entry that is not the one this would write: ${conflicts.join("; ")}.`,
-			`agx never replaces an entry it did not write this time. To keep it, do nothing. To use the new one, delete the entry from ${file} and run this again.`,
+			`${file} already has an entry under ${conflicts.join(", ")} that mentions agx and is not the one this would write. Its text is not shown, in case it holds a secret.`,
+			`agx never replaces an entry it did not write this time. To keep it, do nothing. To use the new one, delete that entry from ${file} and run this again.`,
 		);
 	}
 	if (added.length === 0) {
@@ -234,27 +348,146 @@ function indentOf(text: string | null): string | number {
 }
 
 function serialize(next: Json, before: string | null): string {
-	const body = JSON.stringify(next, null, indentOf(before));
-	return before === null || before.trim() === "" || before.endsWith("\n") ? `${body}\n` : body;
+	// The file's own line endings: its first line break decides.
+	const eol = before !== null && /\r?\n/.exec(before)?.[0] === "\r\n" ? "\r\n" : "\n";
+	const body = JSON.stringify(next, null, indentOf(before)).replaceAll("\n", eol);
+	return before === null || before.trim() === "" || before.endsWith("\n") ? `${body}${eol}` : body;
 }
 
-/** Replace the file in one rename, keeping its mode, and leave nothing behind when that fails. */
+function writeFailure(target: string, error: unknown): AgxCliError {
+	return new AgxCliError(`Could not write ${target}: ${(error as Error).message}`, {
+		remediation: "The existing file was not replaced. Check the permissions of the folder and run this again.",
+	});
+}
+
+/**
+ * Replace the file in one rename, keeping its mode: the new text is written to a temporary file beside
+ * it and forced to disk first, so a power loss leaves the old file or the new one and never an empty one.
+ * Nothing is left behind when a step fails.
+ */
 function writeFile(target: string, text: string, mode: number | null): void {
-	const folder = dirname(target);
-	const temporary = join(folder, `.${basename(target)}.agx-${process.pid}-${randomBytes(4).toString("hex")}.tmp`);
+	const temporary = join(dirname(target), `.${basename(target)}.agx-${process.pid}-${randomBytes(4).toString("hex")}.tmp`);
 	try {
-		mkdirSync(folder, { recursive: true });
 		// A new file is 0644 whatever the umask; an existing one keeps the mode it had.
 		const finalMode = mode ?? 0o644;
-		writeFileSync(temporary, text, { flag: "wx", mode: finalMode });
+		const fd = openSync(temporary, "wx", finalMode);
+		try {
+			writeFileSync(fd, text);
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
 		chmodSync(temporary, finalMode);
 		renameSync(temporary, target);
 	} catch (error) {
 		rmSync(temporary, { force: true });
-		throw new AgxCliError(`Could not write ${target}: ${(error as Error).message}`, {
-			remediation: "The existing file was not replaced. Check the permissions of the folder and run this again.",
-		});
+		throw writeFailure(target, error);
 	}
+}
+
+function holderIsGone(lockText: string): boolean {
+	try {
+		const pid = (JSON.parse(lockText) as { pid?: unknown }).pid;
+		if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+			return false;
+		}
+		process.kill(pid, 0);
+		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH";
+	}
+}
+
+/** The text of a lock file that no running install holds any more (its process is gone, or it is old), else null. */
+function staleLockText(lock: string): string | null {
+	try {
+		const text = readFileSync(lock, "utf8");
+		const old = Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS;
+		return old || holderIsGone(text) ? text : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Run `run` while this process holds a lock file beside `target`, so two installs at once cannot both read
+ * the file and then each replace it with a version that lacks the other's entries. Waits a bounded time
+ * for another install, and takes over a lock that is left over from one that died.
+ */
+function withLock<T>(target: string, waitMs: number, run: () => T): T {
+	const folder = dirname(target);
+	const lock = join(folder, `.${basename(target)}.agx-lock`);
+	try {
+		mkdirSync(folder, { recursive: true });
+	} catch (error) {
+		throw writeFailure(target, error);
+	}
+	const deadline = Date.now() + waitMs;
+	for (;;) {
+		try {
+			const fd = openSync(lock, "wx", 0o600);
+			try {
+				writeFileSync(fd, `${JSON.stringify({ pid: process.pid })}\n`);
+			} finally {
+				closeSync(fd);
+			}
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+				throw writeFailure(target, error);
+			}
+			const stale = staleLockText(lock);
+			if (stale !== null) {
+				// Only the lock that was judged left over is removed: one another run made since stays.
+				try {
+					if (readFileSync(lock, "utf8") === stale) {
+						rmSync(lock, { force: true });
+					}
+				} catch {
+					// Gone already.
+				}
+				continue;
+			}
+			if (Date.now() >= deadline) {
+				throw refusal(
+					`Another agx link install seems to be changing ${target} (it holds ${lock}).`,
+					`Run this again in a moment. If no such command is running, delete ${lock}.`,
+				);
+			}
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+		}
+	}
+	try {
+		return run();
+	} finally {
+		rmSync(lock, { force: true });
+	}
+}
+
+interface Prepared {
+	loaded: Loaded;
+	result: Plan;
+	action: "created" | "updated" | "unchanged";
+}
+
+/** Read the file and work out what it should hold. Throws when it must not be touched, or cannot be replaced. */
+function prepare(host: HookHost, file: string, profile: string | undefined): Prepared {
+	const loaded = load(file);
+	const result = plan(host, parse(loaded.text, file), profile, file);
+	const action = loaded.text === null ? "created" : result.added.length > 0 ? "updated" : "unchanged";
+	if (action === "updated") {
+		// Replacing a file is a rename, which ignores both of these: so they are checked first.
+		if (loaded.mode !== null && (loaded.mode & 0o200) === 0) {
+			throw refusal(`${loaded.target} is read-only, and agx will not replace a file its owner has locked.`, `Make it writable (chmod u+w) or add the entries yourself: see docs/hooks.md.`);
+		}
+		if (loaded.links > 1) {
+			throw refusal(
+				`${loaded.target} has ${loaded.links} hard links, and replacing it would leave the other names with the old content.`,
+				"Add the entries yourself: see docs/hooks.md.",
+			);
+		}
+	}
+	return { loaded, result, action };
 }
 
 /**
@@ -263,7 +496,7 @@ function writeFile(target: string, text: string, mode: number | null): void {
  * entry. It never replaces an entry that differs from the one it would write, it
  * leaves the rest of the file as it was, and with `--dry-run` it writes nothing.
  */
-export function linkInstallCommand(options: LinkInstallOptions): void {
+export function linkInstallCommand(options: LinkInstallOptions, deps: LinkInstallDeps = {}): void {
 	const host = options.agent;
 	const profile = options.profile;
 	if (profile !== undefined && !isHookProfileName(profile)) {
@@ -272,16 +505,32 @@ export function linkInstallCommand(options: LinkInstallOptions): void {
 			"Use a name made of letters, digits, dots, dashes and underscores, starting with a letter or digit.",
 		);
 	}
+	// The hook command is plain `agx hook ...`: it does not carry these, so an agent started without them reads another profile.
+	const uncarried = [process.env.AGX_HOME ? "AGX_HOME" : null, process.env.AGX_PROFILE && profile === undefined ? "AGX_PROFILE" : null].filter(
+		(name): name is string => name !== null,
+	);
+	if (uncarried.length > 0) {
+		const them = uncarried.length === 1 ? "it" : "them";
+		warn(
+			`${uncarried.join(" and ")} ${uncarried.length === 1 ? "is" : "are"} set in this shell, but the hook commands written here do not carry ${them}: an agent that runs without ${them} reads another profile. Add ${them} to the commands by hand if that matters (see docs/hooks.md).`,
+		);
+	}
 
 	const file = configFile(host);
-	const loaded = load(file);
-	const result = plan(host, parse(loaded.text, file), profile, file);
-	const action = loaded.text === null ? "created" : result.added.length > 0 ? "updated" : "unchanged";
+	let state = prepare(host, file, profile);
 	const dryRun = options.dryRun === true;
-
-	if (action !== "unchanged" && !dryRun) {
-		writeFile(loaded.target, serialize(result.next, loaded.text), loaded.mode);
+	if (state.action !== "unchanged" && !dryRun) {
+		deps.afterFirstRead?.();
+		// Under the lock the file is read and planned again, so a change made since the first read is kept.
+		state = withLock(state.loaded.target, deps.lockWaitMs ?? LOCK_WAIT_MS, () => {
+			const fresh = prepare(host, file, profile);
+			if (fresh.action !== "unchanged") {
+				writeFile(fresh.loaded.target, serialize(fresh.result.next, fresh.loaded.text), fresh.loaded.mode);
+			}
+			return fresh;
+		});
 	}
+	const { action, result } = state;
 
 	const undo =
 		action === "created"
