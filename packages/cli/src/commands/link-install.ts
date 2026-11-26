@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
+	existsSync,
 	fsyncSync,
 	lstatSync,
 	mkdirSync,
@@ -539,9 +540,11 @@ function withLock<T>(target: string, deps: LinkInstallDeps, run: (stillMine: () 
 				continue;
 			}
 			if (Date.now() >= deadline) {
+				// A second file that blocks a takeover is named too, so the message is not about the lock alone.
+				const blocking = existsSync(`${lock}.takeover`) ? ` and ${lock}.takeover` : "";
 				throw refusal(
-					`Another agx link install seems to be changing ${target} (it holds ${lock}).`,
-					`Run this again in a moment. If no such command is running, delete ${lock}.`,
+					`Another agx link install seems to be changing ${target} (it holds ${lock}${blocking}).`,
+					`Run this again in a moment. If no such command is running, delete ${lock}${blocking}.`,
 				);
 			}
 			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
