@@ -117,6 +117,11 @@ async function startSocksProxy(): Promise<SocksProxy> {
 				socket.pipe(upstream);
 				upstream.pipe(socket);
 			});
+			// The connection to the relay is closed with the others in `close()`: a
+			// client that vanishes without a goodbye does not end it, and the relay's
+			// own `close()` waits for every connection that is still open.
+			sockets.add(upstream);
+			upstream.once("close", () => sockets.delete(upstream));
 			upstream.on("error", () => socket.destroy());
 		});
 	});
@@ -337,10 +342,15 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 	});
 
 	afterEach(async () => {
-		endStandIn();
+		// The folder goes first and whatever follows may take time: a hook that runs
+		// out of time must not leave the throwaway home behind.
+		try {
+			endStandIn();
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
 		await socks.close();
 		await relay.close();
-		rmSync(home, { recursive: true, force: true });
 	});
 
 	it("sends through the SOCKS proxy, prints JSON and exits on its own", async () => {
