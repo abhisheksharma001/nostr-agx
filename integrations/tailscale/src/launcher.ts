@@ -157,9 +157,16 @@ export interface BundledTailscaleProxy {
 	 *
 	 * The listener is called once, after the launcher's temporary state directory
 	 * has been deleted. A listener added after the launcher already ended is called
-	 * on the next tick. Returns a function that removes the listener.
+	 * in a microtask, so not before the call to `onExit` returns. Returns a function
+	 * that removes the listener.
+	 *
+	 * A listener that throws does not end the host and does not stop the listeners
+	 * after it: the error is kept in `listenerErrors` and reported as a process
+	 * warning (code `AGX_TAILSCALE_ONEXIT_LISTENER`).
 	 */
 	onExit(listener: (exit: BundledTailscaleExit) => void): () => void;
+	/** The errors thrown by `onExit` listeners so far, oldest first. */
+	readonly listenerErrors: readonly unknown[];
 }
 
 /**
@@ -298,13 +305,27 @@ export async function startBundledTailscale(
 	let stopRequested = false;
 	let endedOnItsOwn: BundledTailscaleExit | undefined;
 	const exitListeners = new Set<(exit: BundledTailscaleExit) => void>();
+	const listenerErrors: unknown[] = [];
+	// A listener belongs to the host. If it throws, the host keeps running and the
+	// listeners after it still hear about the exit.
+	const tell = (listener: (exit: BundledTailscaleExit) => void, exit: BundledTailscaleExit): void => {
+		try {
+			listener(exit);
+		} catch (error) {
+			listenerErrors.push(error);
+			process.emitWarning(
+				`An onExit listener threw: ${error instanceof Error ? error.message : String(error)}`,
+				{ code: "AGX_TAILSCALE_ONEXIT_LISTENER" },
+			);
+		}
+	};
 	const exited = new Promise<void>((resolve) =>
 		child.once("exit", (code, signal) => {
 			removeOwnedStateDir();
 			resolve();
 			if (stopRequested) return;
 			endedOnItsOwn = { code, signal };
-			for (const listener of [...exitListeners]) listener(endedOnItsOwn);
+			for (const listener of [...exitListeners]) tell(listener, endedOnItsOwn);
 		}),
 	);
 	let url: string;
@@ -347,12 +368,13 @@ export async function startBundledTailscale(
 			stopping ??= stopChild(child, stdin, exited);
 			return stopping;
 		},
+		listenerErrors,
 		onExit(listener): () => void {
 			const ended = endedOnItsOwn;
 			if (ended) {
 				let removed = false;
 				queueMicrotask(() => {
-					if (!removed) listener(ended);
+					if (!removed) tell(listener, ended);
 				});
 				return () => {
 					removed = true;
