@@ -170,6 +170,13 @@ describe.skipIf(!posix)("two-agents-auth-key example", () => {
 		}
 	}, RUN_TIMEOUT_MS);
 
+	it("says nothing came on stdin when stdin is empty", async () => {
+		const run = await runExample("two-agents-auth-key.ts", [...relayArgs(), "--auth-key-stdin"], { stdin: "\n" });
+		expect(run.code, run.output).toBe(1);
+		expect(run.output).toContain("No Tailscale auth key was available on stdin.");
+		expect(existsSync(keyFile), "the launcher was started").toBe(false);
+	}, RUN_TIMEOUT_MS);
+
 	it("names stdin, not an argument, as the source of a key it finds malformed", async () => {
 		const words = `tskey-${hex(6)} ${hex(6)}`;
 		const run = await runExample("two-agents-auth-key.ts", [...relayArgs(), "--auth-key-stdin"], {
