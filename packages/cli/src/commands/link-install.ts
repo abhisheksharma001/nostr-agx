@@ -2,7 +2,6 @@ import { randomBytes } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
-	existsSync,
 	fsyncSync,
 	lstatSync,
 	mkdirSync,
@@ -483,6 +482,16 @@ function requireRegularFile(file: string): void {
 	}
 }
 
+/** Whether anything is at `file`, a link to nothing included (a plain existence check follows the link and says no). */
+function lookedAt(file: string): boolean {
+	try {
+		lstatSync(file);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /** The text of a lock file that no running install holds any more (its process is gone, or it is old), else null. */
 function staleLockText(lock: string): string | null {
 	try {
@@ -581,7 +590,7 @@ function withLock<T>(target: string, deps: LinkInstallDeps, run: (stillMine: () 
 			}
 			if (Date.now() >= deadline) {
 				// A second file that blocks a takeover is named too, so the message is not about the lock alone.
-				const blocking = existsSync(`${lock}.takeover`) ? ` and ${lock}.takeover` : "";
+				const blocking = lookedAt(`${lock}.takeover`) ? ` and ${lock}.takeover` : "";
 				throw refusal(
 					`Another agx link install seems to be changing ${target} (it holds ${lock}${blocking}).`,
 					`Run this again in a moment. If no such command is running, delete ${lock}${blocking}.`,
