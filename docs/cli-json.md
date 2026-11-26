@@ -150,7 +150,7 @@ A message is announced once per host: `hook-nudged-<host>.json` in the profile f
 
 ## `agx link install --agent <claude|cursor|codex>`
 
-Adds the `agx hook` entries (see above) to that coding agent's user-level configuration file (Claude Code's is under `CLAUDE_CONFIG_DIR` when that is set). It writes nothing else and never replaces an entry that mentions agx and is not the one it would write (exit `3`, nothing changed, and the command is not printed). It also refuses, with exit `3`, a file it cannot write back exactly, a read-only file and a hard-linked file, and waits up to 5 seconds for another install of the same file. `--dry-run` writes nothing. Which file and what goes in it: [`hooks.md`](hooks.md#agx-link-install).
+Adds the `agx hook` entries (see above) to that coding agent's user-level configuration file (Claude Code's is under `CLAUDE_CONFIG_DIR` when that is set, which must be an absolute path: any other value is refused with exit `3`). It writes nothing else and never replaces an entry that runs agx and is not the one it would write (exit `3`, nothing changed, the host, event and position are named and the command is not printed). A `--profile` that looks like a secret key is refused with exit `2` and not shown. It also refuses, with exit `3`, a file it cannot write back exactly, a read-only file and a hard-linked file, and waits up to 5 seconds for another install of the same file. `--dry-run` writes nothing. Which file and what goes in it: [`hooks.md`](hooks.md#agx-link-install).
 
 `--json` returns `agx.link.install/1`:
 
@@ -164,11 +164,12 @@ Adds the `agx hook` entries (see above) to that coding agent's user-level config
   "action": "created",
   "added": [{ "event": "Stop", "command": "agx hook stop --host claude" }],
   "present": [],
-  "undo": "rm /home/me/.claude/settings.json"
+  "undo": "rm /home/me/.claude/settings.json",
+  "warnings": []
 }
 ```
 
-`action` is `created` (there was no file), `updated` (the file was there; `added` is what was appended) or `unchanged` (every entry was already there; `undo` is `null` and nothing was written). With `dryRun: true` nothing was written and the document is the one a real run would print. `present` lists entries that were there already.
+`action` is `created` (there was no file), `updated` (the file was there; `added` is what was appended) or `unchanged` (every entry was already there; `undo` is `null` and nothing was written). With `dryRun: true` nothing was written and the document is the one a real run would print. `present` lists entries that were there already. `warnings` lists the names (never the values) of `AGX_HOME` and `AGX_PROFILE` when they are set and the hook commands written here do not carry them; it is empty when there is nothing to say.
 
 ## Hosts
 

@@ -417,7 +417,7 @@ agx link install --agent claude --dry-run   # print the change, write nothing
 agx link install --agent claude             # add the entries to ~/.claude/settings.json (or under CLAUDE_CONFIG_DIR)
 ```
 
-`--agent` is `claude`, `cursor` or `codex`; `--profile <name>` makes the hook read that profile. It prints the change and one line to undo it, keeps everything else in the file, and refuses (exit `3`, nothing changed, the entry not printed) when the file already has a command that mentions agx and is not the one it would write, or a file it cannot write back exactly. Details: [docs/hooks.md](../../docs/hooks.md#agx-link-install).
+`--agent` is `claude`, `cursor` or `codex`; `--profile <name>` makes the hook read that profile. It prints the change and one line to undo it, keeps everything else in the file, and refuses (exit `3`, nothing changed, the entry not printed) when the file already has a command that runs agx and is not the one it would write (it names the event and the command's position, not its text), a `CLAUDE_CONFIG_DIR` that is not an absolute path, or a file it cannot write back exactly. A `--profile` that looks like a secret key is refused (exit `2`) and never shown. Details: [docs/hooks.md](../../docs/hooks.md#agx-link-install).
 
 ## Use from Claude Code
 
