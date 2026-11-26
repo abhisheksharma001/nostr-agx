@@ -317,6 +317,11 @@ function targetOf(args: unknown[]): { host: string; port: number | null } {
 	return { host: typeof args[1] === "string" ? args[1] : "localhost", port: Number.isFinite(port) ? port : null };
 }
 
+/** Why a connection to `host`:`port` is stopped, or null when it may go through. */
+export function blockedReason(host: string, port: number | null): ConnectAttempt["blocked"] {
+	return FORBIDDEN_PORTS.has(port ?? -1) ? "port" : LOOPBACK_HOSTS.has(host.toLowerCase()) ? null : "name";
+}
+
 /** The port a `listen(...)` call asks for, or null when it names none (the system then picks a free one) or a socket file. */
 export function listenPortOf(args: unknown[]): number | null {
 	const first = args[0];
@@ -343,7 +348,7 @@ export function guardConnections(): { attempts: ConnectAttempt[]; restore: () =>
 	const realConnect = net.Socket.prototype.connect;
 	const connectSpy = vi.spyOn(net.Socket.prototype, "connect").mockImplementation(function (this: net.Socket, ...args: unknown[]) {
 		const { host, port } = targetOf(args);
-		const blocked: ConnectAttempt["blocked"] = FORBIDDEN_PORTS.has(port ?? -1) ? "port" : LOOPBACK_HOSTS.has(host.toLowerCase()) ? null : "name";
+		const blocked = blockedReason(host, port);
 		attempts.push({ host, port, blocked });
 		if (blocked) {
 			queueMicrotask(() => this.destroy(Object.assign(new Error(`connect ${host}:${port} refused by the canary`), { code: "ECONNREFUSED" })));

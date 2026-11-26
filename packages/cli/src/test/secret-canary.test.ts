@@ -3,7 +3,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createServer, Server as HttpServer } from "node:http";
-import type { AddressInfo } from "node:net";
+import net, { type AddressInfo } from "node:net";
 import { Command, CommanderError } from "commander";
 import { nip19 } from "nostr-tools";
 import WebSocket from "ws";
@@ -19,6 +19,7 @@ import { setStdinForTests } from "../lib/stdin.js";
 import { buildProgram, reportCliError, runCli } from "../program.js";
 import { type RunningRelay, startRelay } from "../relay/server.js";
 import {
+	blockedReason,
 	type CommandNode,
 	changedSince,
 	type ConnectAttempt,
@@ -1411,6 +1412,10 @@ function leakyProgram(): Command {
 	add("connect", async (value) => {
 		await dns.promises.lookup(`${value}.invalid`).catch(() => undefined);
 	});
+	add("socket", (value) => new Promise<void>((resolve) => {
+		const socket = net.connect({ host: `${value}.invalid`, port: 80 });
+		socket.on("error", () => resolve());
+	}));
 	add("remember", (value) => rememberSecret(value));
 	add("clean", () => console.log("all good"));
 	return program;
@@ -1476,6 +1481,7 @@ describe("the secret-key canary", () => {
 			{ command: "file-name", forms: ["nsec", "ncryptsec", "hex", "HEX", "nostr"], channel: "file-name" },
 			{ command: "file-content", forms: FORMS, channel: "file-content" },
 			{ command: "connect", forms: ["nsec", "ncryptsec", "hex", "HEX"], channel: "connect" },
+			{ command: "socket", forms: ["nsec", "ncryptsec", "hex", "HEX"], channel: "connect" },
 		];
 		const here = (channel: Channel, json: boolean): Channel =>
 			json && channel === "stdout" ? "json-stdout" : json && channel === "stderr" ? "json-stderr" : channel;
@@ -1542,6 +1548,17 @@ describe("the secret-key canary", () => {
 			expect(stock.threw).toBeNull();
 			expect([...stock.channels]).toEqual([]);
 		}, LONG);
+
+		it("stops a connection to a port that is never touched, and to any other machine", () => {
+			expect(blockedReason("127.0.0.1", 7447)).toBe("port");
+			expect(blockedReason("localhost", 53505)).toBe("port");
+			expect(blockedReason("::1", 7447)).toBe("port");
+			expect(blockedReason("relay.example.org", 7447)).toBe("port");
+			expect(blockedReason("relay.example.org", 443)).toBe("name");
+			expect(blockedReason("192.0.2.1", 80)).toBe("name");
+			expect(blockedReason("127.0.0.1", 40123)).toBeNull();
+			expect(blockedReason("localhost", null)).toBeNull();
+		});
 
 		it("tells which port a server is asked to listen on", () => {
 			expect(listenPortOf([7447, "127.0.0.1"])).toBe(7447);
