@@ -220,9 +220,8 @@ async function loadSocksProxyAgent(): Promise<{
 	} catch (cause) {
 		const detail = cause instanceof Error ? cause.message : String(cause);
 		throw new RelayProxyError(
-			"Relay proxy support requires the optional socks-proxy-agent package.",
-			"Install it in the host application: npm install socks-proxy-agent. The package could not be loaded because: " +
-				detail,
+			`Relay proxy support could not load the optional socks-proxy-agent package: ${detail}`,
+			"If it is not installed, install it in the host application: npm install socks-proxy-agent. If it is installed and the reason mentions a dynamic require, a bundler has copied it into the bundle: keep socks-proxy-agent out of the bundle (mark it external).",
 			{ cause },
 		);
 	}
