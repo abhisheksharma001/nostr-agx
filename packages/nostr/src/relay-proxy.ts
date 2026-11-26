@@ -248,6 +248,11 @@ function localDnsProxyUrl(url: string): string {
 	if (/^socks4a:/i.test(url)) {
 		return url.replace(/^socks4a:/i, "socks4:");
 	}
+	// `socks:` names no version, and `socks-proxy-agent` reads it as SOCKS5 with
+	// the proxy resolving the name. SOCKS5 with local lookup is what is wanted.
+	if (/^socks:/i.test(url)) {
+		return url.replace(/^socks:/i, "socks5:");
+	}
 	return url;
 }
 
