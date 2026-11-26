@@ -1552,6 +1552,10 @@ describe("what the launcher writes on its stderr", () => {
 			"a CONNECT line's header text",
 			' response (auth "Basic enE3dXNlcjp6cTdwYXNz...(40 total bytes)"): 407',
 		],
+		[
+			"a CONNECT line's header text of another scheme",
+			' response (auth "Negotiate YIIRjwYGKwYBBQUCoIIRIzCC...(1800 total bytes)"): 407',
+		],
 		["a header written out", " sent Proxy-Authorization: Basic enE3dXNlcjp6cTdwYXNz now"],
 		["a loose Basic value", " sent Basic enE3dXNlcjp6cTdwYXNz now"],
 	])(
@@ -1572,7 +1576,7 @@ describe("what the launcher writes on its stderr", () => {
 					try {
 						const text = await waitForCuts(writes, lines);
 						expect(text.split(LINE_CUT)).toHaveLength(lines + 1);
-						expect(text).not.toMatch(/zq|7user|7pass|enE|dXNl|cjp6|cTdw|YXNz/);
+						expect(text).not.toMatch(/zq|7user|7pass|enE|dXNl|cjp6|cTdw|YXNz|YII|Rjw|GKw/);
 					} finally {
 						await proxy.stop();
 					}
