@@ -76,6 +76,20 @@ const AUTH_LOG_VALUE = /\(auth "[^"]{0,120}"\)/g;
 const AUTH_HEADER = /(proxy-authorization):?[^\n\r]*/gi;
 const BASIC_VALUE = /\bBasic[ \t]+[A-Za-z0-9+/]{8,}={0,2}/g;
 
+/**
+ * A short text for whatever a listener threw, with logins masked. A thrown value
+ * can be anything (an object with no prototype, an Error whose message getter
+ * throws), so describing it must never throw.
+ */
+function describeThrown(thrown: unknown): string {
+	try {
+		const text = thrown instanceof Error ? thrown.message : String(thrown);
+		return maskSecrets(typeof text === "string" ? text : "").slice(0, 500);
+	} catch {
+		return "a value that could not be described";
+	}
+}
+
 function maskSecrets(text: string): string {
 	return text
 		.replace(URL_CREDENTIALS, "$1***@")
@@ -353,10 +367,13 @@ export async function startBundledTailscale(
 			listener(exit);
 		} catch (error) {
 			listenerErrors.push(error);
-			process.emitWarning(
-				`An onExit listener threw: ${error instanceof Error ? error.message : String(error)}`,
-				{ code: "AGX_TAILSCALE_ONEXIT_LISTENER" },
-			);
+			try {
+				process.emitWarning(`An onExit listener threw: ${describeThrown(error)}`, {
+					code: "AGX_TAILSCALE_ONEXIT_LISTENER",
+				});
+			} catch {
+				// Reporting is best effort. The host and the other listeners go on.
+			}
 		}
 	};
 	const exited = new Promise<void>((resolve) =>
