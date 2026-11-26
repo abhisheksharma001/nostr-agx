@@ -2,7 +2,7 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	CONFIG_LOCK_STALE_MS,
 	CONFIG_LOCK_UNREADABLE_MS,
@@ -180,6 +180,26 @@ describe("withConfigLock", () => {
 		it("waits on a fresh lock from another host", () => {
 			writeLock({ pid: 1, host: "some-other-container", token: "far" });
 			expect(() => withConfigLock(() => undefined, { waitMs: 100 })).toThrow(/config lock/i);
+		});
+
+		it("waits on a lock whose pid belongs to another user: the process exists, so the lock is held", () => {
+			// `kill(pid, 0)` answers EPERM for a process of another user. Made to happen for one pid, so the test
+			// gives the same answer whoever runs it.
+			const theirs = deadPid();
+			writeLock({ pid: theirs, host: hostname(), token: "other-user" });
+			const kill = process.kill.bind(process);
+			const spy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+				if (pid === theirs && signal === 0) {
+					throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+				}
+				return kill(pid, signal);
+			});
+			try {
+				expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
+			} finally {
+				spy.mockRestore();
+			}
+			expect(JSON.parse(readFileSync(configLockPath(), "utf8")).token).toBe("other-user");
 		});
 	});
 
