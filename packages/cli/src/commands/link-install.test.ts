@@ -18,8 +18,12 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
+import { hexToBytes } from "@nostr-agx/nostr";
+import { nip19 } from "nostr-tools";
+import { encrypt } from "nostr-tools/nip49";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgxCliError, EXIT } from "../lib/errors.js";
+import { createIdentity } from "../lib/identity.js";
 import { setStdinForTests } from "../lib/stdin.js";
 import { agx, type CliRun, capture, jsonDocuments, sandbox } from "../test/helpers.js";
 import { linkInstallCommand } from "./link-install.js";
@@ -274,6 +278,55 @@ describe("agx link install: --profile", () => {
 		const run = await install("claude", "--profile", name);
 		expect(run.code).toBe(EXIT.usage);
 		expect(tree(userHome)).toEqual([]);
+	});
+
+	describe("a profile value that looks like a secret key", () => {
+		const identity = createIdentity();
+		const NSEC = nip19.nsecEncode(hexToBytes(identity.secretKeyHex));
+		const NCRYPTSEC = encrypt(hexToBytes(createIdentity().secretKeyHex), "throwaway-password", 4);
+		const HEX = createIdentity().secretKeyHex;
+
+		/** The first 12-character stretch of `secret` found in `shown`, in any case; null when none. */
+		function leaked(shown: string, secret: string): string | null {
+			const text = shown.toLowerCase();
+			const key = secret.toLowerCase();
+			for (let i = 0; i + 12 <= key.length; i++) {
+				if (text.includes(key.slice(i, i + 12))) {
+					return key.slice(i, i + 12);
+				}
+			}
+			return null;
+		}
+
+		it.each([
+			["an nsec", () => NSEC],
+			["an nsec in upper case", () => NSEC.toUpperCase()],
+			["an ncryptsec", () => NCRYPTSEC],
+			["64 hexadecimal characters", () => HEX],
+			["64 hexadecimal characters in upper case", () => HEX.toUpperCase()],
+			["the start of an nsec", () => "nsec1abc"],
+		])("refuses %s as --profile before anything is written or printed, and never shows it", async (_label, make) => {
+			const value = make();
+			for (const args of [[], ["--dry-run"]]) {
+				const run = await install("claude", "--profile", value, ...args);
+				expect(run.code).toBe(EXIT.usage);
+				expect(run.stderr.toLowerCase()).toContain("secret key");
+				expect(leaked(`${run.stdout}${run.stderr}`, value)).toBeNull();
+				expect(tree(userHome)).toEqual([]);
+			}
+			const json = await agx("--json", "--profile", value, "link", "install", "--agent", "cursor");
+			expect(json.code).toBe(EXIT.usage);
+			expect(leaked(`${json.stdout}${json.stderr}`, value)).toBeNull();
+			expect(tree(userHome)).toEqual([]);
+			expect(existsSync(path(".claude"))).toBe(false);
+			expect(existsSync(path(".cursor"))).toBe(false);
+		});
+
+		it.each(["work", "nsec-notes", "team.sec1", `${"a".repeat(63)}`, `${HEX.slice(0, 63)}`])("still accepts the ordinary profile name %j", async (name) => {
+			const run = await install("claude", "--profile", name);
+			expect(run.code).toBe(EXIT.ok);
+			expect((readJson(FILE.claude) as { hooks: { Stop: { hooks: { command: string }[] }[] } }).hooks.Stop[0]?.hooks[0]?.command).toContain(`--profile ${name} `);
+		});
 	});
 });
 
@@ -591,6 +644,48 @@ describe("agx link install: CLAUDE_CONFIG_DIR", () => {
 		expect(readJson(FILE.claude)).toEqual(expected("claude"));
 	});
 
+	it.each([
+		["a relative path", "secret-rel-folder/cc"],
+		["a path that starts with a dot", "./secret-dot-folder"],
+		["a path in a parent folder", "../secret-up-folder"],
+		["a path that starts with a tilde", "~/secret-tilde-folder"],
+		["only a tilde", "~"],
+		["a single dot", "."],
+		["a space", " "],
+	])("refuses %s, because Claude Code's documentation asks for an absolute path: exit 3, nothing created, the value not printed", async (_label, value) => {
+		process.env.CLAUDE_CONFIG_DIR = value;
+		const before = tree(userHome);
+		for (const args of [[], ["--dry-run"]]) {
+			const run = await install("claude", ...args);
+			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr).toContain("CLAUDE_CONFIG_DIR");
+			expect(run.stderr).toContain("absolute");
+			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
+			if (value.trim().length > 3) {
+				expect(`${run.stdout}${run.stderr}`).not.toContain(value);
+			}
+		}
+		const json = await agx("--json", "link", "install", "--agent", "claude");
+		expect(json.code).toBe(EXIT.config);
+		expect(tree(userHome)).toEqual(before);
+		expect(existsSync(join(resolve(value), "settings.json"))).toBe(false);
+	});
+
+	it("still accepts an absolute path that has a trailing slash or a parent segment", async () => {
+		process.env.CLAUDE_CONFIG_DIR = `${path("work-account")}${sep}`;
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		expect(existsSync(path("work-account/settings.json"))).toBe(true);
+		process.env.CLAUDE_CONFIG_DIR = join(path("other-account"), "x", "..", "cc");
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		expect(existsSync(path("other-account/cc/settings.json"))).toBe(true);
+	});
+
+	it("does not look at CLAUDE_CONFIG_DIR for Cursor or Codex, even when it is relative", async () => {
+		process.env.CLAUDE_CONFIG_DIR = "relative-folder";
+		expect((await install("cursor")).code).toBe(EXIT.ok);
+		expect((await install("codex")).code).toBe(EXIT.ok);
+	});
+
 	it("does not move Cursor's or Codex's file", async () => {
 		process.env.CLAUDE_CONFIG_DIR = path("work-account/claude");
 		expect((await install("cursor")).code).toBe(EXIT.ok);
@@ -601,6 +696,9 @@ describe("agx link install: CLAUDE_CONFIG_DIR", () => {
 	});
 });
 
+/** A backslash, written so that no source file needs the escape. */
+const BS = String.fromCharCode(92);
+
 describe("agx link install: an agx entry in any other form", () => {
 	const MENTIONS: [string, string][] = [
 		["a quoted path with a space", '"/opt/My Tools/agx" hook stop --host claude'],
@@ -610,9 +708,14 @@ describe("agx link install: an agx entry in any other form", () => {
 		["an agx.js script", "/usr/local/bin/agx.js hook stop --host claude"],
 		["sh -c", "sh -c 'agx hook stop --host claude'"],
 		["upper case", "AGX hook stop --host claude"],
-		["only an environment variable", "AGX_HOME=/x ./other.sh"],
-		["a folder named for agx", "/home/me/agx-tools/notify.sh"],
 		["another tool that only says agx", "echo agx hook stop"],
+		["an agx.exe in quotes", '"C:/tools/agx.exe" hook stop --host claude'],
+		["a Windows path to agx.cmd", `C:${BS}tools${BS}agx.cmd hook stop --host claude`],
+		["a command after a semicolon", "cd /x; agx hook stop --host claude"],
+		["a command in a subshell", "(agx hook stop --host claude)"],
+		["a command substitution", "echo $(agx hook stop --host claude)"],
+		["a pipe", "true | agx hook stop --host claude"],
+		["a bare agx", "agx"],
 	];
 
 	it.each(MENTIONS)("refuses when Stop has a command with %s: a different agx entry, not a second copy", async (_label, existing) => {
@@ -625,7 +728,9 @@ describe("agx link install: an agx entry in any other form", () => {
 		expect(run.stderr).toContain("Stop");
 		expect(run.stderr).toContain("different agx entry");
 		expect(run.stderr.toLowerCase()).toContain("nothing was changed");
-		expect(`${run.stdout}${run.stderr}`).not.toContain(existing);
+		if (existing.length > 8) {
+			expect(`${run.stdout}${run.stderr}`).not.toContain(existing);
+		}
 		expect(tree(userHome)).toEqual(before);
 		expect(read(FILE.claude)).toBe(text);
 	});
@@ -649,6 +754,47 @@ describe("agx link install: an agx entry in any other form", () => {
 		expect(run.code).toBe(EXIT.ok);
 		const stop = (readJson(FILE.claude) as { hooks: { Stop: unknown[] } }).hooks.Stop;
 		expect(stop).toEqual([group("./done.sh"), group(command("stop", "claude"))]);
+	});
+
+	it.each([
+		["a name that ends in agx", "tagx --notify"],
+		["a folder that ends in agx", "/home/magx/bin/tool stop"],
+		["a checkout whose name has agx in it", "~/nostr-agx/scripts/lint.sh"],
+		["a word that starts with agx", "agxiom --stop"],
+		["agx inside an upper-case word", "echo AGX_DONE"],
+		["agx inside a file name", "python3 ~/bin/flagxit.py"],
+		["only an environment variable", "AGX_HOME=/x ./other.sh"],
+		["a folder named for agx with more in the name", "/home/me/agx-tools/notify.sh"],
+		["a helper that starts with agx-", "agx-helper --run"],
+	])("does not mistake another tool's hook for an agx entry: %s", async (_label, other) => {
+		put(FILE.claude, JSON.stringify({ hooks: { Stop: [group("./first.sh"), group(other)] } }, null, 2));
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.ok);
+		const stop = (readJson(FILE.claude) as { hooks: { Stop: unknown[] } }).hooks.Stop;
+		expect(stop).toEqual([group("./first.sh"), group(other), group(command("stop", "claude"))]);
+	});
+
+	it("says which host, event and command of that event is the one in the way, without printing it", async () => {
+		const hostile = "AGX_KEY=sk-live-SECRET-1 agx --profile x hook stop --host claude";
+		put(
+			FILE.claude,
+			JSON.stringify({ hooks: { Stop: [group("./first.sh"), group(hostile), group("./third.sh")], SessionStart: [group("npx agx hook session-start --host claude")] } }, null, 2),
+		);
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.config);
+		expect(run.stderr).toContain("(claude)");
+		expect(run.stderr).toContain("Stop (command 2 of 3)");
+		expect(run.stderr).toContain("SessionStart (command 1 of 1)");
+		expect(run.stderr).not.toContain("UserPromptSubmit");
+		expect(`${run.stdout}${run.stderr}`).not.toMatch(/SECRET|sk-live|--profile x|npx/);
+	});
+
+	it("counts the position among the commands of the event for Cursor too", async () => {
+		put(FILE.cursor, JSON.stringify({ version: 1, hooks: { stop: [{ command: "./a.sh" }, { command: "./b.sh" }, { command: "env X=1 agx hook stop --host cursor" }] } }));
+		const run = await install("cursor");
+		expect(run.code).toBe(EXIT.config);
+		expect(run.stderr).toContain("(cursor)");
+		expect(run.stderr).toContain("stop (command 3 of 3)");
 	});
 });
 
@@ -939,6 +1085,33 @@ describe("agx link install: two installs at once, and a lock that was left behin
 		expect(tree(userHome)).toEqual(before);
 	});
 
+	it("does not remove a lock that another install made after this one judged the old lock left over", () => {
+		put(FILE.claude, "{}");
+		lockFor(deadPid());
+		const live = liveProcess();
+		const theirs = `${JSON.stringify({ pid: live, token: "made-in-between" })}\n`;
+		let error: unknown;
+		try {
+			linkInstallCommand(
+				{ agent: "claude" },
+				{
+					lockWaitMs: 400,
+					// Another install takes over the left-over lock first and makes one of its own.
+					afterLockJudged: () => {
+						rmSync(path(LOCK));
+						writeFileSync(path(LOCK), theirs);
+					},
+				},
+			);
+		} catch (caught) {
+			error = caught;
+		}
+		expect((error as AgxCliError).exitCode).toBe(EXIT.config);
+		expect(read(LOCK)).toBe(theirs);
+		expect(read(FILE.claude)).toBe("{}");
+		expect(readdirSync(path(".claude")).sort()).toEqual([".settings.json.agx-lock", "settings.json"]);
+	});
+
 	it("waits a bounded time for a live install and then refuses, changing nothing and leaving that lock alone", () => {
 		put(FILE.claude, "{}");
 		lockFor(liveProcess());
@@ -1055,6 +1228,8 @@ describe("agx link install: variables the hook will not see", () => {
 		expect(warning(run)).toHaveLength(1);
 		expect(warning(run)[0]).toContain("AGX_HOME");
 		expect(warning(run)[0]).not.toContain("AGX_PROFILE");
+		// The name, never the value: it can be a path with a user name in it, or anything else.
+		expect(run.stdout).not.toContain(box.home);
 	});
 
 	it("warns when AGX_PROFILE is set and no --profile is given, and names both when both are set", async () => {
@@ -1068,6 +1243,8 @@ describe("agx link install: variables the hook will not see", () => {
 		expect(warning(both)).toHaveLength(1);
 		expect(warning(both)[0]).toContain("AGX_HOME");
 		expect(warning(both)[0]).toContain("AGX_PROFILE");
+		expect(`${both.stdout}${both.stderr}`).not.toContain("from-env");
+		expect(`${both.stdout}${both.stderr}`).not.toContain(box.home);
 	});
 
 	it("does not mention AGX_PROFILE when --profile is given, and prints no warning when neither is set", async () => {
@@ -1081,11 +1258,23 @@ describe("agx link install: variables the hook will not see", () => {
 		expect(none.stderr).toBe("");
 	});
 
-	it("keeps --json output a single document, with no warning in it", async () => {
+	it("keeps --json output a single document, and names the variables in its warnings field (never their values)", async () => {
 		const run = await agx("--json", "link", "install", "--agent", "claude");
 		expect(run.code).toBe(EXIT.ok);
-		expect(jsonDocuments(run.stdout)).toHaveLength(1);
-		expect(run.stdout).not.toContain("AGX_HOME");
+		const docs = jsonDocuments(run.stdout) as { warnings: string[] }[];
+		expect(docs).toHaveLength(1);
+		expect(docs[0]?.warnings).toEqual(["AGX_HOME"]);
+		expect(run.stdout).not.toContain(box.home);
+		expect(run.stderr).toBe("");
+		delete process.env.AGX_HOME;
+		process.env.AGX_PROFILE = "from-env";
+		const profile = jsonDocuments((await agx("--json", "link", "install", "--agent", "cursor", "--dry-run")).stdout) as { warnings: string[] }[];
+		expect(profile[0]?.warnings).toEqual(["AGX_PROFILE"]);
+		const given = jsonDocuments((await agx("--json", "link", "install", "--agent", "cursor", "--dry-run", "--profile", "work")).stdout) as { warnings: string[] }[];
+		expect(given[0]?.warnings).toEqual([]);
+		delete process.env.AGX_PROFILE;
+		const none = jsonDocuments((await agx("--json", "link", "install", "--agent", "cursor", "--dry-run")).stdout) as { warnings: string[] }[];
+		expect(none[0]?.warnings).toEqual([]);
 	});
 });
 

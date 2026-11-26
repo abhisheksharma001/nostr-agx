@@ -32,6 +32,8 @@ export interface LinkInstallOptions {
 export interface LinkInstallDeps {
 	lockWaitMs?: number;
 	afterFirstRead?: () => void;
+	/** A step between judging a lock left over and taking it over. */
+	afterLockJudged?: () => void;
 }
 
 /** How long to wait for another `agx link install` that is changing the same file. */
