@@ -36,6 +36,36 @@ const INHERITED_ENV = [
 ] as const;
 const BINARY_NAME = process.platform === "win32" ? "agx-tailscale.exe" : "agx-tailscale";
 
+/**
+ * The state directories this module made for handles and has not removed yet.
+ * They hold the node's private keys, so as long as one is left a single listener
+ * on the process "exit" event removes them, synchronously and best effort. That
+ * covers process.exit(), an uncaught exception and an unhandled rejection; a
+ * signal with no handler and SIGKILL end a process without that event.
+ */
+const ownedStateDirs = new Set<string>();
+
+function removeOwnedStateDirsOnExit(): void {
+	for (const dir of ownedStateDirs) {
+		try {
+			rmSync(dir, { recursive: true, force: true });
+		} catch {
+			// Nothing more can be done while the process is ending.
+		}
+	}
+}
+
+function keepOwnedStateDir(dir: string): void {
+	if (ownedStateDirs.size === 0) process.on("exit", removeOwnedStateDirsOnExit);
+	ownedStateDirs.add(dir);
+}
+
+function releaseOwnedStateDir(dir: string): void {
+	if (ownedStateDirs.delete(dir) && ownedStateDirs.size === 0) {
+		process.off("exit", removeOwnedStateDirsOnExit);
+	}
+}
+
 export interface StartBundledTailscaleOptions {
 	/**
 	 * Tailscale auth key, handed to the launcher as TS_AUTHKEY. The launcher does
@@ -49,9 +79,15 @@ export interface StartBundledTailscaleOptions {
 	/**
 	 * Persistent tsnet state directory. A node enrolled in it is reused, and the
 	 * directory is kept when the launcher stops. When omitted, the launcher gets a
-	 * private temporary directory of its own, so two processes never share one node
-	 * identity; it is deleted when the launcher stops. `stop()` is what deletes it:
-	 * a process that is killed outright leaves it behind.
+	 * private temporary directory of its own (`agx-tailscale-XXXXXX` under the
+	 * operating system's temporary folder, mode 0700), so two processes never share
+	 * one node identity. It holds the node's private keys. It is deleted when the
+	 * launcher ends, and when this process exits through process.exit(), an
+	 * uncaught exception or an unhandled rejection. It is left behind when the
+	 * process is ended by SIGKILL or by a signal it has no handler for (SIGINT,
+	 * SIGTERM and SIGHUP by default): this module installs no signal handlers, so a
+	 * host that wants it removed there handles the signal and calls `stop()`.
+	 * A directory you pass is never deleted.
 	 */
 	stateDir?: string;
 	/** Alternative coordination server URL. */
@@ -169,12 +205,15 @@ export async function startBundledTailscale(
 	// state file, and tsnet ignores a new auth key (and its tags) once the state
 	// holds a node.
 	const ownedStateDir = stateDir ? undefined : mkdtempSync(join(tmpdir(), "agx-tailscale-"));
+	if (ownedStateDir) keepOwnedStateDir(ownedStateDir);
 	const removeOwnedStateDir = (): void => {
 		if (!ownedStateDir) return;
 		try {
 			rmSync(ownedStateDir, { recursive: true, force: true });
+			releaseOwnedStateDir(ownedStateDir);
 		} catch {
 			// Best effort: a leftover temporary directory is not worth failing a stop for.
+			// It stays listed, so the exit listener tries once more.
 		}
 	};
 	const args = ["--exit-on-stdin-eof", "--connect-timeout", `${Math.ceil(timeoutMs)}ms`];
