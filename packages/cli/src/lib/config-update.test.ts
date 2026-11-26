@@ -128,4 +128,27 @@ describe("migrateLegacyKeysNow", () => {
 		expect(await holder.sawWaiter).toBe(true);
 		expect(readFileSync(configPath(), "utf8")).not.toContain("ela_OLD");
 	}, PATIENT_TEST_MS);
+
+	it("reads config.json only after it holds the lock, so a change made while it waited is kept", async () => {
+		writeFileSync(
+			configPath(),
+			JSON.stringify({
+				version: 1,
+				currentProfile: "default",
+				profiles: { default: { apiBaseUrl: "http://localhost:3000", apiKey: "ela_OLD", orgSlug: "acme" } },
+			}),
+		);
+		holder = await holdConfigLockUntilSomeoneWaits(`c.profiles.default.allow = [${JSON.stringify(A)}];`);
+		const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+		try {
+			migrateLegacyKeysNow();
+		} finally {
+			spy.mockRestore();
+		}
+		expect(await holder.sawWaiter).toBe(true);
+		const stored = JSON.parse(readFileSync(configPath(), "utf8"));
+		// The key was moved, and the other writer's allowlist entry is still there.
+		expect(stored.profiles.default.apiKey).toBeNull();
+		expect(stored.profiles.default.allow).toEqual([A]);
+	}, PATIENT_TEST_MS);
 });
