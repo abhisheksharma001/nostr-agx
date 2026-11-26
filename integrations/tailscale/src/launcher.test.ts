@@ -1504,6 +1504,24 @@ describe("what the launcher writes on its stderr", () => {
 		}
 	});
 
+	it.skipIf(!posix)("does not end a cut line in the middle of a character of two UTF-16 units", async () => {
+		// The cap falls between the two halves of the emoji.
+		const fake = await stderrWritingBinary([["a".repeat(CAP - 1) + "\u{1F600}" + "tail\nnext\n", 0]]);
+		try {
+			await withStderrWrites(async (writes) => {
+				const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+				try {
+					await until(() => writes.join("").endsWith("next\n"));
+					expect(writes.join("")).toBe("a".repeat(CAP - 1) + LINE_CUT + "next\n");
+				} finally {
+					await proxy.stop();
+				}
+			});
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
 	it.skipIf(!posix)("cuts a last line that is too long and has no newline", async () => {
 		const fake = await stderrWritingBinary([["z".repeat(CAP * 2), 0]]);
 		try {

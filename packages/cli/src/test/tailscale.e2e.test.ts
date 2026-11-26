@@ -521,6 +521,31 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		}
 	}, 90_000);
 
+	it("a second signal after the one serve took in ends it at once, with 130 and no node keys left", async () => {
+		const pidFile = interruptibleLauncher();
+		const held = await serveHoldingATask();
+		try {
+			process.kill(Number(readFileSync(pidFile, "utf8").trim()), "SIGINT");
+			await until(() => held.serve.errors().includes(LAUNCHER_NOTICE), 10_000);
+			held.serve.child.kill("SIGINT");
+			await new Promise((r) => setTimeout(r, 1_000));
+			expect(
+				held.serve.child.exitCode === null && held.serve.child.signalCode === null,
+				"serve ended on the first signal",
+			).toBe(true);
+			held.serve.child.kill("SIGINT");
+			const run = await Promise.race([
+				held.serve.done,
+				new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
+			]);
+			expect(run, "serve did not end on the second signal").not.toBeNull();
+			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(130);
+			expectTailscaleRunWasPerRunAndCleanedUp();
+		} finally {
+			await held.cleanUp();
+		}
+	}, 90_000);
+
 	it("a Ctrl-C that reaches serve before the launcher ends stops it with status 0", async () => {
 		const pidFile = interruptibleLauncher();
 		const held = await serveHoldingATask();
