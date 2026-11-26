@@ -288,13 +288,13 @@ describe("agx link install: --profile", () => {
 		const NCRYPTSEC = encrypt(hexToBytes(createIdentity().secretKeyHex), "throwaway-password", 4);
 		const HEX = createIdentity().secretKeyHex;
 
-		/** The first 12-character stretch of `secret` found in `shown`, in any case; null when none. */
+		/** The first 8-character stretch of `secret` found in `shown`, in any case; null when none. Eight characters of a key are already 32 bits. */
 		function leaked(shown: string, secret: string): string | null {
 			const text = shown.toLowerCase();
 			const key = secret.toLowerCase();
-			for (let i = 0; i + 12 <= key.length; i++) {
-				if (text.includes(key.slice(i, i + 12))) {
-					return key.slice(i, i + 12);
+			for (let i = 0; i + 8 <= key.length; i++) {
+				if (text.includes(key.slice(i, i + 8))) {
+					return key.slice(i, i + 8);
 				}
 			}
 			return null;
@@ -964,6 +964,10 @@ describe("agx link install: which commands count as an agx entry", () => {
 		"npx @nostr-agx/climate",
 		// the .ts ending is not the start of .tsx
 		"agx.tsx hook",
+		// a name that ends in -agx is another tool (and allowing a dash before agx would refuse it)
+		"x-agx",
+		"other-agx hook",
+		"npx create-agx",
 	];
 
 	/** Cautious false positives, kept on purpose: a folder named exactly agx, or the word agx in quotes or as an argument. */
@@ -1523,7 +1527,30 @@ describe("agx link install: two installs at once, and a lock that was left behin
 		expect(error?.exitCode).toBe(EXIT.config);
 		expect(error?.message).toContain(path(LOCK));
 		expect(error?.message).toContain(path(`${LOCK}.takeover`));
+		// What to delete names it too, not only the message.
+		expect(error?.remediation).toContain(path(`${LOCK}.takeover`));
 		expect(error?.message.toLowerCase()).toContain("nothing was changed");
+	});
+
+	it("waits for a live install whose lock is 55 seconds old, and leaves the lock where it is", () => {
+		put(FILE.claude, "{}");
+		lockFor(liveProcess());
+		const young = new Date(Date.now() - 55_000);
+		utimesSync(path(LOCK), young, young);
+		const before = read(LOCK);
+		const error = threw(undefined, { lockWaitMs: 300 });
+		expect(error?.exitCode).toBe(EXIT.config);
+		expect(read(LOCK)).toBe(before);
+		expect(read(FILE.claude)).toBe("{}");
+	});
+
+	it("takes over the lock of a live install once it is 65 seconds old: the limit is a minute", async () => {
+		put(FILE.claude, "{}");
+		lockFor(liveProcess());
+		const old = new Date(Date.now() - 65_000);
+		utimesSync(path(LOCK), old, old);
+		expect((await install("claude")).code).toBe(EXIT.ok);
+		expect(readJson(FILE.claude)).toEqual(expected("claude"));
 	});
 
 	it("waits a bounded time for a live install and then refuses, changing nothing and leaving that lock alone", () => {
