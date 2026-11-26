@@ -1161,6 +1161,15 @@ describe("what the launcher writes on its stderr", () => {
 		}
 	});
 
+	it.skipIf(!posix)("masks a login in a last line that has no newline", async () => {
+		const fake = await stderrWritingBinary([['using proxy "http://puser:ppass@127.0.0.1:9"', 0]]);
+		try {
+			expect((await stderrOf(fake)).join("")).toBe('using proxy "http://***@127.0.0.1:9"');
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
 	it.skipIf(!posix)("is passed on unchanged when it holds no credentials", async () => {
 		const text =
 			"2026/11/26 23:10:01 plain line\n" +
