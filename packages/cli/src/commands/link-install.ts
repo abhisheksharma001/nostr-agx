@@ -18,6 +18,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { AgxCliError, EXIT, usageError } from "../lib/errors.js";
 import { type HookEvent, type HookHost, isHookProfileName } from "../lib/hook.js";
 import { heading, info, json, ok, say, table, warn } from "../lib/output.js";
+import { holdsSecretKey } from "../lib/secrets.js";
 
 export const LINK_INSTALL_SCHEMA = "agx.link.install/1";
 
@@ -538,6 +539,11 @@ function prepare(host: HookHost, file: string, profile: string | undefined): Pre
 	return { loaded, result, action };
 }
 
+/** An nsec or ncryptsec, or a 64-character hexadecimal secret key (any case). */
+function looksLikeSecretKey(value: string): boolean {
+	return holdsSecretKey(value) || /^[0-9a-f]{64}$/i.test(value);
+}
+
 /**
  * Add one coding agent's agx hook entries to that agent's own user-level
  * configuration file, and nothing else: no other file, no agx setting, no other
@@ -547,6 +553,13 @@ function prepare(host: HookHost, file: string, profile: string | undefined): Pre
 export function linkInstallCommand(options: LinkInstallOptions, deps: LinkInstallDeps = {}): void {
 	const host = options.agent;
 	const profile = options.profile;
+	// Before anything else, so the value is never shown: a hook command is written to a file other tools read.
+	if (profile !== undefined && looksLikeSecretKey(profile)) {
+		throw usageError(
+			"That --profile value looks like a secret key, so agx will not write it into a hook command. Nothing was changed.",
+			"--profile takes a profile name such as work, never a key.",
+		);
+	}
 	if (profile !== undefined && !isHookProfileName(profile)) {
 		throw usageError(
 			`"${profile}" is not a profile name a hook can use.`,
