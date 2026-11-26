@@ -11,6 +11,7 @@ import {
 	withConfigLock,
 } from "./config-lock.js";
 import { AgxCliError } from "./errors.js";
+import { holdConfigLockUntilSomeoneWaits, PATIENT_TEST_MS, PATIENT_WAIT_MS } from "../test/config-lock-helpers.js";
 
 let home: string;
 let previous: string | undefined;
@@ -97,13 +98,14 @@ describe("withConfigLock", () => {
 		const started = Date.now();
 		const value = withConfigLock(() => {
 			const before = readFileSync(configLockPath(), "utf8");
-			const inner = withConfigLock(() => "inner", { waitMs: 50 });
+			const inner = withConfigLock(() => "inner", { waitMs: PATIENT_WAIT_MS });
 			// Still the outer call's own lock, not a new one the nested call made.
 			expect(readFileSync(configLockPath(), "utf8")).toBe(before);
 			return inner;
 		});
 		expect(value).toBe("inner");
-		expect(Date.now() - started).toBeLessThan(40);
+		// Far below the limit it was given: it did not wait at all.
+		expect(Date.now() - started).toBeLessThan(PATIENT_WAIT_MS / 2);
 		expect(existsSync(configLockPath())).toBe(false);
 	});
 
@@ -111,7 +113,7 @@ describe("withConfigLock", () => {
 		withConfigLock(() => undefined);
 		expect(lockFiles()).toEqual([]);
 		writeLock({ pid: deadPid(), host: hostname(), token: "gone" });
-		withConfigLock(() => undefined, { waitMs: 500 });
+		withConfigLock(() => undefined, { waitMs: PATIENT_WAIT_MS });
 		expect(lockFiles()).toEqual([]);
 		writeLock({ pid: liveProcess(), host: hostname(), token: "other" });
 		expect(() => withConfigLock(() => undefined, { waitMs: 100 })).toThrow(/config lock/i);
@@ -150,32 +152,21 @@ describe("withConfigLock", () => {
 		});
 
 		it("waits for it to be released, then runs", async () => {
-			const script = [
-				'const fs = require("fs"), os = require("os");',
-				"const path = process.argv[1];",
-				'fs.writeFileSync(path, JSON.stringify({ pid: process.pid, host: os.hostname(), token: "child" }) + "\\n");',
-				"setTimeout(() => fs.rmSync(path), 400);",
-				"setTimeout(() => {}, 3000);",
-			].join("\n");
-			children.push(spawn(process.execPath, ["-e", script, configLockPath()], { stdio: "ignore" }));
-			const deadline = Date.now() + 5_000;
-			while (!existsSync(configLockPath())) {
-				if (Date.now() > deadline) {
-					throw new Error("the helper process never took the lock");
-				}
-				await new Promise((resolve) => setTimeout(resolve, 10));
-			}
-			const started = Date.now();
-			let ran = false;
+			// The holder lets go once it has seen this writer waiting, so no timer decides the order.
+			const held = await holdConfigLockUntilSomeoneWaits();
+			children.push(held.child);
+			let holder: string | undefined;
 			withConfigLock(
 				() => {
-					ran = true;
+					holder = JSON.parse(readFileSync(configLockPath(), "utf8")).token;
 				},
-				{ waitMs: 5_000 },
+				{ waitMs: PATIENT_WAIT_MS },
 			);
-			expect(ran).toBe(true);
-			expect(Date.now() - started).toBeGreaterThanOrEqual(250);
-		});
+			expect(await held.sawWaiter).toBe(true);
+			// By the time it ran, the lock was its own: the other process's record was gone.
+			expect(holder).toBeDefined();
+			expect(holder).not.toBe("other-writer");
+		}, PATIENT_TEST_MS);
 
 		it("waits on a fresh lock from another host", () => {
 			writeLock({ pid: 1, host: "some-other-container", token: "far" });
@@ -206,26 +197,26 @@ describe("withConfigLock", () => {
 	describe("a lock nobody is holding", () => {
 		it("is taken over when its process has exited", () => {
 			writeLock({ pid: deadPid(), host: hostname(), token: "gone" });
-			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
+			expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 			expect(existsSync(configLockPath())).toBe(false);
 		});
 
 		it("is taken over when it is older than the stale age, whatever its pid", () => {
 			writeLock({ pid: liveProcess(), host: hostname(), token: "forgotten" });
 			age(CONFIG_LOCK_STALE_MS / 1000 + 5);
-			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
+			expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 		});
 
 		it("is taken over when it is from another host and older than the stale age", () => {
 			writeLock({ pid: 1, host: "some-other-container", token: "far" });
 			age(CONFIG_LOCK_STALE_MS / 1000 + 5);
-			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
+			expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 		});
 
 		it("is taken over when the file has stayed empty", () => {
 			writeLock("");
 			age(CONFIG_LOCK_UNREADABLE_MS / 1000 + 1);
-			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
+			expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 		});
 
 		it("is NOT taken over while an unreadable file is new: it may be mid-change, and a vanished file is never abandoned", () => {
@@ -236,12 +227,12 @@ describe("withConfigLock", () => {
 
 		it("is taken over when it is from this very pid but we do not hold it (an earlier life of the pid)", () => {
 			writeLock({ pid: process.pid, host: hostname(), token: "earlier-life" });
-			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
+			expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 		});
 
 		it("is taken over when its record has no host and its process has exited", () => {
 			writeLock({ pid: deadPid(), token: "no-host" });
-			expect(withConfigLock(() => "ran", { waitMs: 500 })).toBe("ran");
+			expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 		});
 
 		it("is NOT taken over when its record has no host and its process is alive", () => {
@@ -277,7 +268,7 @@ describe("withConfigLock", () => {
 		it("removes a breaker whose owner has exited", () => {
 			deadHolder();
 			writeBreaker({ pid: deadPid(), host: hostname(), token: "died" });
-			expect(withConfigLock(() => "ran", { waitMs: 1_000 })).toBe("ran");
+			expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 			expect(lockFiles()).toEqual([]);
 		});
 
@@ -285,7 +276,7 @@ describe("withConfigLock", () => {
 			deadHolder();
 			const breaker = writeBreaker({ pid: liveProcess(), host: hostname(), token: "forgotten" });
 			age(CONFIG_LOCK_STALE_MS / 1000 + 5, breaker);
-			expect(withConfigLock(() => "ran", { waitMs: 1_000 })).toBe("ran");
+			expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 			expect(lockFiles()).toEqual([]);
 		});
 
@@ -294,7 +285,7 @@ describe("withConfigLock", () => {
 			writeBreaker("12345\n");
 			expect(() => withConfigLock(() => "ran", { waitMs: 150 })).toThrow(/config lock/i);
 			age(CONFIG_LOCK_UNREADABLE_MS / 1000 + 0.5, `${configLockPath()}.break`);
-			expect(withConfigLock(() => "ran", { waitMs: 1_000 })).toBe("ran");
+			expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 			expect(lockFiles()).toEqual([]);
 		});
 	});

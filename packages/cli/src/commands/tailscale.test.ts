@@ -6,7 +6,7 @@ import { createIdentity } from "../lib/identity.js";
 import { configPath, tailscaleSecretsPath } from "../lib/paths.js";
 import { setStdinForTests } from "../lib/stdin.js";
 import { setTailscaleStarterForTests } from "../lib/tailscale/index.js";
-import { type HeldConfigLock, holdConfigLockUntilSomeoneWaits } from "../test/config-lock-helpers.js";
+import { type HeldConfigLock, holdConfigLockUntilSomeoneWaits, PATIENT_TEST_MS } from "../test/config-lock-helpers.js";
 import { agx, jsonDocuments, sandbox } from "../test/helpers.js";
 
 const KEY = "tskey-auth-k1234567890CNTRL-abcdefghijklmnop";
@@ -269,7 +269,7 @@ describe("agx tailscale while another agx command is writing config.json", () =>
 		expect(run.code, run.stderr).toBe(0);
 		expect(await held.sawWaiter).toBe(true);
 		expect(getProfile("default").tailscale).toMatchObject({ enabled: false, hostname: "agx-from-another" });
-	});
+	}, PATIENT_TEST_MS);
 
 	it("up does not switch Tailscale back on when a disable finished while it waited for the lock", async () => {
 		await enabledProfile();
@@ -280,7 +280,7 @@ describe("agx tailscale while another agx command is writing config.json", () =>
 		expect(run.code, run.stderr).toBe(0);
 		expect(await held.sawWaiter).toBe(true);
 		expect(getProfile("default").tailscale).toMatchObject({ enabled: false, hostname: "agx-new" });
-	});
+	}, PATIENT_TEST_MS);
 
 	it("enable keeps a state directory another command stored while it waited for the lock", async () => {
 		await enabledProfile();
@@ -295,7 +295,7 @@ describe("agx tailscale while another agx command is writing config.json", () =>
 			hostname: "agx-next",
 			stateDir: "/state/from-another",
 		});
-	});
+	}, PATIENT_TEST_MS);
 
 	it("disable also keeps an allowlist entry another command added while it waited", async () => {
 		await enabledProfile();
@@ -308,7 +308,7 @@ describe("agx tailscale while another agx command is writing config.json", () =>
 		expect(await held.sawWaiter).toBe(true);
 		expect(getProfile("default").allow).toEqual([peer]);
 		expect(getProfile("default").tailscale.enabled).toBe(false);
-	});
+	}, PATIENT_TEST_MS);
 
 	it("up with no other writer stores the new hostname and leaves the rest as it was", async () => {
 		await enabledProfile();

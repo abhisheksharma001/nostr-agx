@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { configLockPath, withConfigLock } from "./config-lock.js";
+import { PATIENT_WAIT_MS } from "../test/config-lock-helpers.js";
 import { AgxCliError } from "./errors.js";
 
 // Only `linkSync` is replaced, so a test can make taking the lock fail in a way a real file system
@@ -39,7 +40,7 @@ function linkFailsWith(code: string): void {
 }
 
 describe("taking the config lock when the file system refuses the link", () => {
-	it.each(["EPERM", "EACCES", "ENOSPC"])("raises a %s error as it is, and does not wait for the lock", (code) => {
+	it.each(["EPERM", "EACCES", "ENOSPC"])("raises the %s error as it is, and does not wait for the lock", (code) => {
 		linkFailsWith(code);
 		let ran = false;
 		let error: unknown;
@@ -65,7 +66,7 @@ describe("taking the config lock when the file system refuses the link", () => {
 		linkFailsWith("EPERM");
 		expect(() => withConfigLock(() => "ran", { waitMs: 300 })).toThrow();
 		vi.mocked(fs.linkSync).mockReset();
-		expect(withConfigLock(() => "ran", { waitMs: 300 })).toBe("ran");
+		expect(withConfigLock(() => "ran", { waitMs: PATIENT_WAIT_MS })).toBe("ran");
 		expect(existsSync(configLockPath())).toBe(false);
 	});
 });
