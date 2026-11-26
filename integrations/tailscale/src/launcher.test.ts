@@ -372,7 +372,9 @@ const LAUNCHER_SOURCE = fileURLToPath(new URL("./launcher.ts", import.meta.url))
  * A stand-in launcher that writes a file into its `--state-dir` (as the real one
  * writes the node's keys), reports a proxy, and ends when its stdin closes.
  */
-async function stateWritingBinary(): Promise<{ dir: string; path: string }> {
+async function stateWritingBinary(
+	options: { locked?: boolean } = {},
+): Promise<{ dir: string; path: string }> {
 	const dir = await mkdtemp(join(tmpdir(), "agx-launcher-writer-"));
 	const path = join(dir, "fake-agx-tailscale");
 	await writeFile(
@@ -381,6 +383,14 @@ async function stateWritingBinary(): Promise<{ dir: string; path: string }> {
 			`const args = process.argv.slice(2);\n` +
 			`const dir = args[args.indexOf("--state-dir") + 1];\n` +
 			`require("fs").writeFileSync(require("path").join(dir, "tailscaled.state"), "stand-in state, not a key\\n");\n` +
+			// A folder that cannot be emptied: removing the state directory fails until
+			// the host gives it back its permissions.
+			(options.locked
+				? `const locked = require("path").join(dir, "locked");\n` +
+					`require("fs").mkdirSync(locked);\n` +
+					`require("fs").writeFileSync(require("path").join(locked, "inner"), "x");\n` +
+					`require("fs").chmodSync(locked, 0o500);\n`
+				: "") +
 			`console.log("socks5://agx:secret@127.0.0.1:43240");\n` +
 			`process.stdin.resume();\n` +
 			`process.stdin.on("end", () => process.exit(0));\n`,
@@ -397,6 +407,7 @@ interface EndedHost {
 	/** Folders named like a launcher's own state directory. */
 	leftover: string[];
 	scratch: string;
+	stdout: string;
 }
 
 /**
@@ -407,11 +418,11 @@ interface EndedHost {
  * temporary folder is a scratch folder, so what it leaves behind can be listed.
  */
 async function endHost(
-	ending: "exit" | "throw" | "reject" | "stop" | "signal",
+	ending: "exit" | "throw" | "reject" | "stop" | "locked" | "signal",
 	options: { stateDir?: string; signal?: NodeJS.Signals } = {},
 ): Promise<EndedHost> {
 	const scratch = await mkdtemp(join(tmpdir(), "agx-launcher-host-"));
-	const writer = await stateWritingBinary();
+	const writer = await stateWritingBinary({ locked: ending === "locked" });
 	const script = join(writer.dir, "host.mts");
 	await writeFile(
 		script,
@@ -423,6 +434,16 @@ async function endHost(
 			`else if (ending === "throw") setTimeout(() => { throw new Error("host failed"); }, 0);\n` +
 			`else if (ending === "reject") void Promise.reject(new Error("host failed"));\n` +
 			`else if (ending === "stop") { await proxy.stop(); process.exit(0); }\n` +
+			// stop() could not remove the directory. Then the host restores its permissions and ends.
+			`else if (ending === "locked") {\n` +
+			`  await proxy.stop();\n` +
+			`  const { readdirSync, chmodSync } = await import("node:fs");\n` +
+			`  const { join } = await import("node:path");\n` +
+			`  const dirs = readdirSync(process.env.TMPDIR).filter((n) => n.startsWith("agx-tailscale-"));\n` +
+			`  await new Promise((resolve) => process.stdout.write("AFTER_STOP " + dirs.length + "\\n", resolve));\n` +
+			`  for (const n of dirs) chmodSync(join(process.env.TMPDIR, n, "locked"), 0o700);\n` +
+			`  process.exit(0);\n` +
+			`}\n` +
 			`else setInterval(() => {}, 1_000);\n`,
 	);
 	const host = spawn(
@@ -454,7 +475,7 @@ async function endHost(
 			throw new Error(`host never got ready: ${stderr}`);
 		}
 		const leftover = (await readdir(scratch)).filter((name) => name.startsWith("agx-tailscale-"));
-		return { ...result, leftover, scratch };
+		return { ...result, leftover, scratch, stdout };
 	} finally {
 		if (host.exitCode === null && host.signalCode === null) host.kill("SIGKILL");
 		await rm(writer.dir, { recursive: true, force: true });
@@ -506,6 +527,20 @@ describe("the default state directory when the whole process ends", () => {
 		},
 		60_000,
 	);
+
+	it.skipIf(!posix)("is deleted at exit when stop() could not delete it", async () => {
+		// The directory has a folder that cannot be emptied, so the removal in stop()
+		// fails. The host then gives the folder its permissions back and ends: the exit
+		// listener must still know about the directory.
+		const ended = await endHost("locked");
+		try {
+			expect(ended.stdout).toContain("AFTER_STOP 1\n");
+			expect(ended.code).toBe(0);
+			expect(ended.leftover, `left behind in ${ended.scratch}`).toEqual([]);
+		} finally {
+			await rm(ended.scratch, { recursive: true, force: true });
+		}
+	}, 60_000);
 
 	it.skipIf(!posix)("never deletes a directory the caller named, when the host ends", async () => {
 		const named = await mkdtemp(join(tmpdir(), "agx-launcher-named-state-"));
@@ -1547,6 +1582,70 @@ describe("what the launcher writes on its stderr", () => {
 			await rm(fake.dir, { recursive: true, force: true });
 		}
 	}, 60_000);
+
+	it.skipIf(!posix)("writes every whole line of one piece without waiting for more", async () => {
+		// All three lines arrive in one piece and nothing follows. They must be written
+		// while the launcher still runs, not when it ends.
+		const fake = await stderrWritingBinary([["line one\nline two\nline three\n", 0]]);
+		try {
+			await withStderrWrites(async (writes) => {
+				const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+				try {
+					await until(() => writes.join("").includes("line three\n"), 3_000);
+					expect(writes.join("")).toBe("line one\nline two\nline three\n");
+				} finally {
+					await proxy.stop();
+				}
+			});
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("is written before stop() returns, even from a process that outlives the launcher", async () => {
+		// The launcher ends at once. A process it started still has its stderr open
+		// and writes 150 ms later, as a launcher's last words can arrive after it ended.
+		const fake = await scriptedStderrBinary(
+			`const { spawn } = require("child_process");\n` +
+				`spawn(process.execPath, ["-e", "setTimeout(() => process.stderr.write('late words\\\\n'), 150)"], {\n` +
+				`  stdio: ["ignore", "inherit", "inherit"],\n` +
+				`}).unref();\n`,
+		);
+		try {
+			await withStderrWrites(async (writes) => {
+				const proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+				await proxy.stop();
+				expect(writes.join("")).toBe("late words\n");
+			});
+		} finally {
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("is written before a start that times out is reported, from a late last line", async () => {
+		// The start times out, the launcher is sent SIGTERM, and writes its last line
+		// 150 ms after that.
+		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-late-"));
+		const path = join(dir, "fake-agx-tailscale");
+		await writeFile(
+			path,
+			`#!${process.execPath}\n` +
+				`process.on("SIGTERM", () => { setTimeout(() => { process.stderr.write("last words on SIGTERM\\n"); process.exit(0); }, 150); });\n` +
+				`setInterval(() => {}, 1000);\n`,
+			{ mode: 0o755 },
+		);
+		await chmod(path, 0o755);
+		try {
+			await withStderrWrites(async (writes) => {
+				await expect(startBundledTailscale({ binary: path, timeoutMs: 500 })).rejects.toThrow(
+					/did not report/,
+				);
+				expect(writes.join("")).toBe("last words on SIGTERM\n");
+			});
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
 
 	it.skipIf(!posix)("reaches stderr before a failed start is reported", async () => {
 		// The launcher says why it is ending and ends before it reports an address:
