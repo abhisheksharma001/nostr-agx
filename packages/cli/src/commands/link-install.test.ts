@@ -894,6 +894,15 @@ describe("agx link install: which commands count as an agx entry", () => {
 		"agx.sh hook",
 		"~/nostr-agx/packages/cli/dist/agx.js hook stop",
 		"node /x/node_modules/@nostr-agx/cli/dist/index.js hook stop",
+		// the right edge of agx: each shell character that can follow it
+		"agx;true",
+		"agx|cat",
+		"agx&true",
+		"agx&&true",
+		"agx(x)",
+		"agx`x`",
+		'agx"x"',
+		"agx'x'",
 		// upper and mixed case
 		"NPX -Y AGX@LATEST HOOK",
 		"npx @NOSTR-AGX/CLI hook",
@@ -926,6 +935,8 @@ describe("agx link install: which commands count as an agx entry", () => {
 		"AGX_HOME=/x ./other.sh",
 		"agx.conf --show",
 		`node -e "require('@nostr-agx/nostr')"`,
+		"npx @nostr-agx/cli-helper run",
+		"npx @nostr-agx/climate",
 	];
 
 	/** Cautious false positives, kept on purpose: a folder named exactly agx, or the word agx in quotes or as an argument. */
@@ -1435,6 +1446,9 @@ describe("agx link install: two installs at once, and a lock that was left behin
 		expect(error).toBeInstanceOf(AgxCliError);
 		expect((error as AgxCliError).exitCode).toBe(EXIT.config);
 		expect((error as AgxCliError).message.toLowerCase()).toContain("nothing was changed");
+		// No takeover is going on, so only the lock is named.
+		expect((error as AgxCliError).message).toContain(path(LOCK));
+		expect((error as AgxCliError).message).not.toContain("takeover");
 		expect(waited).toBeGreaterThanOrEqual(300);
 		expect(waited).toBeLessThan(4000);
 		expect(tree(userHome)).toEqual(before);
