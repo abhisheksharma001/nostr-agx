@@ -873,6 +873,19 @@ describe("the exit notice", () => {
 			});
 		});
 
+		it.skipIf(!posix)("cuts a very long message in the warning to 500 characters", async () => {
+			await withEndingLauncher(async (proxy, end, uncaught, warnings) => {
+				proxy.onExit(() => {
+					throw new Error("m".repeat(100_000));
+				});
+				await end();
+				await until(() => warnings.some((w) => w.code === "AGX_TAILSCALE_ONEXIT_LISTENER"));
+				const warning = warnings.find((w) => w.code === "AGX_TAILSCALE_ONEXIT_LISTENER")!;
+				expect(warning.message).toBe(`An onExit listener threw: ${"m".repeat(500)}`);
+				expect(uncaught).toEqual([]);
+			});
+		});
+
 		it.skipIf(!posix)("does not print a login that is in the thrown error", async () => {
 			await withEndingLauncher(async (proxy, end, uncaught, warnings) => {
 				const later = vi.fn();
