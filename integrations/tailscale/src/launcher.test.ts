@@ -283,6 +283,45 @@ describe("the default state directory", () => {
 		}
 	});
 
+	it.skipIf(!posix)("is deleted when the launcher cannot be started", async () => {
+		const scratch = await mkdtemp(join(tmpdir(), "agx-launcher-tmpdir-"));
+		const previous = process.env.TMPDIR;
+		process.env.TMPDIR = scratch;
+		try {
+			await expect(
+				startBundledTailscale({ binary: join(scratch, "no-such-launcher"), timeoutMs: 5_000 }),
+			).rejects.toThrow(/could not start/);
+			expect(await readdir(scratch)).toEqual([]);
+		} finally {
+			if (previous === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = previous;
+			await rm(scratch, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("is deleted when the launcher process cannot even be created", async () => {
+		const fake = await recordingBinary(RUNNING);
+		const scratch = await mkdtemp(join(tmpdir(), "agx-launcher-tmpdir-"));
+		const previous = process.env.TMPDIR;
+		process.env.TMPDIR = scratch;
+		try {
+			// A NUL byte in an argument makes spawn() itself throw.
+			await expect(
+				startBundledTailscale({
+					binary: fake.path,
+					hostname: `bad${String.fromCharCode(0)}name`,
+					timeoutMs: 5_000,
+				}),
+			).rejects.toThrow();
+			expect(await readdir(scratch)).toEqual([]);
+		} finally {
+			if (previous === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = previous;
+			await rm(fake.dir, { recursive: true, force: true });
+			await rm(scratch, { recursive: true, force: true });
+		}
+	});
+
 	it.skipIf(!posix)("passes a directory the caller names through, and keeps it", async () => {
 		const fake = await recordingBinary(RUNNING);
 		const named = await mkdtemp(join(tmpdir(), "agx-launcher-named-state-"));
