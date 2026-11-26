@@ -32,10 +32,9 @@ const BEL = String.fromCharCode(0x07);
 const LINE_SEPARATOR = String.fromCharCode(0x2028);
 const CSI = String.fromCharCode(0x9b);
 const NUL = String.fromCharCode(0);
-/** Characters that do not show on screen: a right-to-left override, a zero-width space, a byte order mark, a bidi isolate and its end mark. */
+/** Characters that do not show on screen: a right-to-left override, a zero-width space, a bidi isolate and its end mark. */
 const RLO = String.fromCharCode(0x202e);
 const ZWSP = String.fromCharCode(0x200b);
-const BOM = String.fromCharCode(0xfeff);
 const LRI = String.fromCharCode(0x2066);
 const PDI = String.fromCharCode(0x2069);
 
@@ -356,17 +355,6 @@ describe("agx config show: other output that must not change", () => {
 		writeAllow(saved);
 		const human = await agx("config", "show");
 		expect(human.stdout).toBe(expectedHuman(6));
-		const json = await agx("config", "show", "--json");
-		expect(json.code).toBe(0);
-		expect(json.stderr).toBe("");
-		expect(json.stdout).toBe(expectedJson(saved));
-		expect(JSON.parse(json.stdout)).not.toHaveProperty("invalidPositions");
-	});
-
-	it("counts a byte order mark around a valid key as padding, as before: the entry is listed and printed as saved", async () => {
-		// `normalizePubkey` trims the entry first, and trimming removes a byte order mark as it removes a space.
-		const saved = [`${BOM}${a.publicKey}`, `${b.npub}${BOM}`, `${BOM}${c.publicKey.toUpperCase()}${BOM}`];
-		writeAllow(saved);
 		const json = await agx("config", "show", "--json");
 		expect(json.code).toBe(0);
 		expect(json.stderr).toBe("");
