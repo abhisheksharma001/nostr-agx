@@ -131,6 +131,11 @@ export interface PrivateWriteOptions {
 	 * with the machine, turns this off.
 	 */
 	sync?: boolean;
+	/**
+	 * Called after the temp file is written and flushed, right before it is renamed into place. If it
+	 * throws, nothing is published and the temp file is removed.
+	 */
+	beforePublish?: () => void;
 }
 
 /**
@@ -143,7 +148,7 @@ export interface PrivateWriteOptions {
 export function writePrivateText(
 	path: string,
 	text: string,
-	{ sync = true }: PrivateWriteOptions = {},
+	{ sync = true, beforePublish }: PrivateWriteOptions = {},
 ): void {
 	ensureDir(dirname(path));
 	const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
@@ -159,6 +164,7 @@ export function writePrivateText(
 				closeSync(fd);
 			}
 		}
+		beforePublish?.();
 		renameSync(tmp, path);
 	} catch (error) {
 		rmSync(tmp, { force: true });

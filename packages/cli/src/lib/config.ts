@@ -16,7 +16,7 @@ import {
 	type ExitCode,
 	usageError,
 } from "./errors.js";
-import { withConfigLock } from "./config-lock.js";
+import { assertConfigLockHeld, withConfigLock } from "./config-lock.js";
 import { notice } from "./output.js";
 import { configPath, writePrivateJson } from "./paths.js";
 import { runtime } from "./runtime.js";
@@ -142,7 +142,9 @@ export function loadConfig(): AgxConfig {
 }
 
 export function saveConfig(config: AgxConfig): void {
-	writePrivateJson(configPath(), migrateLegacyKeys(config, storedConfig()));
+	writePrivateJson(configPath(), migrateLegacyKeys(config, storedConfig()), {
+		beforePublish: assertConfigLockHeld,
+	});
 }
 
 /** `config.json` as it is on disk right now, or null if there is none (or it

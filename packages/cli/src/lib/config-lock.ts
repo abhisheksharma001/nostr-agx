@@ -161,7 +161,7 @@ function pause(ms: number): void {
 	Atomics.wait(sleeper, 0, 0, ms);
 }
 
-function acquire(waitMs: number): () => void {
+function acquire(waitMs: number): { token: string; release: () => void } {
 	const path = configLockPath();
 	ensureDir(dirname(path));
 	const token = randomUUID();
@@ -175,10 +175,13 @@ function acquire(waitMs: number): () => void {
 				linkSync(mine, path);
 				// Only our own record means we hold it.
 				if (readRecord(path)?.token === token) {
-					return () => {
-						if (readRecord(path)?.token === token) {
-							rmSync(path, { force: true });
-						}
+					return {
+						token,
+						release: () => {
+							if (readRecord(path)?.token === token) {
+								rmSync(path, { force: true });
+							}
+						},
 					};
 				}
 			} catch (error) {
@@ -207,6 +210,8 @@ function acquire(waitMs: number): () => void {
 }
 
 let depth = 0;
+/** The token in the lock record this process wrote, while it holds the lock. */
+let heldToken: string | null = null;
 
 /** A function that returns a promise is refused: the lock is let go when `fn` returns, before the promise settles. */
 type NotAPromise<T> = T extends PromiseLike<unknown> ? never : T;
@@ -219,12 +224,33 @@ export function withConfigLock<T>(fn: () => NotAPromise<T>, options: { waitMs?: 
 	if (depth > 0) {
 		return fn();
 	}
-	const release = acquire(options.waitMs ?? CONFIG_LOCK_WAIT_MS);
+	const { token, release } = acquire(options.waitMs ?? CONFIG_LOCK_WAIT_MS);
 	depth = 1;
+	heldToken = token;
 	try {
 		return fn();
 	} finally {
 		depth = 0;
+		heldToken = null;
 		release();
 	}
+}
+
+/**
+ * Called right before config.json is renamed into place. A command that is stopped for longer than
+ * the stale age (a debugger, a laptop asleep) has its lock taken by the next one, and would then
+ * publish its out-of-date copy over what that command saved. So the holder checks, one step before
+ * the rename, that the lock file still carries its own token; if it does not, this raises and nothing
+ * is written. That narrows the window to the time between this check and the rename. It does not
+ * close it: that would need the file system to refuse a write from a holder that was displaced.
+ * A save made outside the lock holds nothing to lose, so it is never refused.
+ */
+export function assertConfigLockHeld(): void {
+	if (heldToken === null || readRecord(configLockPath())?.token === heldToken) {
+		return;
+	}
+	throw configError(
+		`This change was not saved: another agx command took over the config lock on ${configPath()} while this one was stopped for more than ${CONFIG_LOCK_STALE_MS / 1000} seconds. config.json is as that command left it.`,
+		"Run the command again.",
+	);
 }
