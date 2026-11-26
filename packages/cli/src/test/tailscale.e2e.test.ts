@@ -252,6 +252,63 @@ function expectTailscaleRunWasPerRunAndCleanedUp(): void {
 	expect(readdirSync(join(home, "tailscale-runs"))).toEqual([]);
 }
 
+describe("the fake SOCKS5 proxy", () => {
+	it("closes its connection to the relay when it is closed, even if its client vanished", async () => {
+		// A plain TCP server stands in for the relay. A relay's own `close()` waits
+		// for every connection that is still open, so a proxy that leaves one behind
+		// makes the hook that closes both hang.
+		const accepted: Socket[] = [];
+		const relayStandIn = createServer((socket) => {
+			accepted.push(socket);
+			socket.on("error", () => undefined);
+		});
+		await new Promise<void>((resolve) => relayStandIn.listen(0, "127.0.0.1", resolve));
+		const relayPort = (relayStandIn.address() as { port: number }).port;
+		const proxy = await startSocksProxy();
+		const client = connect({ host: "127.0.0.1", port: proxy.port });
+		client.on("error", () => undefined);
+		try {
+			let received = Buffer.alloc(0);
+			client.on("data", (chunk: Buffer) => {
+				received = Buffer.concat([received, chunk]);
+			});
+			const answered = async (length: number): Promise<void> => {
+				await until(() => received.length >= length, 5_000);
+				received = received.subarray(length);
+			};
+			client.write(Buffer.from([0x05, 0x01, 0x02]));
+			await answered(2);
+			client.write(
+				Buffer.concat([
+					Buffer.from([0x01, SOCKS_USER.length]),
+					Buffer.from(SOCKS_USER),
+					Buffer.from([SOCKS_PASS.length]),
+					Buffer.from(SOCKS_PASS),
+				]),
+			);
+			await answered(2);
+			client.write(Buffer.from([0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, relayPort >> 8, relayPort & 0xff]));
+			await answered(10);
+			await until(() => accepted.length === 1, 5_000);
+			// The client goes away without a goodbye.
+			client.resetAndDestroy();
+			await proxy.close();
+			let closed = false;
+			try {
+				await until(() => accepted[0]!.destroyed, 3_000);
+				closed = true;
+			} catch {
+				// still open: reported below
+			}
+			expect(closed, "the proxy left its connection to the relay open after close()").toBe(true);
+		} finally {
+			client.destroy();
+			for (const socket of accepted) socket.destroy();
+			await new Promise<void>((resolve) => relayStandIn.close(() => resolve()));
+		}
+	}, 20_000);
+});
+
 describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 	beforeEach(async () => {
 		expect(existsSync(AGX), "run pnpm build before the built-CLI test").toBe(true);
