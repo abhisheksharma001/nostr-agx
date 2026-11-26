@@ -4,7 +4,9 @@ This package bundles prebuilt `agx-tailscale` binaries under `bin/<platform>/`. 
 the Go source in `launcher/` and are statically linked: each binary contains the Go standard library
 and the Go modules listed below. Those components are licensed by their respective authors, and the
 licence texts are reproduced in this file. The exact dependency versions are recorded in
-`launcher/go.mod` and `launcher/go.sum`. The launcher's own code is under this package's MIT `LICENSE`.
+`launcher/go.mod` and `launcher/go.sum` in the source repository (`integrations/tailscale/launcher/` in
+https://github.com/ellavox-ai/nostr-agx); those two files are not part of the npm package. The launcher's own code
+is under this package's MIT `LICENSE`.
 
 ## What is linked
 
@@ -800,9 +802,11 @@ DEALINGS IN THE SOFTWARE.
 
 ### Apache-2.0: `github.com/golang/groupcache`, `github.com/google/btree`, `github.com/pires/go-proxyproto`, `github.com/safchain/ethtool`, `go4.org/mem`, `gvisor.dev/gvisor`
 
-The same standard text is in each of these files. `github.com/golang/groupcache` has it without the (a) to (d)
-list markers in one clause; the terms are otherwise the same. The "Copyright" line each file ends with, in the
-appendix that shows how to apply the licence, is:
+The standard text is in each of these files, with two small differences in how it is written. `github.com/golang/groupcache`
+has it without the (a) to (d) list markers in one clause; the terms are otherwise the same. In
+`github.com/pires/go-proxyproto`, `github.com/safchain/ethtool` and `go4.org/mem`, the appendix sentence that says
+the fields are "enclosed by brackets" shows them as `{}` where the text printed below shows `[]`. The "Copyright"
+line each file ends with, in the appendix that shows how to apply the licence, is:
 
 - `github.com/golang/groupcache`: `Copyright [yyyy] [name of copyright owner]`
 - `github.com/google/btree`: `Copyright [yyyy] [name of copyright owner]`
