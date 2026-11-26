@@ -10,6 +10,7 @@ import { asCliError, type TailscaleOAuthOptions } from "./auth.js";
 import { loadTailscaleSecret } from "./credentials.js";
 import {
 	loadTailscaleSdk,
+	type TailscaleExit,
 	type TailscaleRelayConfig,
 	type TailscaleStarter,
 } from "./sdk.js";
@@ -22,7 +23,7 @@ export {
 	type ResolvedAuthKey,
 	type TailscaleOAuthOptions,
 } from "./auth.js";
-export { setTailscaleSdkLoaderForTests } from "./sdk.js";
+export { setTailscaleSdkLoaderForTests, type TailscaleExit } from "./sdk.js";
 export {
 	forgetTailscaleSecret,
 	loadTailscaleSecret,
@@ -46,6 +47,11 @@ export function displayTailscaleProxyUrl(url: string): string {
 	}
 }
 
+/** The launcher's end, in words: "exit code 7" or "signal SIGKILL". */
+export function describeTailscaleExit(exit: TailscaleExit): string {
+	return exit.signal ? `signal ${exit.signal}` : `exit code ${exit.code}`;
+}
+
 /** Whether a command should use the profile's Tailscale integration. */
 export function tailscaleRequested(
 	profile: Profile,
@@ -62,6 +68,8 @@ export interface TailscaleUseOptions {
 	withoutTailscale?: boolean;
 	/** One-off key from a command flag; never persisted. */
 	authKey?: string | null;
+	/** Called if the launcher ends on its own (not through `stop()`). */
+	onTailscaleExit?: (exit: TailscaleExit) => void;
 }
 
 let testStarter: TailscaleStarter | undefined;
@@ -182,6 +190,9 @@ export async function startTailscaleForProfile(
 	try {
 		const { startTailscaleRelayProxy } = await loadTailscaleSdk();
 		const proxy = await startTailscaleRelayProxy(config);
+		if (options.onTailscaleExit) {
+			proxy.onExit(options.onTailscaleExit);
+		}
 		if (!runStateDir) {
 			return proxy;
 		}
