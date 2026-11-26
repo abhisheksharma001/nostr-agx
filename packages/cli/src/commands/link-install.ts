@@ -464,6 +464,25 @@ function readText(file: string): string | null {
 	}
 }
 
+/**
+ * Refuses at once a lock or takeover file that is not a plain file: a named pipe would make reading it wait for a writer
+ * that never comes, and nothing else than a plain file is what an install makes. Nothing is read or removed.
+ */
+function requireRegularFile(file: string): void {
+	let stat: ReturnType<typeof lstatSync>;
+	try {
+		stat = lstatSync(file);
+	} catch {
+		return;
+	}
+	if (!stat.isFile()) {
+		throw refusal(
+			`${file} is not a regular file (it is a named pipe, a link, a folder or something else), so agx cannot tell whether another install holds it.`,
+			`If no agx link install is running, delete ${file} and run this again.`,
+		);
+	}
+}
+
 /** The text of a lock file that no running install holds any more (its process is gone, or it is old), else null. */
 function staleLockText(lock: string): string | null {
 	try {
@@ -498,6 +517,7 @@ function takeOverLeftOverLock(lock: string, judged: string, deps: LinkInstallDep
 		}
 	} catch {
 		// Another install is doing it. If that one died halfway, its file is cleared and the next round gets it.
+		requireRegularFile(takeover);
 		const judgedTakeover = staleLockText(takeover);
 		if (judgedTakeover !== null) {
 			deps.afterTakeoverJudged?.();
@@ -554,6 +574,7 @@ function withLock<T>(target: string, deps: LinkInstallDeps, run: (stillMine: () 
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
 				throw writeFailure(target, error);
 			}
+			requireRegularFile(lock);
 			const stale = staleLockText(lock);
 			if (stale !== null && takeOverLeftOverLock(lock, stale, deps)) {
 				continue;
