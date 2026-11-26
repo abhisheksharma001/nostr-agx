@@ -1,5 +1,5 @@
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { hexToBytes } from "@nostr-agx/nostr";
 import { nip19 } from "nostr-tools";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -57,6 +57,25 @@ function leakedPart(shown: string, secretHex: string): string | null {
 	return null;
 }
 
+/** The first 10-character stretch of the key found in any file under `dir` except the identity files; null if none. */
+function leakedOnDisk(dir: string, secretHex: string): string | null {
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			const found = leakedOnDisk(path, secretHex);
+			if (found !== null) {
+				return found;
+			}
+		} else if (entry.name !== "identity.json") {
+			const found = leakedPart(readFileSync(path, "utf8"), secretHex);
+			if (found !== null) {
+				return found;
+			}
+		}
+	}
+	return null;
+}
+
 beforeEach(() => {
 	box = sandbox();
 	vi.clearAllMocks();
@@ -88,6 +107,8 @@ describe("this profile's own secret key given where a peer belongs", () => {
 	it.each([
 		["agx identity allow", (key: string) => ["identity", "allow", key]],
 		["agx held allow", (key: string) => ["held", "allow", key]],
+		["agx held ignore", (key: string) => ["held", "ignore", key]],
+		["agx held block", (key: string) => ["held", "block", key]],
 		["agx send", (key: string) => ["send", key, "hello"]],
 		["agx request", (key: string) => ["request", key, "agx.ping", "--timeout", "1000"]],
 		["agx card", (key: string) => ["card", key]],
@@ -101,6 +122,7 @@ describe("this profile's own secret key given where a peer belongs", () => {
 		expect(mocks.createTransport).not.toHaveBeenCalled();
 		expect(mocks.publishMessage).not.toHaveBeenCalled();
 		expect(mocks.fetchByAuthor).not.toHaveBeenCalled();
+		expect(leakedOnDisk(box.home, mine.secretKeyHex)).toBeNull();
 	});
 
 	it("is refused however it is written: upper case, padded, or as the npub that carries the same bytes", async () => {
@@ -160,6 +182,63 @@ describe("this profile's own secret key given where a peer belongs", () => {
 	});
 });
 
+// An entry for this key may have been stored by an earlier agx, and `identity deny` is how it is taken out.
+// It must do that without printing the key back, which is what an npub of it would be.
+describe("identity deny with this profile's own secret key", () => {
+	it("takes the entry out and prints none of the key, however it is written", async () => {
+		for (const form of [
+			mine.secretKeyHex,
+			mine.secretKeyHex.toUpperCase(),
+			`  ${mine.secretKeyHex}  `,
+			nip19.npubEncode(mine.secretKeyHex),
+		]) {
+			updateProfile("default", { allow: [friend.publicKey, mine.secretKeyHex] });
+			const run = await agx("identity", "deny", form);
+			expect(run.code, form).toBe(0);
+			for (const out of [run.stdout, run.stderr]) {
+				expect(leakedPart(out, mine.secretKeyHex), form).toBeNull();
+			}
+			expect(getProfile("default").allow, form).toEqual([friend.publicKey]);
+		}
+	});
+
+	it("prints none of the key when it was never on the list, and leaves the list as it was", async () => {
+		const run = await agx("identity", "deny", mine.secretKeyHex);
+		expect(run.code).toBe(0);
+		for (const out of [run.stdout, run.stderr]) {
+			expect(leakedPart(out, mine.secretKeyHex)).toBeNull();
+		}
+		expect(getProfile("default").allow).toEqual([friend.publicKey]);
+	});
+
+	it("prints none of the key in JSON mode either", async () => {
+		updateProfile("default", { allow: [friend.publicKey, mine.secretKeyHex] });
+		const run = await agx("identity", "deny", mine.secretKeyHex, "--json");
+		expect(run.code).toBe(0);
+		for (const out of [run.stdout, run.stderr]) {
+			expect(leakedPart(out, mine.secretKeyHex)).toBeNull();
+		}
+	});
+
+	it("names a valid peer as before, and this profile's own public key too", async () => {
+		updateProfile("default", { allow: [friend.publicKey, mine.publicKey] });
+		const denied = await agx("identity", "deny", friend.npub, mine.npub);
+		expect(denied.code).toBe(0);
+		expect(denied.stdout).toContain(`Removed ${friend.npub} from the allowlist.`);
+		expect(denied.stdout).toContain(`Removed ${mine.npub} from the allowlist.`);
+		expect(getProfile("default").allow).toEqual([]);
+	});
+
+	it("held block does not do this job: it refuses, and the stored entry stays until identity deny takes it out", async () => {
+		updateProfile("default", { allow: [friend.publicKey, mine.secretKeyHex] });
+		const run = await agx("held", "block", mine.secretKeyHex);
+		expect(run.code).toBe(2);
+		expect(getProfile("default").allow).toEqual([friend.publicKey, mine.secretKeyHex]);
+		expect((await agx("identity", "deny", mine.secretKeyHex)).code).toBe(0);
+		expect(getProfile("default").allow).toEqual([friend.publicKey]);
+	});
+});
+
 // What this step does not change: ordinary input, and the keys it cannot tell from a public key.
 describe("input that is still accepted", () => {
 	it("a valid npub and a valid hex pubkey are allowed as before", async () => {
@@ -192,13 +271,21 @@ describe("input that is still accepted", () => {
 		expect(inTheOther.code).toBe(0);
 	});
 
-	it("identity deny and held block still take such an entry out", async () => {
+	it("identity deny still takes such an entry out, which an earlier agx may have stored", async () => {
 		updateProfile("default", { allow: [friend.publicKey, mine.secretKeyHex] });
 		expect((await agx("identity", "deny", mine.secretKeyHex)).code).toBe(0);
 		expect(getProfile("default").allow).toEqual([friend.publicKey]);
-		updateProfile("default", { allow: [friend.publicKey, mine.secretKeyHex] });
-		expect((await agx("held", "block", mine.secretKeyHex)).code).toBe(0);
+	});
+
+	it("held ignore and held block still work for a valid peer", async () => {
+		const ignored = await agx("held", "ignore", friend.npub);
+		expect(ignored.code).toBe(0);
+		expect(ignored.stdout).toContain(`Ignored ${friend.npub}`);
 		expect(getProfile("default").allow).toEqual([friend.publicKey]);
+		const blocked = await agx("held", "block", friend.npub);
+		expect(blocked.code).toBe(0);
+		expect(blocked.stdout).toContain(`Blocked ${friend.npub}`);
+		expect(getProfile("default").allow).toEqual([]);
 	});
 
 	it("a profile with no identity yet can still allow a peer", async () => {
