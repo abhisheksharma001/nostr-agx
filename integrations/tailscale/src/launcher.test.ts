@@ -479,3 +479,156 @@ describe("the exit notice", () => {
 		}
 	});
 });
+
+/**
+ * A fake launcher written in JavaScript (a shell would add variables of its
+ * own) that saves the environment it was started with, then reports a proxy.
+ */
+async function envDumpingBinary(): Promise<{ dir: string; path: string; envFile: string }> {
+	const dir = await mkdtemp(join(tmpdir(), "agx-launcher-envdump-"));
+	const path = join(dir, "fake-agx-tailscale");
+	const envFile = join(dir, "env.json");
+	await writeFile(
+		path,
+		`#!${process.execPath}\n` +
+			`require("fs").writeFileSync(${JSON.stringify(envFile)}, JSON.stringify(process.env));\n` +
+			'console.log("socks5://agx:secret@127.0.0.1:43240");\n' +
+			"process.stdin.resume();\n",
+		{ mode: 0o755 },
+	);
+	await chmod(path, 0o755);
+	return { dir, path, envFile };
+}
+
+/** The environment a launcher saw, minus the one variable macOS adds to every process. */
+async function savedEnv(envFile: string): Promise<Record<string, string>> {
+	await until(() => existsSync(envFile));
+	const env = JSON.parse(await readFile(envFile, "utf8")) as Record<string, string>;
+	delete env.__CF_USER_TEXT_ENCODING;
+	return env;
+}
+
+/** Run `fn` with these variables set in (or, for undefined, removed from) this process. */
+async function withParentEnv<T>(
+	vars: Record<string, string | undefined>,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const saved = Object.fromEntries(Object.keys(vars).map((name) => [name, process.env[name]]));
+	for (const [name, value] of Object.entries(vars)) {
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+	}
+	try {
+		return await fn();
+	} finally {
+		for (const [name, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	}
+}
+
+const PASSED_THROUGH = [
+	"USERPROFILE",
+	"SystemRoot",
+	"TMPDIR",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"NO_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"no_proxy",
+	"TS_NO_LOGS_NO_SUPPORT",
+] as const;
+
+describe("the launcher's environment", () => {
+	it.skipIf(!posix)("passes the allowlisted variables that are set, and nothing else", async () => {
+		const fake = await envDumpingBinary();
+		const scratch = await mkdtemp(join(tmpdir(), "agx-launcher-tmpdir-"));
+		const parent: Record<string, string> = {
+			USERPROFILE: "/throwaway/userprofile",
+			SystemRoot: "/throwaway/systemroot",
+			TMPDIR: scratch,
+			HTTP_PROXY: "http://upper-http.invalid:3128",
+			HTTPS_PROXY: "http://upper-https.invalid:3128",
+			NO_PROXY: "upper.invalid",
+			http_proxy: "http://lower-http.invalid:3128",
+			https_proxy: "http://lower-https.invalid:3128",
+			no_proxy: "lower.invalid",
+			TS_NO_LOGS_NO_SUPPORT: "true",
+			// None of these may reach the launcher.
+			OPENAI_API_KEY: "throwaway-not-a-real-key",
+			AWS_SECRET_ACCESS_KEY: "throwaway-not-a-real-secret",
+			ALL_PROXY: "socks5://other.invalid:1080",
+			TS_AUTHKEY: "tskey-auth-throwaway-from-parent",
+			AGX_TAILSCALE_AUTH_KEY: "throwaway-agx-key-from-parent",
+		};
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			await withParentEnv(parent, async () => {
+				proxy = await startBundledTailscale({
+					binary: fake.path,
+					authKey: "tskey-auth-test-value",
+					timeoutMs: 5_000,
+				});
+			});
+			const expected: Record<string, string> = {
+				HOME: process.env.HOME!,
+				TS_AUTHKEY: "tskey-auth-test-value",
+			};
+			for (const name of PASSED_THROUGH) expected[name] = parent[name]!;
+			expect(await savedEnv(fake.envFile)).toEqual(expected);
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+			await rm(scratch, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("passes only HOME and the key when none of the others are set", async () => {
+		const fake = await envDumpingBinary();
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			await withParentEnv(
+				{
+					...Object.fromEntries(PASSED_THROUGH.map((name) => [name, undefined])),
+					// Set but empty counts as not set.
+					HTTPS_PROXY: "",
+				},
+				async () => {
+					proxy = await startBundledTailscale({
+						binary: fake.path,
+						authKey: "tskey-auth-test-value",
+						timeoutMs: 5_000,
+					});
+				},
+			);
+			expect(await savedEnv(fake.envFile)).toEqual({
+				HOME: process.env.HOME!,
+				TS_AUTHKEY: "tskey-auth-test-value",
+			});
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("does not take the auth key from the parent environment", async () => {
+		const fake = await envDumpingBinary();
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			await withParentEnv(
+				{ TS_AUTHKEY: "tskey-auth-throwaway-from-parent", AGX_TAILSCALE_AUTH_KEY: "throwaway" },
+				async () => {
+					proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+				},
+			);
+			const env = await savedEnv(fake.envFile);
+			expect(env).not.toHaveProperty("TS_AUTHKEY");
+			expect(env).not.toHaveProperty("AGX_TAILSCALE_AUTH_KEY");
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+});
