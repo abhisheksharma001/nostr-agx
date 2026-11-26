@@ -719,6 +719,10 @@ describe("agx link install: an agx entry in any other form", () => {
 		["a pipe", "true | agx hook stop --host claude"],
 		["a bare agx", "agx"],
 		["a command in backticks", "echo `agx hook stop --host claude`"],
+		["a semicolon with no space after it", "cd /x;agx hook stop --host claude"],
+		["a pipe with no space after it", "true|agx hook stop --host claude"],
+		["an and-and with no space after it", "true&&agx hook stop --host claude"],
+		["agx closed by a bracket", "echo $(agx)"],
 	];
 
 	it.each(MENTIONS)("refuses when Stop has a command with %s: a different agx entry, not a second copy", async (_label, existing) => {
@@ -790,6 +794,13 @@ describe("agx link install: an agx entry in any other form", () => {
 		expect(run.stderr).toContain("SessionStart (command 1 of 1)");
 		expect(run.stderr).not.toContain("UserPromptSubmit");
 		expect(`${run.stdout}${run.stderr}`).not.toMatch(/SECRET|sk-live|--profile x|npx/);
+	});
+
+	it("lists every command of the event that is in the way, by position", async () => {
+		put(FILE.claude, JSON.stringify({ hooks: { Stop: [group("npx agx hook stop"), group("./between.sh"), group("env X=1 agx hook stop")] } }, null, 2));
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.config);
+		expect(run.stderr).toContain("Stop (commands 1, 3 of 3)");
 	});
 
 	it("counts the position among the commands of the event for Cursor too", async () => {
