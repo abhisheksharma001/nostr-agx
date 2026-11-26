@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Library callers: since 0.7.0, `NostrTransport.create()` no longer sets a process-wide WebSocket for `nostr-tools` (0.6.0 did). The functions that dial relays by themselves (`fetchByAuthor`, `fetchByAuthorWithStatus`, `resolvePeerCard`, `resolvePeerCardWithStatus`, `resolvePeerRelays`, `resolveNip05`) take the class as their `ws` argument, for example `resolvePeerCard(pubkey, relays, signer, ws)`. Without it they use the runtime's global WebSocket: Node 22 and later have one, and use it instead of `ws`; Node 20 has none, and there a lookup finds nothing and reports no error. Pass `ws`, or call `configureWebSocket(ws)` once, if your code runs on Node 20.
+- `socks://` as a relay proxy URL: for relays a peer advertises, the proxy is now asked for the address that was looked up and checked on this machine, not the host name, as `socks5://` already did. For your own relays `socks://` still lets the proxy resolve the name.
+
+### Fixed
+
+- `agx card <peer>` found no card on Node 20, whatever the relay held, and printed "No Agent Card found" (exit 6). Node 22 and later were not affected.
+- The `two-agents` example's requester did not find the reviewer's card on Node 20, for the same reason.
+- A WebSocket class that drops the proxy agent (a subclass that does not pass its options on) is refused when the proxy class is created. Before, a relay given as a bare IP address saw a direct connection from this host before the class was refused on the first dial.
+- When `socks-proxy-agent` could not be loaded, the error said the package was required even if it was installed, for example when a bundler copied it into the bundle (`Dynamic require of "events" is not supported`). The error now says why loading failed.
+
 ## 0.7.1
 
 Released with `@nostr-agx/core`, `@nostr-agx/nostr` and `@nostr-agx/tailscale` 0.7.1. Only `@nostr-agx/tailscale` changes; the others are released at the same version, as always.
