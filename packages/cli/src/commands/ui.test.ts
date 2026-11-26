@@ -238,20 +238,30 @@ describe("agx ui and Tailscale", () => {
 		expect(stops, "launchers stopped").toBe(starts);
 	});
 
-	it("tries the launcher again on the next send after a failed start", async () => {
+	it("waits a while after a failed start, then tries the launcher again", async () => {
 		await storeTailscaleOptIn();
 		launcherFails = true;
-		const ui = await startUi();
-		await until(() => starts > 0, "the first start attempt");
-		const failed = await ui.send("one");
-		expect(failed.status).toBe(500);
-		launcherFails = false;
-		const startsBefore = starts;
-		const retried = await ui.send("two");
-		expect(starts, "a send after the launcher recovered did not start it").toBe(startsBefore + 1);
-		expect(retried.status, retried.body).toBe(502);
-		await ui.stop();
-		expect(stops, "every launcher that started was stopped").toBe(started);
+		// Only the clock the pause is measured with; the servers keep real time.
+		vi.useFakeTimers({ toFake: ["performance"] });
+		try {
+			const ui = await startUi();
+			await until(() => starts > 0, "the first start attempt");
+			const failed = await ui.send("one");
+			expect(failed.status).toBe(500);
+			launcherFails = false;
+			const startsBefore = starts;
+			const early = await ui.send("two");
+			expect(early.status).toBe(500);
+			expect(starts, "the launcher was started again inside the pause").toBe(startsBefore);
+			vi.advanceTimersByTime(30_000);
+			const retried = await ui.send("three");
+			expect(starts, "a send after the pause did not start the launcher").toBe(startsBefore + 1);
+			expect(retried.status, retried.body).toBe(502);
+			await ui.stop();
+			expect(stops, "every launcher that started was stopped").toBe(started);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
