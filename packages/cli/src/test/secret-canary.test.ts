@@ -1,5 +1,6 @@
 import dns from "node:dns";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createServer, Server as HttpServer } from "node:http";
@@ -9,13 +10,14 @@ import { nip19 } from "nostr-tools";
 import WebSocket from "ws";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hexToBytes } from "@nostr-agx/nostr";
-import { effectiveProfile, updateProfile } from "../lib/config.js";
+import { effectiveProfile, getProfile, updateProfile } from "../lib/config.js";
 import { setCredential } from "../lib/credentials.js";
 import { saveIdentity } from "../lib/identity.js";
 import { redactSecrets, rememberSecret } from "../lib/secrets.js";
 import { startGateway } from "../lib/gateway/gateway.js";
 import { createGatewayKey } from "../lib/gateway/keys.js";
 import { setStdinForTests } from "../lib/stdin.js";
+import { setTailscaleSdkLoaderForTests } from "../lib/tailscale/index.js";
 import { buildProgram, reportCliError, runCli } from "../program.js";
 import { type RunningRelay, startRelay } from "../relay/server.js";
 import {
@@ -27,7 +29,9 @@ import {
 	FORM_DESCRIPTION,
 	FORMS,
 	type Form,
+	forbidPortForTest,
 	guardConnections,
+	countKey,
 	holdsKey,
 	listenPortOf,
 	mask,
@@ -92,10 +96,17 @@ interface Spec {
 	stdin?: true;
 	/** Other slots whose value changes what this slot means: the probe is run once for each. */
 	vary?: Record<string, string>[];
-	/** Flags this slot only does anything with. */
+	/** Arguments this slot only does anything with (`--new-org`, `--domain-id d1`), added to every probe of it. */
 	with?: string[];
+	/** Other slots and base arguments (by name) that are left out when this one is probed, because they cannot go with it. */
+	without?: string[];
 	/** A value that is not valid here makes the command wait for ever: stop watching it after a moment. */
 	waits?: true;
+	/**
+	 * Why the probe cannot show that the command used this slot (it stops before it, or what it does with
+	 * the value is not seen anywhere). Only for a slot that would otherwise pass as clean without proof.
+	 */
+	unproven?: string;
 }
 
 interface CommandEntry {
@@ -104,7 +115,19 @@ interface CommandEntry {
 	base?: string[];
 	/** The command starts a server and runs until Ctrl-C: the probe stops it the way Ctrl-C would. */
 	listens?: true;
+	/** The profile has to be in a state the command needs before it does anything. */
+	opted?: "tailscale";
+	/** The same for `--profile`: why the command's use of the profile name is not seen (see `unproven` on a slot). */
+	profileUnproven?: string;
 }
+
+/** In `base` and `with`: the public key of the peer that every probe knows. */
+const PEER = "<peer>";
+
+// Why a slot's clean result is not backed by proof that the command used it (`unproven`).
+const NO_MESSAGE = "it matters when a message arrives, and the probe sends none";
+const NO_PROFILE_READ = "the command does not read a profile name";
+const SAME_ANSWER = "the command uses the profile name, but a profile that does not exist and the default one (empty here) give the same answer";
 
 const REGISTER_SLOTS: CommandEntry["slots"] = {
 	"--slug": { kind: "id", fill: "demo-agent" },
@@ -118,7 +141,7 @@ const REGISTER_SLOTS: CommandEntry["slots"] = {
 	"--tag": "id",
 	"--runtime": "text",
 	"--visibility": "choice",
-	"--handle": "id",
+	"--handle": { kind: "id", with: ["--domain-id", "domain-1"] },
 	"--domain-id": "id",
 };
 
@@ -133,7 +156,12 @@ const CONFIG_KEYS = ["apiKey", "apiBaseUrl", "orgSlug", "relays", "org", "nip05"
 const SLOT_TABLE: Record<string, CommandEntry> = {
 	"(program)": { slots: { "--profile": "id" } },
 	login: {
-		slots: { "--api-base-url": "url", "--org": "id", "--org-name": "text", "--org-slug": "id" },
+		slots: {
+			"--api-base-url": "url",
+			"--org": "id",
+			"--org-name": { kind: "text", with: ["--new-org"] },
+			"--org-slug": { kind: "id", with: ["--new-org"] },
+		},
 		base: ["--no-browser", "--no-wait"],
 	},
 	logout: { slots: {} },
@@ -148,18 +176,19 @@ const SLOT_TABLE: Record<string, CommandEntry> = {
 	"config show": { slots: {} },
 	"config set": {
 		slots: {
-			"<key>": "id",
+			"<key>": { kind: "id", fill: "orgSlug" },
 			"[value]": { kind: "text", vary: CONFIG_KEYS.map((key) => ({ "<key>": key })) },
-			"--stdin": { kind: "secret", stdin: true, vary: CONFIG_KEYS.map((key) => ({ "<key>": key })) },
+			"--stdin": { kind: "secret", stdin: true, without: ["[value]"], vary: CONFIG_KEYS.map((key) => ({ "<key>": key })) },
 		},
 	},
-	"config use": { slots: { "<profile>": "id" } },
-	"config list": { slots: {} },
-	"config path": { slots: {} },
+	"config use": { slots: { "<profile>": "id" }, profileUnproven: NO_PROFILE_READ },
+	"config list": { slots: {}, profileUnproven: NO_PROFILE_READ },
+	"config path": { slots: {}, profileUnproven: NO_PROFILE_READ },
 	identity: { slots: {} },
 	"identity new": { slots: {} },
 	"identity show": { slots: {} },
-	"identity import": { slots: { "[secret]": "secret", "--stdin": { kind: "secret", stdin: true } }, base: ["--force"] },
+	// A key that is accepted, so the other probes of the command get as far as the profile they are about.
+	"identity import": { slots: { "[secret]": { kind: "secret", fill: plant("nsec", "import-fill").value }, "--stdin": { kind: "secret", stdin: true, without: ["[secret]"] } }, base: ["--force"] },
 	"identity export": { slots: {} },
 	"identity sign": { slots: { "<nonce>": "text" } },
 	"identity allow": { slots: { "[peers...]": "pubkey" } },
@@ -170,7 +199,7 @@ const SLOT_TABLE: Record<string, CommandEntry> = {
 	"listing create": {
 		slots: {
 			"--slug": { kind: "id", fill: "demo-agent" },
-			"--team": "id",
+			"--team": { kind: "id", without: ["--pubkey"] },
 			"--pubkey": "pubkey",
 			"--display-name": "text",
 			"--capability": "id",
@@ -180,11 +209,12 @@ const SLOT_TABLE: Record<string, CommandEntry> = {
 			"--tag": "id",
 			"--runtime": "text",
 			"--visibility": "choice",
-			"--handle": "id",
+			"--handle": { kind: "id", with: ["--domain-id", "domain-1"] },
 			"--domain-id": "id",
 			"--relay": "relay",
 			"--org": "id",
 		},
+		base: ["--pubkey", PEER],
 	},
 	"listing list": { slots: { "--org": "id", "--limit": "number" } },
 	"listing get": { slots: { "[listingId]": "id", "--org": "id" } },
@@ -230,45 +260,64 @@ const SLOT_TABLE: Record<string, CommandEntry> = {
 			"--allow": "pubkey",
 			"--capability": "id",
 			"--handler": "path",
-			"--poll-interval": "number",
-			"--max-auto-depth": "number",
-			"--reply-text": "text",
+			"--poll-interval": { kind: "number", unproven: "`--once` stops after one pass, so the pause between passes never comes" },
+			"--max-auto-depth": { kind: "number", unproven: NO_MESSAGE },
+			"--reply-text": { kind: "text", unproven: NO_MESSAGE },
 		},
 		base: ["--once"],
 	},
 	gateway: {
-		slots: { "--host": { kind: "id", fill: "127.0.0.1" }, "--port": { kind: "number", fill: "0" }, "--poll-interval": { kind: "number", fill: "500" } },
+		slots: {
+			"--host": { kind: "id", fill: "127.0.0.1" },
+			"--port": { kind: "number", fill: "0" },
+			"--poll-interval": { kind: "number", fill: "500", unproven: "the probe stops the gateway as soon as it is up, before anything is polled" },
+		},
 		base: ["--port", "0"],
 		listens: true,
 	},
 	"gateway key": { slots: {} },
 	"gateway key new": { slots: { "--label": "text" } },
-	"gateway key list": { slots: {} },
-	"gateway key revoke": { slots: { "<id>": "id" } },
-	inbox: { slots: { "--wait": "number", "--thread": "id" }, base: ["--wait", "1"] },
+	"gateway key list": { slots: {}, profileUnproven: SAME_ANSWER },
+	"gateway key revoke": { slots: { "<id>": "id" }, profileUnproven: SAME_ANSWER },
+	inbox: { slots: { "--wait": "number", "--thread": { kind: "id", unproven: "the inbox holds no message, so every thread id gets the same empty answer" } }, base: ["--wait", "1"] },
 	wait: { slots: { "--timeout": "number" }, base: ["--timeout", "1"] },
 	held: { slots: {} },
-	"held list": { slots: {} },
+	"held list": { slots: {}, profileUnproven: SAME_ANSWER },
 	"held allow": { slots: { "<npub>": "pubkey" } },
 	"held ignore": { slots: { "<npub>": "pubkey" } },
 	"held block": { slots: { "<npub>": "pubkey" } },
-	threads: { slots: {} },
-	thread: { slots: { "<contextId>": "id" } },
+	threads: { slots: {}, profileUnproven: SAME_ANSWER },
+	thread: { slots: { "<contextId>": "id" }, profileUnproven: SAME_ANSWER },
 	send: { slots: { "<peer>": "pubkey", "<message>": "text", "--subject": "text", "--context-id": "id" } },
 	ui: {
-		slots: { "--port": { kind: "number", fill: "0" }, "--compose": "path", "--drafts": "path", "--idle": "number", "--dev-store": "path" },
+		slots: {
+			"--port": { kind: "number", fill: "0" },
+			"--compose": "path",
+			"--drafts": { kind: "path", unproven: "the folder is read when the UI is asked for a draft, and the probe sends the UI no request" },
+			"--idle": "number",
+			"--dev-store": { kind: "path", unproven: "refused unless AGX_UI_DEV_STORE=1, which is for tests only" },
+		},
 		base: ["--no-open"],
 		listens: true,
 	},
 	request: {
-		slots: { "<peer>": "pubkey", "<capability>": "id", "--payload": "json", "--timeout": { kind: "number", fill: "300", waits: true } },
+		slots: {
+			"<peer>": "pubkey",
+			"<capability>": "id",
+			"--payload": "json",
+			"--timeout": { kind: "number", fill: "300", waits: true, unproven: "the command waits for a reply that never comes, and the probe stops watching after 1.5 seconds" },
+		},
 		base: ["--timeout", "300"],
 	},
-	card: { slots: { "<peer>": "pubkey", "--relay": "relay" } },
+	card: { slots: { "<peer>": "pubkey", "--relay": "relay" }, profileUnproven: SAME_ANSWER },
 	relay: {
-		slots: { "--port": { kind: "number", fill: "0" }, "--tls-port": { kind: "number", fill: "0" } },
+		slots: {
+			"--port": { kind: "number", fill: "0" },
+			"--tls-port": { kind: "number", fill: "0", unproven: "used only with --tls, which makes a certificate with openssl and is never passed" },
+		},
 		base: ["--port", "0"],
 		listens: true,
+		profileUnproven: NO_PROFILE_READ,
 	},
 	tailscale: { slots: {} },
 	"tailscale enable": {
@@ -290,7 +339,13 @@ const SLOT_TABLE: Record<string, CommandEntry> = {
 		base: ["--no-up"],
 	},
 	"tailscale up": {
-		slots: { "--auth-key": "secret", "--auth-key-stdin": { kind: "secret", stdin: true }, "--hostname": "id", "--state-dir": "path" },
+		slots: {
+			"--auth-key": { kind: "secret", unproven: "read, and then the command stops: the Tailscale package is replaced by one that fails, so no node is started" },
+			"--auth-key-stdin": { kind: "secret", stdin: true, unproven: "read, and then the command stops: the Tailscale package is replaced by one that fails, so no node is started" },
+			"--hostname": "id",
+			"--state-dir": "path",
+		},
+		opted: "tailscale",
 	},
 	"tailscale status": { slots: {} },
 	"tailscale disable": { slots: {} },
@@ -313,6 +368,7 @@ interface World {
 let world: World;
 let startedIn = "";
 let restoreGuard: () => void;
+let restoreTailscale: () => void;
 
 function fillOf(slot: SlotInfo, spec: Spec, home: string): string {
 	if (spec.fill !== undefined) {
@@ -406,20 +462,22 @@ function lineFor(plan: Plan, planted: string, home: string, json: boolean): { ar
 	const slotted = target.type === "slot" ? target.slot : null;
 	const arguments_ = node.slots.filter((slot) => slot.kind === "argument");
 	const options = node.slots.filter((slot) => slot.kind === "option" && slot.takesValue);
-	const plantedIndex = slotted?.kind === "argument" ? arguments_.indexOf(slotted) : -1;
 	const vary = target.type === "slot" ? target.vary : null;
+	const without = new Set(target.type === "slot" ? (target.spec.without ?? []) : []);
 
+	// Every positional is filled, optional ones too: a command that was not given one
+	// may stop before it uses the slot being probed. Only the slot itself changes.
 	const positional: string[] = [];
-	arguments_.forEach((slot, index) => {
+	for (const slot of arguments_) {
 		const spec = specOf(entry.slots[slot.name] ?? "text");
 		if (slot === slotted) {
 			positional.push(planted);
 		} else if (vary && slot.name in vary) {
 			positional.push(vary[slot.name] as string);
-		} else if (slot.required || index < plantedIndex || target.type === "extra-argument") {
+		} else if (!without.has(slot.name)) {
 			positional.push(fillOf(slot, spec, home));
 		}
-	});
+	}
 	if (target.type === "extra-argument") {
 		positional.push(planted);
 	}
@@ -428,7 +486,7 @@ function lineFor(plan: Plan, planted: string, home: string, json: boolean): { ar
 	for (const slot of options) {
 		if (slot === slotted) {
 			optionTokens.push(slot.name, planted);
-		} else if (slot.required) {
+		} else if (slot.required && !without.has(slot.name)) {
 			optionTokens.push(slot.name, fillOf(slot, specOf(entry.slots[slot.name] ?? "text"), home));
 		}
 	}
@@ -439,7 +497,7 @@ function lineFor(plan: Plan, planted: string, home: string, json: boolean): { ar
 	for (let i = 0; i < (entry.base?.length ?? 0); i++) {
 		const token = (entry.base as string[])[i] as string;
 		const info = known.get(token);
-		if (info && slotted && info.name === slotted.name) {
+		if (info && ((slotted && info.name === slotted.name) || without.has(info.name))) {
 			i += info.takesValue ? 1 : 0;
 			continue;
 		}
@@ -461,10 +519,11 @@ function lineFor(plan: Plan, planted: string, home: string, json: boolean): { ar
 	if (target.type === "slot" && target.spec.with) {
 		tail.push(...target.spec.with);
 	}
+	const peerFor = (token: string): string => (token === PEER ? world.peerNpub : token);
 	if (target.type === "unknown-subcommand") {
 		return { args: [...front, ...node.path, planted], stdin: null };
 	}
-	return { args: [...front, ...node.path, ...positional, ...optionTokens, ...base, ...tail], stdin };
+	return { args: [...front, ...node.path, ...positional, ...optionTokens, ...base, ...tail].map(peerFor), stdin };
 }
 
 // ------------------------------------------------------------- channels and runs
@@ -494,6 +553,8 @@ interface Observed {
 	millis: number;
 	/** What the guard stopped on a forbidden port. */
 	forbidden: ConnectAttempt[];
+	/** Everything the run showed, with the random folder names taken out: two runs that did the same have the same summary. */
+	summary: string;
 }
 
 const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
@@ -527,7 +588,7 @@ type Finished = { code: number } | { error: string };
  * stops it: through the signal handlers it registered, once it is up. Nothing is
  * signalled for real, and `process.exit` is recorded, never carried out.
  */
-async function drive(run: Promise<number>, listens: boolean, before: Map<string, Handler[]>, exits: number[]): Promise<Finished | null> {
+async function drive(run: Promise<number>, listens: boolean, before: Map<string, Handler[]>, exits: number[], patience = 15_000): Promise<Finished | null> {
 	let finished: Finished | null = null;
 	void run.then(
 		(code) => {
@@ -538,7 +599,7 @@ async function drive(run: Promise<number>, listens: boolean, before: Map<string,
 		},
 	);
 	if (listens) {
-		const deadline = Date.now() + 15_000;
+		const deadline = Date.now() + patience;
 		while (finished === null && addedHandlers(before).length === 0 && Date.now() < deadline) {
 			await pause(5);
 		}
@@ -547,9 +608,13 @@ async function drive(run: Promise<number>, listens: boolean, before: Map<string,
 		for (const [, handler] of handlers) {
 			await Promise.resolve(handler());
 		}
-		const stopBy = Date.now() + 5_000;
+		const stopBy = Date.now() + Math.min(patience, 5_000);
 		while (finished === null && exits.length === 0 && Date.now() < stopBy) {
 			await pause(5);
+		}
+		// Neither ended by itself nor stopped by its signal handlers: it would be left running.
+		if (finished === null && exits.length === 0) {
+			return { error: `the command is still running and has not stopped on a signal${handlers.length === 0 ? " (it registered no handler)" : ""}` };
 		}
 	} else {
 		await run.catch(() => undefined);
@@ -562,12 +627,26 @@ async function runOnce(
 	lineFor: (home: string) => { args: string[]; stdin: string | null },
 	planted: Planted,
 	json: boolean,
-	options: { listens?: boolean; waits?: boolean; keeps?: boolean; run?: (args: string[]) => Promise<number> } = {},
+	options: {
+		listens?: boolean;
+		waits?: boolean;
+		keeps?: boolean;
+		opted?: CommandEntry["opted"];
+		run?: (args: string[]) => Promise<number>;
+		/** Milliseconds a command may take (and a server may take to stop); the controls make it short. */
+		deadline?: number;
+		/** Runs after the profile is set up and before the relay pin is checked: the controls break the pin here. */
+		afterSetup?: () => void;
+	} = {},
 ): Promise<Observed> {
 	const run = options.run ?? runCli;
 	const started = performance.now();
 	const box = sandbox();
 	homesMade.push(box.home);
+	// What a command writes under the temp directory lands here (and is looked through), not next to somebody's files.
+	const scratch = mkdtempSync(join(tmpdir(), "agx-canary-tmp-"));
+	homesMade.push(scratch);
+	process.env.TMPDIR = scratch;
 	const cwd = process.cwd();
 	const { args, stdin } = lineFor(box.home);
 	const restoreStdin = setStdinForTests(stdin);
@@ -594,19 +673,11 @@ async function runOnce(
 		process.env.AGX_API_URL = world.index.origin;
 		process.env.AGX_RELAY = world.relayUrl;
 		world.relay.clear();
-		// The stock profile's relay is ws://127.0.0.1:7447, somebody's own. Every profile a command can name must resolve to the throwaway relay.
-		const named = args.includes("--profile") ? args[args.indexOf("--profile") + 1] : undefined;
-		for (const name of new Set(["default", ...(named ? [named] : [])])) {
-			let relays: string[] = [];
-			try {
-				relays = effectiveProfile(name).relays;
-			} catch {
-				continue; // a name that is not a profile name: the command refuses it before it can connect
-			}
-			if (relays.length !== 1 || relays[0] !== world.relayUrl) {
-				throw new Error(`the throwaway home does not pin the relay for profile "${name.length > 24 ? mask(name) : name}": ${relays.join(", ")}`);
-			}
+		if (options.opted === "tailscale") {
+			updateProfile("default", { tailscale: { ...getProfile("default").tailscale, enabled: true } });
 		}
+		options.afterSetup?.();
+		assertRelayPinned(args);
 
 		let code: number | null = null;
 		let threw: string | null = null;
@@ -627,7 +698,8 @@ async function runOnce(
 		}) as never);
 		const { stdout, stderr } = await capture(async () => {
 			try {
-				const finished = await withDeadline(drive(run(args), options.listens === true, before, exits), options.waits ? WAITS_MS : 30_000, args);
+				const limit = options.deadline ?? (options.waits ? WAITS_MS : 30_000);
+				const finished = await withDeadline(drive(run(args), options.listens === true, before, exits, options.deadline === undefined ? undefined : Math.floor(options.deadline / 4)), limit, args);
 				if (finished && "code" in finished) {
 					code = finished.code;
 				} else if (finished) {
@@ -660,10 +732,12 @@ async function runOnce(
 		if (!own && !options.keeps && redactSecrets(planted.value) !== planted.value) {
 			threw ??= "the program remembered the planted key for redaction";
 		}
-		const tree = readTree(box.home, own ? new Set(["profiles/default/identity.json"]) : new Set());
+		const home = readTree(box.home, own ? new Set(["profiles/default/identity.json"]) : new Set());
+		const temp = readTree(scratch);
+		const tree = { names: `${home.names}\n${temp.names}`, contents: `${home.contents}\n${temp.contents}` };
 		const requests = world.index.requests
 			.slice(requestsBefore)
-			.map((r) => `${r.method} ${r.path}\n${JSON.stringify(r.headers)}\n${typeof r.body === "string" ? r.body : JSON.stringify(r.body)}`)
+			.map((r) => `${r.method} ${r.path}${r.search}\n${JSON.stringify(r.headers)}\n${typeof r.body === "string" ? r.body : JSON.stringify(r.body)}`)
 			.join("\n");
 		const attempts = world.attempts.slice(attemptsBefore);
 		const texts: Record<Channel, string> = {
@@ -685,11 +759,40 @@ async function runOnce(
 				channels.add(channel);
 			}
 		}
-		return { code, threw, abandoned, channels, millis: performance.now() - started, forbidden: attempts.filter((a) => a.blocked === "port") };
+		// What differs from one run to the next without anybody asking for it: folders, times, ports, counters, and whether a connection was reused.
+		const { connect: _connect, ...shown } = texts;
+		const summary = JSON.stringify({ code, abandoned, shown })
+			.split(box.home)
+			.join("<home>")
+			.split(scratch)
+			.join("<tmp>")
+			.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g, "<time>")
+			.replace(/\d{4,}/g, "<n>");
+		return { code, threw, abandoned, channels, millis: performance.now() - started, forbidden: attempts.filter((a) => a.blocked === "port"), summary };
 	} finally {
 		restoreStdin();
 		process.chdir(cwd);
 		box.restore();
+		rmSync(scratch, { recursive: true, force: true });
+	}
+}
+
+/**
+ * The stock profile's relay is ws://127.0.0.1:7447, somebody's own. Every profile
+ * a command can name must resolve to the throwaway relay, or the run does not start.
+ */
+function assertRelayPinned(args: string[]): void {
+	const named = args.includes("--profile") ? args[args.indexOf("--profile") + 1] : undefined;
+	for (const name of new Set(["default", ...(named ? [named] : [])])) {
+		let relays: string[] = [];
+		try {
+			relays = effectiveProfile(name).relays;
+		} catch {
+			continue; // a name that is not a profile name: the command refuses it before it can connect
+		}
+		if (relays.length !== 1 || relays[0] !== world.relayUrl) {
+			throw new Error(`the throwaway home does not pin the relay for profile "${name.length > 24 ? mask(name) : name}": ${relays.join(", ")}`);
+		}
 	}
 }
 
@@ -813,6 +916,10 @@ interface MatrixResult {
 	slow: Array<{ line: string; millis: number }>;
 	slots: number;
 	commands: number;
+	/** `command | slot` of every run that was left waiting, once per slot. */
+	abandoned: Set<string>;
+	/** For every slot: did the command use what it was given? A leak says so; so does a marker that comes back. */
+	reach: Array<{ command: string; slot: string; reached: boolean; reason: string | null }>;
 }
 
 // ================================================== the gateway's HTTP API
@@ -837,6 +944,8 @@ interface HttpRequest {
 interface HttpProbe {
 	slot: string;
 	send: (value: string, peer: string) => HttpRequest;
+	/** Why the gateway's use of this field is not seen (see `unproven` on a slot). */
+	unproven?: string;
 }
 
 const asJson = (value: unknown): string => JSON.stringify(value);
@@ -845,10 +954,10 @@ const here = (value: string): string => encodeURIComponent(value);
 const HTTP_PROBES: HttpProbe[] = [
 	{ slot: "POST /v1/tasks peer", send: (v) => ({ method: "POST", path: "/v1/tasks", body: asJson({ peer: v, capability: "demo.run", timeoutSec: 1 }) }) },
 	{ slot: "POST /v1/tasks capability", send: (v, peer) => ({ method: "POST", path: "/v1/tasks", body: asJson({ peer, capability: v, timeoutSec: 1 }) }) },
-	{ slot: "POST /v1/tasks payload", send: (v, peer) => ({ method: "POST", path: "/v1/tasks", body: asJson({ peer, capability: "demo.run", payload: { note: v }, timeoutSec: 1 }) }) },
-	{ slot: "POST /v1/tasks Idempotency-Key", send: (v, peer) => ({ method: "POST", path: "/v1/tasks", headers: { "idempotency-key": v }, body: asJson({ peer, capability: "demo.run", timeoutSec: 1 }) }) },
-	{ slot: "POST /v1/tasks (body)", send: (v) => ({ method: "POST", path: "/v1/tasks", body: v }) },
-	{ slot: "GET /v1/tasks/:id", send: (v) => ({ method: "GET", path: `/v1/tasks/${here(v)}` }) },
+	{ slot: "POST /v1/tasks payload", send: (v, peer) => ({ method: "POST", path: "/v1/tasks", body: asJson({ peer, capability: "demo.run", payload: { note: v }, timeoutSec: 1 }) }), unproven: "the payload is encrypted for the peer before it leaves, so the relay shows only ciphertext" },
+	{ slot: "POST /v1/tasks Idempotency-Key", send: (v, peer) => ({ method: "POST", path: "/v1/tasks", headers: { "idempotency-key": v }, body: asJson({ peer, capability: "demo.run", timeoutSec: 1 }) }), unproven: "the gateway keeps only a SHA-256 hash of the key" },
+	{ slot: "POST /v1/tasks (body)", send: (v) => ({ method: "POST", path: "/v1/tasks", body: v }), unproven: "a body that is not JSON is refused with a fixed message" },
+	{ slot: "GET /v1/tasks/:id", send: (v) => ({ method: "GET", path: `/v1/tasks/${here(v)}` }), unproven: "an id that names no task gets the same answer as any other" },
 	{ slot: "POST /v1/messages peer", send: (v) => ({ method: "POST", path: "/v1/messages", body: asJson({ peer: v, text: "hello" }) }) },
 	{ slot: "POST /v1/messages text", send: (v, peer) => ({ method: "POST", path: "/v1/messages", body: asJson({ peer, text: v }) }) },
 	{ slot: "POST /v1/messages subject", send: (v, peer) => ({ method: "POST", path: "/v1/messages", body: asJson({ peer, text: "hello", subject: v }) }) },
@@ -859,12 +968,12 @@ const HTTP_PROBES: HttpProbe[] = [
 	{ slot: "POST /v1/subscriptions label", send: (v) => ({ method: "POST", path: "/v1/subscriptions", body: asJson({ url: "http://127.0.0.1:9/hook", label: v, events: ["message"], acceptAll: true }) }) },
 	{ slot: "POST /v1/subscriptions capabilities", send: (v) => ({ method: "POST", path: "/v1/subscriptions", body: asJson({ url: "http://127.0.0.1:9/hook", events: ["task"], capabilities: [v], acceptAll: true }) }) },
 	{ slot: "POST /v1/subscriptions allowedPeers", send: (v) => ({ method: "POST", path: "/v1/subscriptions", body: asJson({ url: "http://127.0.0.1:9/hook", events: ["message"], allowedPeers: [v] }) }) },
-	{ slot: "POST /v1/subscriptions events", send: (v) => ({ method: "POST", path: "/v1/subscriptions", body: asJson({ url: "http://127.0.0.1:9/hook", events: [v], acceptAll: true }) }) },
+	{ slot: "POST /v1/subscriptions events", send: (v) => ({ method: "POST", path: "/v1/subscriptions", body: asJson({ url: "http://127.0.0.1:9/hook", events: [v], acceptAll: true }) }), unproven: "an event name that does not exist is refused with a fixed message" },
 	{ slot: "GET /v1/subscriptions/:id", send: (v) => ({ method: "GET", path: `/v1/subscriptions/${here(v)}` }) },
 	{ slot: "DELETE /v1/subscriptions/:id", send: (v) => ({ method: "DELETE", path: `/v1/subscriptions/${here(v)}` }) },
 	{ slot: "<unknown path> under /v1", send: (v) => ({ method: "GET", path: `/v1/${here(v)}` }) },
 	{ slot: "<unknown path>", send: (v) => ({ method: "GET", path: `/${here(v)}` }) },
-	{ slot: "Authorization", send: (v) => ({ method: "GET", path: "/v1/identity", headers: { authorization: `Bearer ${v}` } }) },
+	{ slot: "Authorization", send: (v) => ({ method: "GET", path: "/v1/identity", headers: { authorization: `Bearer ${v}` } }), unproven: "a gateway key that is not known gets the same refusal as any other" },
 ];
 
 /** What one HTTP probe is watched against: where to send it, what the gateway logged, and the files before it. */
@@ -877,7 +986,32 @@ interface HttpWatch {
 	tree: TreeListing;
 }
 
+/**
+ * The files once the gateway has finished what the request caused. It writes some state, and sends
+ * some events, after it has answered (sometimes 100 ms later), and it saves its own bookkeeping all
+ * the time; so it is looked at again until the number of places that hold the key (and the relay
+ * events and log lines) has not changed for 250 ms, or three seconds have passed. What it did then
+ * belongs to this request and not to the next.
+ */
+async function settle(watch: HttpWatch, needles: readonly string[]): Promise<TreeListing> {
+	const look = () => {
+		const tree = readTree(watch.home, watch.skip);
+		const shape = [countKey(tree.contents, needles), countKey(tree.names, needles), world.relayLog.filter((entry) => entry.startsWith("EVENT")).length, watch.lines.length].join(",");
+		return { tree, shape };
+	};
+	let last = look();
+	let quiet = 0;
+	for (let attempt = 0; attempt < 60 && quiet < 5; attempt++) {
+		await pause(50);
+		const next = look();
+		quiet = next.shape === last.shape ? quiet + 1 : 0;
+		last = next;
+	}
+	return last.tree;
+}
+
 /** Send one probe and say in which channels `value` came back; the watch moves on to the state after it. */
+
 async function sendProbe(watch: HttpWatch, probe: HttpProbe, value: Planted): Promise<{ channels: Set<Channel>; error: string | null }> {
 	const linesBefore = watch.lines.length;
 	const relayBefore = world.relayLog.length;
@@ -898,15 +1032,17 @@ async function sendProbe(watch: HttpWatch, probe: HttpProbe, value: Planted): Pr
 	} catch (cause) {
 		error = cause instanceof Error ? cause.message : String(cause);
 	}
-	const after = readTree(watch.home, watch.skip);
-	const changed = changedSince(watch.tree, after);
+	const after = await settle(watch, value.needles);
+	const before = watch.tree;
+	const changed = changedSince(before, after);
 	watch.tree = after;
 	const texts: Partial<Record<Channel, string>> = {
 		response,
 		log: watch.lines.slice(linesBefore).join("\n"),
 		relay: world.relayLog.slice(relayBefore).join("\n"),
 		"file-name": changed.names,
-		"file-content": changed.contents,
+		// The profile's own key is in every request and in the files it makes: only a file that holds it more often than before is a leak of this request.
+		"file-content": countKey(after.contents, value.needles) > countKey(before.contents, value.needles) ? after.contents : "",
 		connect: world.attempts.slice(attemptsBefore).map((a) => `${a.host}:${a.port}`).join("\n"),
 	};
 	const channels = new Set<Channel>();
@@ -918,12 +1054,48 @@ async function sendProbe(watch: HttpWatch, probe: HttpProbe, value: Planted): Pr
 	return { channels, error };
 }
 
+/** A gateway in a throwaway home, as the profile whose own key is `fixed`, and what is needed to watch it. */
+async function startWatchedGateway(fixed: Planted, skip: ReadonlySet<string>): Promise<{ gateway: Awaited<ReturnType<typeof startGateway>>; watch: HttpWatch; restore: () => void }> {
+	const box = sandbox();
+	try {
+		saveIdentity("default", fixed.identity);
+		updateProfile("default", { relays: [world.relayUrl] });
+		const lines: string[] = [];
+		const key = createGatewayKey("default", "canary").key;
+		const gateway = await startKeepingConnections(() => startGateway({ profile: "default", port: 0, pollIntervalMs: 200, log: (line) => lines.push(line) }));
+		return { gateway, watch: { url: gateway.url, key, home: box.home, lines, skip, tree: readTree(box.home, skip) }, restore: box.restore };
+	} catch (error) {
+		box.restore();
+		throw error;
+	}
+}
+
+/** Was each gateway field used? A marker sent in it is looked for in everything the gateway shows. */
+async function runGatewayReach(result: MatrixResult): Promise<void> {
+	const leaking = new Set(result.leaks.filter((leak) => leak.command === GATEWAY_API).map((leak) => leak.slot));
+	const clean = HTTP_PROBES.filter((probe) => !leaking.has(probe.slot));
+	const started = clean.length > 0 ? await startWatchedGateway(plant("nsec", "http|marker"), new Set()) : null;
+	try {
+		for (const probe of HTTP_PROBES) {
+			let reached = leaking.has(probe.slot);
+			if (!reached && started) {
+				const sent = await sendProbe(started.watch, probe, { ...plant("nsec", `http|${probe.slot}|marker`), value: MARKER, needles: [MARKER] });
+				result.runs += 1;
+				reached = sent.channels.size > 0;
+			}
+			result.reach.push({ command: GATEWAY_API, slot: probe.slot, reached, reason: probe.unproven ?? null });
+		}
+	} finally {
+		await started?.gateway.close().catch(() => undefined);
+		started?.restore();
+	}
+}
+
 async function runGatewayMatrix(result: MatrixResult): Promise<void> {
 	for (const form of FORMS) {
 		const fixed = plant(form, "http");
 		const hexForm = form === "hex" || form === "HEX";
 		const skip: ReadonlySet<string> = hexForm ? new Set(["profiles/default/identity.json"]) : new Set();
-		const box = sandbox();
 		const planted = new Map<string, Planted>();
 		const found = new Map<string, Set<Channel>>();
 		const note = (slot: string, channel: Channel): void => {
@@ -932,13 +1104,13 @@ async function runGatewayMatrix(result: MatrixResult): Promise<void> {
 			found.set(slot, channels);
 		};
 		let gateway: Awaited<ReturnType<typeof startGateway>> | null = null;
+		let restore = (): void => undefined;
 		try {
-			saveIdentity("default", fixed.identity);
-			updateProfile("default", { relays: [world.relayUrl] });
-			const lines: string[] = [];
-			const key = createGatewayKey("default", "canary").key;
-			gateway = await startKeepingConnections(() => startGateway({ profile: "default", port: 0, pollIntervalMs: 200, log: (line) => lines.push(line) }));
-			const watch: HttpWatch = { url: gateway.url, key, home: box.home, lines, skip, tree: readTree(box.home, skip) };
+			const started = await startWatchedGateway(fixed, skip);
+			gateway = started.gateway;
+			restore = started.restore;
+			const watch = started.watch;
+			const box = { home: watch.home };
 			for (const probe of HTTP_PROBES) {
 				// A new key for every request, so a file that holds it can be traced to the request; the profile's own key is one value.
 				const value = hexForm ? fixed : plant(form, `http|${probe.slot}`);
@@ -967,7 +1139,7 @@ async function runGatewayMatrix(result: MatrixResult): Promise<void> {
 			}
 		} finally {
 			await gateway?.close().catch(() => undefined);
-			box.restore();
+			restore();
 		}
 		for (const [slot, channels] of found) {
 			for (const channel of channels) {
@@ -978,6 +1150,52 @@ async function runGatewayMatrix(result: MatrixResult): Promise<void> {
 	}
 }
 
+/** One run of a plan with `planted` in its slot (or the plain value of `valueOf`, for the run that is not about a key). */
+function runPlan(plan: Plan, planted: Planted, json: boolean, valueOf: (home: string) => string = () => planted.value): Promise<Observed> {
+	return runOnce((home) => lineFor(plan, valueOf(home), home, json), planted, json, {
+		listens: SLOT_TABLE[plan.command]?.listens === true,
+		waits: plan.target.type === "slot" && plan.target.spec.waits === true,
+		keeps: plan.command === "config set" && plan.target.type === "slot" && plan.target.vary?.["<key>"] === "apiKey",
+		opted: SLOT_TABLE[plan.command]?.opted,
+	});
+}
+
+/** A harmless word to put where a key would go: whatever repeats it shows that the slot was used. */
+const MARKER = "canarymark0001";
+
+function reachMarker(plan: Plan): Planted {
+	return { ...plant("nsec", `${plan.command}|${plan.slot}|marker`), value: MARKER, needles: [MARKER] };
+}
+
+/** What an ordinary, valid value of the plan's slot looks like. */
+function ordinaryValue(plan: Plan): (home: string) => string {
+	return (home) => (plan.target.type === "slot" ? fillOf(plan.target.slot, plan.target.spec, home) : "default");
+}
+
+/**
+ * Did the command use the value it was given? Yes if the marker came back anywhere. If not, yes
+ * if the command does something else with the marker than with an ordinary value, and does the
+ * same every time with the ordinary one (so a difference is the marker's).
+ */
+async function reached(plan: Plan, result: MatrixResult): Promise<boolean> {
+	const marked = await runPlan(plan, reachMarker(plan), false);
+	result.runs += 1;
+	if (marked.abandoned) {
+		result.abandoned.add(`${plan.command} | ${plan.slot}`);
+	}
+	if (marked.threw) {
+		result.threw.push(`${plan.command} | ${plan.slot} | marker: ${marked.threw}`);
+	}
+	if (marked.channels.size > 0) {
+		return true;
+	}
+	const plain = { ...reachMarker(plan), needles: [] };
+	const first = await runPlan(plan, plain, false, ordinaryValue(plan));
+	const second = await runPlan(plan, plain, false, ordinaryValue(plan));
+	result.runs += 2;
+	return first.summary === second.summary && first.summary !== marked.summary;
+}
+
 let matrix: Promise<MatrixResult> | null = null;
 
 function runMatrix(): Promise<MatrixResult> {
@@ -985,7 +1203,19 @@ function runMatrix(): Promise<MatrixResult> {
 		const started = performance.now();
 		const nodes = walkProgram(buildProgram());
 		const plans = plansFor(nodes).filter((plan) => inScopeName(plan.command));
-		const result: MatrixResult = { leaks: [], probes: 0, runs: 0, millis: 0, threw: [], forbidden: [], slow: [], slots: 0, commands: nodes.length };
+		const result: MatrixResult = {
+			leaks: [],
+			probes: 0,
+			runs: 0,
+			millis: 0,
+			threw: [],
+			forbidden: [],
+			slow: [],
+			slots: 0,
+			commands: nodes.length,
+			abandoned: new Set(),
+			reach: [],
+		};
 		const slotKeys = new Set<string>();
 		for (const plan of plans) {
 			slotKeys.add(`${plan.command}|${plan.slot}`);
@@ -994,12 +1224,11 @@ function runMatrix(): Promise<MatrixResult> {
 				result.probes += 1;
 				const found = new Map<Channel, true>();
 				for (const json of [false, true]) {
-					const observed = await runOnce((home) => lineFor(plan, planted.value, home, json), planted, json, {
-						listens: SLOT_TABLE[plan.command]?.listens === true,
-						waits: plan.target.type === "slot" && plan.target.spec.waits === true,
-						keeps: plan.command === "config set" && plan.target.type === "slot" && plan.target.vary?.["<key>"] === "apiKey",
-					});
+					const observed = await runPlan(plan, planted, json);
 					result.runs += 1;
+					if (observed.abandoned) {
+						result.abandoned.add(`${plan.command} | ${plan.slot}`);
+					}
 					if (observed.threw) {
 						result.threw.push(`${plan.command} | ${plan.slot} | ${form}: ${observed.threw}`);
 					}
@@ -1018,8 +1247,19 @@ function runMatrix(): Promise<MatrixResult> {
 				}
 			}
 		}
+		// A slot that repeats nothing is only clean if the command used what it was given. A marker shows that.
+		const leaking = new Set(result.leaks.map((leak) => `${leak.command} | ${leak.slot}`));
+		for (const plan of plans) {
+			if (plan.target.type !== "slot" && plan.target.type !== "profile") {
+				continue;
+			}
+			const used = leaking.has(`${plan.command} | ${plan.slot}`) || (await reached(plan, result));
+			const reason = plan.target.type === "slot" ? (plan.target.spec.unproven ?? null) : (SLOT_TABLE[plan.command]?.profileUnproven ?? null);
+			result.reach.push({ command: plan.command, slot: plan.slot, reached: used, reason });
+		}
 		if (inScopeName(GATEWAY_API)) {
 			await runGatewayMatrix(result);
+			await runGatewayReach(result);
 			for (const probe of HTTP_PROBES) {
 				slotKeys.add(`${GATEWAY_API}|${probe.slot}`);
 			}
@@ -1054,6 +1294,8 @@ beforeAll(async () => {
 	startedIn = process.cwd();
 	const guard = guardConnections();
 	restoreGuard = guard.restore;
+	// A profile that has opted in to Tailscale would start a node. No command may: the package is reported missing.
+	restoreTailscale = setTailscaleSdkLoaderForTests(() => Promise.reject(new Error("no Tailscale package in the canary")));
 	const relayLog: string[] = [];
 	const relay = await startKeepingConnections(() =>
 		startRelay({
@@ -1067,6 +1309,9 @@ beforeAll(async () => {
 	index.setRpc("agentIndex/searchListings", () => ({ output: { listings: [], total: 0 } }));
 	index.setRpc("agentIndex/listDomains", () => ({ output: { domains: [] } }));
 	index.setRpc("exchange/listPeers", () => ({ output: { peers: [] } }));
+	// `register` asks for a challenge and proves the key before it creates the listing: let it get as far as that.
+	index.setRpc("agentIndex/createKeyChallenge", () => ({ output: { nonce: "n".repeat(32), expiresAt: "2099-01-01T00:00:00Z", pubkey: "x" } }));
+	index.setRpc("agentIndex/submitKeyProof", () => ({ output: { ok: true } }));
 	world = {
 		index,
 		indexKey: index.addKey().key,
@@ -1079,6 +1324,7 @@ beforeAll(async () => {
 }, 30_000);
 
 afterAll(async () => {
+	restoreTailscale?.();
 	restoreGuard?.();
 	await world?.relay.close();
 	await world?.index.close();
@@ -1089,31 +1335,37 @@ afterAll(async () => {
 type Channels = readonly Channel[];
 
 /**
- * One reviewable line of what leaks today. An entry names a set of slots and what
- * leaks there: every combination of command, slot, key form and channel it spells
- * out is expected to leak, and nothing else. The test fails for a leak that is
- * not covered here, and for a listed combination that no longer leaks.
+ * One line of what leaks today: one command, one slot, and the key forms and
+ * channels in which it leaks there. Every combination a line spells out is
+ * expected to leak, and nothing else. The test fails for a leak that no line
+ * covers, and for a listed combination that no longer leaks. The lines are in
+ * order (command, then slot), so a fix deletes its own lines and nothing around
+ * them changes.
  */
 interface KnownLeak {
-	/** The commands (as typed after `agx`), or "*" for every command that has all of `slots`. */
-	commands: readonly string[] | "*";
-	slots: readonly string[];
-	forms: readonly Form[] | "*";
+	/** The command as typed after `agx`, or the gateway's HTTP API. */
+	command: string;
+	slot: string;
+	forms: readonly Form[] | typeof ALL;
 	channels: Channels;
-	/** The open pull request that fixes it, or why it is not fixed. */
+	/** The open pull request that fixes it, or why it is not fixed. Never empty. */
 	reason: string;
 }
 
 const ALL = "*" as const;
+/** The forms that look like a key: a check for `nsec1` sees them. */
+const SHAPED: readonly Form[] = ["nsec", "ncryptsec", "nostr", "sentence", "NSEC"];
+/** The profile's own key, as 64 hex characters: a check for `nsec1` does not see it. */
+const OWN: readonly Form[] = ["hex", "HEX"];
 
 const WHY = {
-	pr61: "open PR #61 hides a hex run of 56 or more digits in an unknown command or option",
-	tooMany: "the parser's 'too many arguments' quotes every extra word (issue #57; PR #61 leaves it on purpose)",
+	pr61: "open PR #61 (as of 2026-11-26) hides a run of 56 or more hex digits, in any case, in an unknown command or option",
+	tooMany: "the parser's 'too many arguments' quotes every extra word; open PR #61 (as of 2026-11-26) leaves it on purpose except for `gateway`",
 	parserEscaped: "a parser error quotes a %xx-escaped key as typed; no check decodes %xx yet",
-	pr64_66: "open PRs #64 and #66 refuse a profile name that holds nsec1 or ncryptsec1",
+	pr64_66: "open PRs #64 and #66 (as of 2026-11-26) refuse a profile name that holds nsec1, in any case",
 	profileName: "a hex or %xx-escaped profile name is a valid folder name; no rule yet says what a profile name may hold",
-	pr65: "open PR #65 refuses a value that holds nsec1 or ncryptsec1",
-	pr75: "open PR #75 refuses and hides a value that holds a key, also %xx-escaped",
+	pr65: "open PR #65 (as of 2026-11-26) refuses a value that holds nsec1, in any case",
+	pr75: "open PR #75 (as of 2026-11-26) refuses and hides a value that holds a key, also %xx-escaped",
 	messageText: "open decision: should message text and subjects stop for a key (the UI asks first)?",
 	afterStop: "a task keeps its agent as typed in the task file; the profile's own key as hex is a valid public key",
 	sendDecision: "open decision: should `agx send` refuse a key in the message, subject or context id?",
@@ -1124,164 +1376,796 @@ const WHY = {
 
 /** Slots whose job is to take a secret and keep it: the value is expected in a file or a request. */
 const INTENDED: readonly KnownLeak[] = [
-	{ commands: ["tailscale enable"], slots: ["--auth-key", "--auth-key-stdin (stdin)", "--oauth-client-secret", "--oauth-client-secret-stdin (stdin)"], forms: "*", channels: ["file-content"], reason: "a Tailscale secret is kept in tailscale.json" },
-	{ commands: ["config set"], slots: ["--stdin (stdin) (key=apiKey)", "[value] (key=apiKey)"], forms: ["nsec", "ncryptsec", "hex", "HEX", "nostr", "escaped"], channels: ["file-content", "request"], reason: "config set apiKey keeps the API key and sends it to the index as the bearer" },
-	{ commands: ["identity import"], slots: ["--stdin (stdin)", "[secret]"], forms: ["nsec", "nostr"], channels: ["file-content"], reason: "identity import keeps the key it is given, in identity.json" },
+	{ command: "config set", slot: "--stdin (stdin) (key=apiKey)", forms: ["nsec", "ncryptsec", "hex", "HEX", "nostr", "escaped", "NSEC"], channels: ["file-content", "request"], reason: "config set apiKey keeps the API key and sends it to the index as the bearer" },
+	{ command: "config set", slot: "[value] (key=apiKey)", forms: ["nsec", "ncryptsec", "hex", "HEX", "nostr", "escaped", "NSEC"], channels: ["file-content", "request"], reason: "config set apiKey keeps the API key and sends it to the index as the bearer" },
+	{ command: "identity import", slot: "--stdin (stdin)", forms: ["nsec", "nostr", "NSEC"], channels: ["file-content"], reason: "identity import keeps the key it is given, in identity.json" },
+	{ command: "identity import", slot: "[secret]", forms: ["nsec", "nostr", "NSEC"], channels: ["file-content"], reason: "identity import keeps the key it is given, in identity.json" },
+	{ command: "tailscale enable", slot: "--auth-key", forms: ALL, channels: ["file-content"], reason: "a Tailscale secret is kept in tailscale.json" },
+	{ command: "tailscale enable", slot: "--auth-key-stdin (stdin)", forms: ALL, channels: ["file-content"], reason: "a Tailscale secret is kept in tailscale.json" },
+	{ command: "tailscale enable", slot: "--oauth-client-secret", forms: ALL, channels: ["file-content"], reason: "a Tailscale secret is kept in tailscale.json" },
+	{ command: "tailscale enable", slot: "--oauth-client-secret-stdin (stdin)", forms: ALL, channels: ["file-content"], reason: "a Tailscale secret is kept in tailscale.json" },
 ];
 
 /** What `main` still repeats, writes or sends. Each fix deletes its lines. */
 const KNOWN_LEAKS: readonly KnownLeak[] = [
-	{ commands: ["gateway (HTTP API)"], slots: ["<saved when the gateway stops>"], forms: ["hex", "HEX"], channels: ["file-content"], reason: WHY.afterStop },
-	{ commands: ["serve"], slots: ["--allow", "--handler"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: "*", slots: ["--api-base-url"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["search"], slots: ["--capability", "--category", "[query]"], forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
-	{ commands: ["serve"], slots: ["--capability"], forms: ["escaped"], channels: ["stdout"], reason: WHY.escaped },
-	{ commands: ["ui"], slots: ["--compose", "--idle"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["domain add"], slots: ["--handle"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["gateway"], slots: ["--host"], forms: ["escaped"], channels: ["connect", "json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["tailscale enable"], slots: ["--hostname", "--state-dir"], forms: ["escaped"], channels: ["file-content", "stdout"], reason: WHY.escaped },
-	{ commands: ["gateway key new"], slots: ["--label"], forms: ["escaped"], channels: ["file-content", "json-stdout", "stdout"], reason: WHY.escaped },
-	{ commands: ["peers allowlist"], slots: ["--name", "--npub"], forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
-	{ commands: ["tailscale enable"], slots: ["--oauth-api-base-url", "--oauth-client-id", "--oauth-scope", "--oauth-tailnet", "--oauth-url", "--tag"], forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
-	{ commands: ["tailscale enable"], slots: ["--oauth-token-auth"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["domain add", "domain remove", "domain verify", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers list", "peers refuse"], slots: ["--org"], forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
-	{ commands: ["domain list", "identity register", "listing list", "register", "search"], slots: ["--org"], forms: ["escaped"], channels: ["request", "stdout"], reason: WHY.escaped },
-	{ commands: ["login"], slots: ["--org"], forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
-	{ commands: "*", slots: ["--peer", "--reason"], forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
-	{ commands: ["gateway", "ui"], slots: ["--port"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["listing create"], slots: ["--pubkey"], forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
-	{ commands: ["card"], slots: ["--relay"], forms: ["escaped"], channels: ["connect", "json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["org create"], slots: ["--slug", "<name>"], forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
-	{ commands: ["config set"], slots: ["--stdin (stdin) (key=apiBaseUrl)", "<key>", "[value] (key=apiBaseUrl)"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["config set"], slots: ["--stdin (stdin) (key=nip05)", "--stdin (stdin) (key=org)", "--stdin (stdin) (key=orgSlug)", "--stdin (stdin) (key=relays)", "[value] (key=nip05)", "[value] (key=org)", "[value] (key=orgSlug)", "[value] (key=relays)"], forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
-	{ commands: ["listing create", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers refuse"], slots: ["--team"], forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
-	{ commands: ["peers list"], slots: ["--team"], forms: ["escaped"], channels: ["request", "stdout"], reason: WHY.escaped },
-	{ commands: ["domain verify", "wait"], slots: ["--timeout"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: "*", slots: ["--visibility"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["inbox"], slots: ["--wait"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["request"], slots: ["<capability>"], forms: ["escaped"], channels: ["json-stdout", "stdout"], reason: WHY.escaped },
-	{ commands: ["thread"], slots: ["<contextId>"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["domain add"], slots: ["<domain>"], forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
-	{ commands: "*", slots: ["<domainId>"], forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
-	{ commands: ["gateway key revoke"], slots: ["<id>"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["identity sign"], slots: ["<nonce>"], forms: ["escaped"], channels: ["json-stdout", "stdout"], reason: WHY.escaped },
-	{ commands: "*", slots: ["<npub>"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: "*", slots: ["<peer>"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["identity deny"], slots: ["<peers...>"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: "*", slots: ["[listingId]"], forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
-	{ commands: ["identity allow"], slots: ["[peers...]"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
-	{ commands: ["gateway (HTTP API)"], slots: ["POST /v1/messages subject", "POST /v1/messages text"], forms: ["nsec", "ncryptsec", "nostr", "escaped", "sentence"], channels: ["file-content"], reason: WHY.messageText },
-	{ commands: "*", slots: ["--api-base-url"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["search"], slots: ["--capability", "--category", "[query]"], forms: ["hex", "HEX"], channels: ["request"], reason: WHY.ownHex },
-	{ commands: ["serve"], slots: ["--capability"], forms: ["hex", "HEX"], channels: ["stdout"], reason: WHY.ownHex },
-	{ commands: ["ui"], slots: ["--compose", "--idle"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["domain add"], slots: ["--handle"], forms: ["HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["serve"], slots: ["--handler"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["gateway"], slots: ["--host"], forms: ["hex", "HEX"], channels: ["connect", "json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["tailscale enable"], slots: ["--hostname", "--state-dir"], forms: ["hex", "HEX"], channels: ["file-content", "stdout"], reason: WHY.ownHex },
-	{ commands: ["gateway key new"], slots: ["--label"], forms: ["hex", "HEX"], channels: ["file-content", "json-stdout", "stdout"], reason: WHY.ownHex },
-	{ commands: ["peers allowlist"], slots: ["--name", "--npub"], forms: ["hex", "HEX"], channels: ["request"], reason: WHY.ownHex },
-	{ commands: ["tailscale enable"], slots: ["--oauth-api-base-url", "--oauth-client-id", "--oauth-scope", "--oauth-tailnet", "--oauth-url", "--tag"], forms: ["hex", "HEX"], channels: ["file-content"], reason: WHY.ownHex },
-	{ commands: ["tailscale enable"], slots: ["--oauth-token-auth"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["domain add", "domain remove", "domain verify", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers list", "peers refuse"], slots: ["--org"], forms: ["hex", "HEX"], channels: ["request"], reason: WHY.ownHex },
-	{ commands: ["domain list", "identity register", "listing list", "register", "search"], slots: ["--org"], forms: ["hex", "HEX"], channels: ["request", "stdout"], reason: WHY.ownHex },
-	{ commands: ["login"], slots: ["--org"], forms: ["hex", "HEX"], channels: ["file-content", "request"], reason: WHY.ownHex },
-	{ commands: ["request"], slots: ["--payload"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: "*", slots: ["--peer", "--reason"], forms: ["hex", "HEX"], channels: ["request"], reason: WHY.ownHex },
-	{ commands: ["gateway", "ui"], slots: ["--port"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["listing create"], slots: ["--pubkey"], forms: ["hex", "HEX"], channels: ["request"], reason: WHY.ownHex },
-	{ commands: ["card"], slots: ["--relay"], forms: ["hex", "HEX"], channels: ["connect", "json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["org create"], slots: ["--slug", "<name>"], forms: ["hex", "HEX"], channels: ["file-content", "request"], reason: WHY.ownHex },
-	{ commands: ["config set"], slots: ["--stdin (stdin) (key=apiBaseUrl)", "<key>", "[value] (key=apiBaseUrl)"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["config set"], slots: ["--stdin (stdin) (key=nip05)", "--stdin (stdin) (key=org)", "--stdin (stdin) (key=orgSlug)", "--stdin (stdin) (key=relays)", "[value] (key=nip05)", "[value] (key=org)", "[value] (key=orgSlug)", "[value] (key=relays)"], forms: ["hex", "HEX"], channels: ["file-content"], reason: WHY.ownHex },
-	{ commands: ["listing create", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers refuse"], slots: ["--team"], forms: ["hex", "HEX"], channels: ["request"], reason: WHY.ownHex },
-	{ commands: ["peers list"], slots: ["--team"], forms: ["hex", "HEX"], channels: ["request", "stdout"], reason: WHY.ownHex },
-	{ commands: ["domain verify", "wait"], slots: ["--timeout"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: "*", slots: ["--visibility"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["inbox"], slots: ["--wait"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["request"], slots: ["<capability>"], forms: ["hex", "HEX"], channels: ["json-stdout", "stdout"], reason: WHY.ownHex },
-	{ commands: ["thread"], slots: ["<contextId>"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["domain add"], slots: ["<domain>"], forms: ["hex", "HEX"], channels: ["request"], reason: WHY.ownHex },
-	{ commands: "*", slots: ["<domainId>"], forms: ["hex", "HEX"], channels: ["request"], reason: WHY.ownHex },
-	{ commands: ["gateway key revoke"], slots: ["<id>"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
-	{ commands: ["identity sign"], slots: ["<nonce>"], forms: ["hex", "HEX"], channels: ["json-stdout", "stdout"], reason: WHY.ownHex },
-	{ commands: "*", slots: ["<npub>"], forms: ["hex", "HEX"], channels: ["file-content", "json-stdout", "stdout"], reason: WHY.ownHex },
-	{ commands: ["card"], slots: ["<peer>"], forms: ["hex", "HEX"], channels: ["json-stderr", "relay", "stderr"], reason: WHY.ownHex },
-	{ commands: ["request"], slots: ["<peer>"], forms: ["hex", "HEX"], channels: ["json-stderr", "relay", "stderr", "stdout"], reason: WHY.ownHex },
-	{ commands: ["send"], slots: ["<peer>"], forms: ["hex", "HEX"], channels: ["file-content", "json-stdout", "relay", "stdout"], reason: WHY.ownHex },
-	{ commands: ["identity deny"], slots: ["<peers...>"], forms: ["hex", "HEX"], channels: ["stdout"], reason: WHY.ownHex },
-	{ commands: ["gateway (HTTP API)"], slots: ["<unknown path>", "<unknown path> under /v1", "DELETE /v1/subscriptions/:id", "GET /v1/agents/:peer ?capability", "GET /v1/subscriptions/:id", "POST /v1/messages contextId", "POST /v1/subscriptions allowedPeers", "POST /v1/subscriptions capabilities", "POST /v1/subscriptions label", "POST /v1/subscriptions url"], forms: ["hex", "HEX"], channels: ["response"], reason: WHY.ownHex },
-	{ commands: ["gateway (HTTP API)"], slots: ["GET /v1/agents/:peer", "POST /v1/messages peer", "POST /v1/tasks capability", "POST /v1/tasks peer"], forms: ["hex", "HEX"], channels: ["relay", "response"], reason: WHY.ownHex },
-	{ commands: "*", slots: ["[listingId]"], forms: ["hex", "HEX"], channels: ["file-content", "request"], reason: WHY.ownHex },
-	{ commands: ["identity allow"], slots: ["[peers...]"], forms: ["hex", "HEX"], channels: ["file-content", "stdout"], reason: WHY.ownHex },
-	{ commands: ["(program)"], slots: ["<unknown command>"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
-	{ commands: ["card", "config", "config list", "config path", "config set", "config show", "config use", "doctor", "domain", "domain add", "domain list", "domain remove", "domain verify", "gateway", "gateway key", "gateway key list", "gateway key new", "gateway key revoke", "held", "held allow", "held block", "held ignore", "held list", "identity", "identity allow", "identity deny", "identity export", "identity new", "identity register", "identity show", "identity sign", "inbox", "listing", "listing create", "listing delete", "listing delist", "listing get", "listing list", "listing publish", "listing set-policy", "listing set-visibility", "login", "logout", "org", "org create", "org list", "peers", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers list", "peers refuse", "register", "relay", "request", "search", "send", "serve", "tailscale", "tailscale disable", "tailscale enable", "tailscale status", "tailscale up", "thread", "threads", "ui", "wait", "whoami"], slots: ["<unknown option>"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
-	{ commands: "*", slots: ["<unknown subcommand>"], forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
-	{ commands: ["(program)"], slots: ["<unknown command>"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
-	{ commands: ["card", "config", "config list", "config path", "config set", "config show", "config use", "doctor", "domain", "domain add", "domain list", "domain remove", "domain verify", "gateway", "gateway key", "gateway key list", "gateway key new", "gateway key revoke", "held", "held allow", "held block", "held ignore", "held list", "identity", "identity allow", "identity deny", "identity export", "identity new", "identity register", "identity show", "identity sign", "inbox", "listing", "listing create", "listing delete", "listing delist", "listing get", "listing list", "listing publish", "listing set-policy", "listing set-visibility", "login", "logout", "org", "org create", "org list", "peers", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers list", "peers refuse", "register", "relay", "request", "search", "send", "serve", "tailscale", "tailscale disable", "tailscale enable", "tailscale status", "tailscale up", "thread", "threads", "ui", "wait", "whoami"], slots: ["<unknown option>"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
-	{ commands: "*", slots: ["<unknown subcommand>"], forms: ["hex", "HEX"], channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
-	{ commands: ["config show", "doctor", "logout", "tailscale status"], slots: ["--profile"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stdout", "stdout"], reason: WHY.pr64_66 },
-	{ commands: ["domain add", "domain list", "domain remove", "domain verify", "gateway", "identity export", "identity register", "identity show", "identity sign", "inbox", "listing create", "listing delete", "listing delist", "listing get", "listing list", "listing publish", "listing set-policy", "listing set-visibility", "org list", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers list", "peers refuse", "register", "request", "search", "send", "serve", "tailscale up", "ui", "wait"], slots: ["--profile"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
-	{ commands: ["gateway key new", "held allow", "held block", "held ignore"], slots: ["--profile"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "file-name"], reason: WHY.pr64_66 },
-	{ commands: ["identity allow"], slots: ["--profile"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["stdout"], reason: WHY.pr64_66 },
-	{ commands: ["identity deny"], slots: ["--profile"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content"], reason: WHY.pr64_66 },
-	{ commands: ["identity new", "login", "org create"], slots: ["--profile"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "file-name", "stdout"], reason: WHY.pr64_66 },
-	{ commands: ["tailscale disable"], slots: ["--profile"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "json-stdout", "stdout"], reason: WHY.pr64_66 },
-	{ commands: ["tailscale enable"], slots: ["--profile"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "stdout"], reason: WHY.pr64_66 },
-	{ commands: ["whoami"], slots: ["--profile"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "json-stdout", "stderr"], reason: WHY.pr64_66 },
-	{ commands: ["config use"], slots: ["<profile>"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "stdout"], reason: WHY.pr64_66 },
-	{ commands: "*", slots: ["--peer"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request"], reason: WHY.pr65 },
-	{ commands: "*", slots: ["[listingId]"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "request"], reason: WHY.pr65 },
-	{ commands: ["search"], slots: ["[query]"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request"], reason: WHY.pr65 },
-	{ commands: ["gateway (HTTP API)"], slots: ["DELETE /v1/subscriptions/:id", "GET /v1/agents/:peer", "GET /v1/subscriptions/:id", "POST /v1/messages peer", "POST /v1/subscriptions allowedPeers", "POST /v1/tasks peer"], forms: ["escaped"], channels: ["response"], reason: WHY.pr75 },
-	{ commands: ["gateway (HTTP API)"], slots: ["GET /v1/agents/:peer ?capability", "POST /v1/messages contextId", "POST /v1/tasks capability"], forms: ["nsec", "ncryptsec", "nostr", "escaped", "sentence"], channels: ["response"], reason: WHY.pr75 },
-	{ commands: ["gateway (HTTP API)"], slots: ["POST /v1/messages contextId"], forms: ["nsec", "ncryptsec", "nostr"], channels: ["file-content"], reason: WHY.pr75 },
-	{ commands: ["gateway (HTTP API)"], slots: ["POST /v1/subscriptions capabilities", "POST /v1/subscriptions label"], forms: ["nsec", "ncryptsec", "nostr", "escaped", "sentence"], channels: ["file-content", "response"], reason: WHY.pr75 },
-	{ commands: ["gateway (HTTP API)"], slots: ["POST /v1/subscriptions url"], forms: ["nsec", "ncryptsec", "escaped", "sentence"], channels: ["response"], reason: WHY.pr75 },
-	{ commands: ["config show", "doctor", "logout", "tailscale status"], slots: ["--profile"], forms: ["hex", "HEX", "escaped"], channels: ["json-stdout", "stdout"], reason: WHY.profileName },
-	{ commands: ["domain add", "domain list", "domain remove", "domain verify", "gateway", "identity export", "identity register", "identity show", "identity sign", "inbox", "listing create", "listing delete", "listing delist", "listing get", "listing list", "listing publish", "listing set-policy", "listing set-visibility", "org list", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers list", "peers refuse", "register", "request", "search", "send", "serve", "tailscale up", "ui", "wait"], slots: ["--profile"], forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
-	{ commands: ["gateway key new", "held allow", "held block", "held ignore"], slots: ["--profile"], forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name"], reason: WHY.profileName },
-	{ commands: ["identity allow"], slots: ["--profile"], forms: ["hex", "HEX", "escaped"], channels: ["stdout"], reason: WHY.profileName },
-	{ commands: ["identity deny"], slots: ["--profile"], forms: ["hex", "HEX", "escaped"], channels: ["file-content"], reason: WHY.profileName },
-	{ commands: ["identity new", "login", "org create"], slots: ["--profile"], forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name", "stdout"], reason: WHY.profileName },
-	{ commands: ["tailscale disable"], slots: ["--profile"], forms: ["hex", "HEX", "escaped"], channels: ["file-content", "json-stdout", "stdout"], reason: WHY.profileName },
-	{ commands: ["tailscale enable"], slots: ["--profile"], forms: ["hex", "HEX", "escaped"], channels: ["file-content", "stdout"], reason: WHY.profileName },
-	{ commands: ["whoami"], slots: ["--profile"], forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "json-stdout", "stderr"], reason: WHY.profileName },
-	{ commands: ["config use"], slots: ["<profile>"], forms: ["hex", "HEX", "escaped"], channels: ["file-content", "stdout"], reason: WHY.profileName },
-	{ commands: ["send"], slots: ["--context-id"], forms: "*", channels: ["file-content", "json-stdout", "stdout"], reason: WHY.sendDecision },
-	{ commands: ["send"], slots: ["--subject", "<message>"], forms: "*", channels: ["file-content"], reason: WHY.sendDecision },
-	{ commands: ["card", "config list", "config path", "config set", "config show", "config use", "doctor", "domain add", "domain list", "domain remove", "domain verify", "gateway key list", "gateway key new", "gateway key revoke", "held allow", "held block", "held ignore", "held list", "identity export", "identity new", "identity register", "identity show", "identity sign", "inbox", "listing create", "listing delete", "listing delist", "listing get", "listing list", "listing publish", "listing set-policy", "listing set-visibility", "login", "logout", "org create", "org list", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers list", "peers refuse", "register", "relay", "request", "search", "send", "serve", "tailscale disable", "tailscale enable", "tailscale status", "tailscale up", "thread", "threads", "ui", "wait", "whoami"], slots: ["<extra argument>"], forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
-	{ commands: "*", slots: ["--api-base-url"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["search"], slots: ["--capability", "--category"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request"], reason: WHY.unchecked },
-	{ commands: ["serve"], slots: ["--capability"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["stdout"], reason: WHY.unchecked },
-	{ commands: ["ui"], slots: ["--compose", "--idle"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["domain add"], slots: ["--handle"], forms: ["nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["serve"], slots: ["--handler"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["gateway"], slots: ["--host"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["connect", "json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["tailscale enable"], slots: ["--hostname", "--state-dir"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "stdout"], reason: WHY.unchecked },
-	{ commands: ["gateway key new"], slots: ["--label"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "json-stdout", "stdout"], reason: WHY.unchecked },
-	{ commands: ["peers allowlist"], slots: ["--name"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request"], reason: WHY.unchecked },
-	{ commands: ["tailscale enable"], slots: ["--oauth-api-base-url", "--oauth-client-id", "--oauth-scope", "--oauth-tailnet", "--oauth-url", "--tag"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content"], reason: WHY.unchecked },
-	{ commands: ["domain add", "domain remove", "domain verify", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers list", "peers refuse"], slots: ["--org"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request"], reason: WHY.unchecked },
-	{ commands: ["domain list", "identity register", "listing list", "register", "search"], slots: ["--org"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request", "stdout"], reason: WHY.unchecked },
-	{ commands: ["login"], slots: ["--org"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "request"], reason: WHY.unchecked },
-	{ commands: ["gateway", "ui"], slots: ["--port"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: "*", slots: ["--reason"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request"], reason: WHY.unchecked },
-	{ commands: ["card"], slots: ["--relay"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["card"], slots: ["--relay"], forms: ["nsec", "ncryptsec"], channels: ["connect"], reason: WHY.unchecked },
-	{ commands: ["org create"], slots: ["--slug", "<name>"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content", "request"], reason: WHY.unchecked },
-	{ commands: ["config set"], slots: ["--stdin (stdin) (key=apiBaseUrl)", "<key>", "[value] (key=apiBaseUrl)"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["config set"], slots: ["--stdin (stdin) (key=nip05)", "--stdin (stdin) (key=org)", "--stdin (stdin) (key=orgSlug)", "--stdin (stdin) (key=relays)", "[value] (key=nip05)", "[value] (key=org)", "[value] (key=orgSlug)", "[value] (key=relays)"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["file-content"], reason: WHY.unchecked },
-	{ commands: ["listing create", "peers accept", "peers allowlist", "peers block", "peers ignore", "peers refuse"], slots: ["--team"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request"], reason: WHY.unchecked },
-	{ commands: ["peers list"], slots: ["--team"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request", "stdout"], reason: WHY.unchecked },
-	{ commands: ["domain verify", "wait"], slots: ["--timeout"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["inbox"], slots: ["--wait"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["request"], slots: ["<capability>"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stdout", "stdout"], reason: WHY.unchecked },
-	{ commands: ["thread"], slots: ["<contextId>"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["domain add"], slots: ["<domain>"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request"], reason: WHY.unchecked },
-	{ commands: "*", slots: ["<domainId>"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["request"], reason: WHY.unchecked },
-	{ commands: ["gateway key revoke"], slots: ["<id>"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
-	{ commands: ["identity sign"], slots: ["<nonce>"], forms: ["nsec", "ncryptsec", "nostr", "sentence"], channels: ["json-stdout", "stdout"], reason: WHY.unchecked },
+	{ command: "(program)", slot: "<unknown command>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "(program)", slot: "<unknown command>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "card", slot: "--relay", forms: OWN, channels: ["connect", "json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "card", slot: "--relay", forms: ["escaped"], channels: ["connect", "json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "card", slot: "--relay", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "card", slot: "--relay", forms: ["nsec", "ncryptsec", "NSEC"], channels: ["connect"], reason: WHY.unchecked },
+	{ command: "card", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "card", slot: "<peer>", forms: OWN, channels: ["json-stderr", "relay", "stderr"], reason: WHY.ownHex },
+	{ command: "card", slot: "<peer>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "card", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "card", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "config", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "config", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "config", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "config", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "config list", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "config list", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "config list", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "config path", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "config path", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "config path", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "config set", slot: "--profile", forms: SHAPED, channels: ["file-content", "stdout"], reason: WHY.pr64_66 },
+	{ command: "config set", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "stdout"], reason: WHY.profileName },
+	{ command: "config set", slot: "--stdin (stdin) (key=apiBaseUrl)", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "config set", slot: "--stdin (stdin) (key=apiBaseUrl)", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "config set", slot: "--stdin (stdin) (key=apiBaseUrl)", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "config set", slot: "--stdin (stdin) (key=nip05)", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "config set", slot: "--stdin (stdin) (key=nip05)", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "config set", slot: "--stdin (stdin) (key=nip05)", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "config set", slot: "--stdin (stdin) (key=org)", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "config set", slot: "--stdin (stdin) (key=org)", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "config set", slot: "--stdin (stdin) (key=org)", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "config set", slot: "--stdin (stdin) (key=orgSlug)", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "config set", slot: "--stdin (stdin) (key=orgSlug)", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "config set", slot: "--stdin (stdin) (key=orgSlug)", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "config set", slot: "--stdin (stdin) (key=relays)", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "config set", slot: "--stdin (stdin) (key=relays)", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "config set", slot: "--stdin (stdin) (key=relays)", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "config set", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "config set", slot: "<key>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "config set", slot: "<key>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "config set", slot: "<key>", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "config set", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "config set", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "config set", slot: "[value] (key=apiBaseUrl)", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "config set", slot: "[value] (key=apiBaseUrl)", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "config set", slot: "[value] (key=apiBaseUrl)", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "config set", slot: "[value] (key=nip05)", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "config set", slot: "[value] (key=nip05)", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "config set", slot: "[value] (key=nip05)", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "config set", slot: "[value] (key=org)", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "config set", slot: "[value] (key=org)", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "config set", slot: "[value] (key=org)", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "config set", slot: "[value] (key=orgSlug)", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "config set", slot: "[value] (key=orgSlug)", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "config set", slot: "[value] (key=orgSlug)", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "config set", slot: "[value] (key=relays)", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "config set", slot: "[value] (key=relays)", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "config set", slot: "[value] (key=relays)", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "config show", slot: "--profile", forms: SHAPED, channels: ["json-stdout", "stdout"], reason: WHY.pr64_66 },
+	{ command: "config show", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stdout", "stdout"], reason: WHY.profileName },
+	{ command: "config show", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "config show", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "config show", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "config use", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "config use", slot: "<profile>", forms: SHAPED, channels: ["file-content", "stdout"], reason: WHY.pr64_66 },
+	{ command: "config use", slot: "<profile>", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "stdout"], reason: WHY.profileName },
+	{ command: "config use", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "config use", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "doctor", slot: "--profile", forms: SHAPED, channels: ["json-stdout", "stdout"], reason: WHY.pr64_66 },
+	{ command: "doctor", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stdout", "stdout"], reason: WHY.profileName },
+	{ command: "doctor", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "doctor", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "doctor", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "domain", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "domain", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "domain", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "domain", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "domain add", slot: "--handle", forms: ["HEX"], channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "domain add", slot: "--handle", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "domain add", slot: "--handle", forms: ["nostr", "sentence", "NSEC"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "domain add", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "domain add", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "domain add", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "domain add", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "domain add", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "domain add", slot: "<domain>", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "domain add", slot: "<domain>", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "domain add", slot: "<domain>", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "domain add", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "domain add", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "domain add", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "domain list", slot: "--org", forms: OWN, channels: ["request", "stdout"], reason: WHY.ownHex },
+	{ command: "domain list", slot: "--org", forms: ["escaped"], channels: ["request", "stdout"], reason: WHY.escaped },
+	{ command: "domain list", slot: "--org", forms: SHAPED, channels: ["request", "stdout"], reason: WHY.unchecked },
+	{ command: "domain list", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "domain list", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "domain list", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "domain list", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "domain list", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "domain remove", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "domain remove", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "domain remove", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "domain remove", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "domain remove", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "domain remove", slot: "<domainId>", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "domain remove", slot: "<domainId>", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "domain remove", slot: "<domainId>", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "domain remove", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "domain remove", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "domain remove", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "domain verify", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "domain verify", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "domain verify", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "domain verify", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "domain verify", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "domain verify", slot: "--timeout", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "domain verify", slot: "--timeout", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "domain verify", slot: "--timeout", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "domain verify", slot: "<domainId>", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "domain verify", slot: "<domainId>", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "domain verify", slot: "<domainId>", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "domain verify", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "domain verify", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "domain verify", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "gateway", slot: "--host", forms: OWN, channels: ["connect", "json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "gateway", slot: "--host", forms: ["escaped"], channels: ["connect", "json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "gateway", slot: "--host", forms: SHAPED, channels: ["connect", "json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "gateway", slot: "--port", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "gateway", slot: "--port", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "gateway", slot: "--port", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "gateway", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "gateway", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "gateway", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "gateway", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "gateway", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "gateway", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "gateway (HTTP API)", slot: "<saved when the gateway stops>", forms: OWN, channels: ["file-content"], reason: WHY.afterStop },
+	{ command: "gateway (HTTP API)", slot: "<unknown path>", forms: OWN, channels: ["response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "<unknown path> under /v1", forms: OWN, channels: ["response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "DELETE /v1/subscriptions/:id", forms: ["escaped"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "DELETE /v1/subscriptions/:id", forms: OWN, channels: ["response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "GET /v1/agents/:peer", forms: ["escaped"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "GET /v1/agents/:peer", forms: OWN, channels: ["relay", "response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "GET /v1/agents/:peer ?capability", forms: ["nsec", "ncryptsec", "nostr", "escaped", "sentence", "NSEC"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "GET /v1/agents/:peer ?capability", forms: OWN, channels: ["response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "GET /v1/subscriptions/:id", forms: ["escaped"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "GET /v1/subscriptions/:id", forms: OWN, channels: ["response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/messages contextId", forms: ["nsec", "ncryptsec", "nostr", "escaped", "sentence", "NSEC"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/messages contextId", forms: ["nsec", "ncryptsec", "nostr", "NSEC"], channels: ["file-content"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/messages contextId", forms: OWN, channels: ["file-content", "response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/messages peer", forms: ["escaped"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/messages peer", forms: OWN, channels: ["file-content", "relay", "response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/messages subject", forms: ALL, channels: ["file-content"], reason: WHY.messageText },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/messages text", forms: ALL, channels: ["file-content"], reason: WHY.messageText },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/subscriptions allowedPeers", forms: ["escaped"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/subscriptions allowedPeers", forms: OWN, channels: ["file-content", "response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/subscriptions capabilities", forms: ["nsec", "ncryptsec", "nostr", "escaped", "sentence", "NSEC"], channels: ["file-content", "response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/subscriptions capabilities", forms: OWN, channels: ["file-content", "response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/subscriptions label", forms: ["nsec", "ncryptsec", "nostr", "escaped", "sentence", "NSEC"], channels: ["file-content", "response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/subscriptions label", forms: OWN, channels: ["file-content", "response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/subscriptions url", forms: ["nsec", "ncryptsec", "escaped", "sentence", "NSEC"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/subscriptions url", forms: OWN, channels: ["response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/tasks capability", forms: ["nsec", "ncryptsec", "nostr", "escaped", "sentence", "NSEC"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/tasks capability", forms: OWN, channels: ["response"], reason: WHY.ownHex },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/tasks peer", forms: ["escaped"], channels: ["response"], reason: WHY.pr75 },
+	{ command: "gateway (HTTP API)", slot: "POST /v1/tasks peer", forms: OWN, channels: ["relay", "response"], reason: WHY.ownHex },
+	{ command: "gateway key", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "gateway key", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "gateway key", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "gateway key", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "gateway key list", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "gateway key list", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "gateway key list", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "gateway key new", slot: "--label", forms: OWN, channels: ["file-content", "json-stdout", "stdout"], reason: WHY.ownHex },
+	{ command: "gateway key new", slot: "--label", forms: ["escaped"], channels: ["file-content", "json-stdout", "stdout"], reason: WHY.escaped },
+	{ command: "gateway key new", slot: "--label", forms: SHAPED, channels: ["file-content", "json-stdout", "stdout"], reason: WHY.unchecked },
+	{ command: "gateway key new", slot: "--profile", forms: SHAPED, channels: ["file-content", "file-name"], reason: WHY.pr64_66 },
+	{ command: "gateway key new", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name"], reason: WHY.profileName },
+	{ command: "gateway key new", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "gateway key new", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "gateway key new", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "gateway key revoke", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "gateway key revoke", slot: "<id>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "gateway key revoke", slot: "<id>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "gateway key revoke", slot: "<id>", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "gateway key revoke", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "gateway key revoke", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "held", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "held", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "held", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "held", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "held allow", slot: "--profile", forms: SHAPED, channels: ["file-content", "file-name"], reason: WHY.pr64_66 },
+	{ command: "held allow", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name"], reason: WHY.profileName },
+	{ command: "held allow", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "held allow", slot: "<npub>", forms: OWN, channels: ["file-content", "json-stdout", "stdout"], reason: WHY.ownHex },
+	{ command: "held allow", slot: "<npub>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "held allow", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "held allow", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "held block", slot: "--profile", forms: SHAPED, channels: ["file-content", "file-name"], reason: WHY.pr64_66 },
+	{ command: "held block", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name"], reason: WHY.profileName },
+	{ command: "held block", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "held block", slot: "<npub>", forms: OWN, channels: ["file-content", "json-stdout", "stdout"], reason: WHY.ownHex },
+	{ command: "held block", slot: "<npub>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "held block", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "held block", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "held ignore", slot: "--profile", forms: SHAPED, channels: ["file-content", "file-name"], reason: WHY.pr64_66 },
+	{ command: "held ignore", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name"], reason: WHY.profileName },
+	{ command: "held ignore", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "held ignore", slot: "<npub>", forms: OWN, channels: ["file-content", "json-stdout", "stdout"], reason: WHY.ownHex },
+	{ command: "held ignore", slot: "<npub>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "held ignore", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "held ignore", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "held list", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "held list", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "held list", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "identity", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "identity", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "identity", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "identity", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "identity allow", slot: "--profile", forms: SHAPED, channels: ["file-content"], reason: WHY.pr64_66 },
+	{ command: "identity allow", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content"], reason: WHY.profileName },
+	{ command: "identity allow", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "identity allow", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "identity allow", slot: "[peers...]", forms: OWN, channels: ["file-content", "stdout"], reason: WHY.ownHex },
+	{ command: "identity allow", slot: "[peers...]", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "identity deny", slot: "--profile", forms: SHAPED, channels: ["file-content"], reason: WHY.pr64_66 },
+	{ command: "identity deny", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content"], reason: WHY.profileName },
+	{ command: "identity deny", slot: "<peers...>", forms: OWN, channels: ["stdout"], reason: WHY.ownHex },
+	{ command: "identity deny", slot: "<peers...>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "identity deny", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "identity deny", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "identity export", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "identity export", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "identity export", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "identity export", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "identity export", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "identity import", slot: "--profile", forms: SHAPED, channels: ["file-content", "file-name", "stdout"], reason: WHY.pr64_66 },
+	{ command: "identity import", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name", "stdout"], reason: WHY.profileName },
+	{ command: "identity new", slot: "--profile", forms: SHAPED, channels: ["file-content", "file-name", "stdout"], reason: WHY.pr64_66 },
+	{ command: "identity new", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name", "stdout"], reason: WHY.profileName },
+	{ command: "identity new", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "identity new", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "identity new", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "identity register", slot: "--capability", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--capability", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--capability", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--category", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--category", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--category", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--description", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--description", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--description", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--display-name", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--display-name", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--display-name", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--domain-id", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--domain-id", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--domain-id", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--handle", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--handle", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--handle", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--org", forms: OWN, channels: ["request", "stdout"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--org", forms: ["escaped"], channels: ["request", "stdout"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--org", forms: SHAPED, channels: ["request", "stdout"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "identity register", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "identity register", slot: "--runtime", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--runtime", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--runtime", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--slug", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--slug", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--slug", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--summary", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--summary", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--summary", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--tag", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--tag", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--tag", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--use-cases", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--use-cases", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "identity register", slot: "--use-cases", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "identity register", slot: "--visibility", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "identity register", slot: "--visibility", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "identity register", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "identity register", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "identity register", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "identity show", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "identity show", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "identity show", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "identity show", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "identity show", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "identity sign", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "identity sign", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "identity sign", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "identity sign", slot: "<nonce>", forms: OWN, channels: ["json-stdout", "stdout"], reason: WHY.ownHex },
+	{ command: "identity sign", slot: "<nonce>", forms: ["escaped"], channels: ["json-stdout", "stdout"], reason: WHY.escaped },
+	{ command: "identity sign", slot: "<nonce>", forms: SHAPED, channels: ["json-stdout", "stdout"], reason: WHY.unchecked },
+	{ command: "identity sign", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "identity sign", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "inbox", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "inbox", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "inbox", slot: "--wait", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "inbox", slot: "--wait", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "inbox", slot: "--wait", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "inbox", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "inbox", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "inbox", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing create", slot: "--capability", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--capability", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--capability", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--category", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--category", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--category", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--description", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--description", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--description", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--display-name", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--display-name", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--display-name", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--domain-id", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--domain-id", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--domain-id", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--handle", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--handle", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--handle", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "listing create", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "listing create", slot: "--pubkey", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--pubkey", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--relay", forms: OWN, channels: ["stdout"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--relay", forms: ["escaped"], channels: ["stdout"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--relay", forms: SHAPED, channels: ["stdout"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--runtime", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--runtime", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--runtime", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--slug", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--slug", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--slug", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--summary", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--summary", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--summary", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--tag", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--tag", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--tag", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--team", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--team", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing create", slot: "--team", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing create", slot: "--visibility", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "listing create", slot: "--visibility", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "listing create", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "listing create", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing create", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing delete", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing delete", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing delete", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing delete", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "listing delete", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "listing delete", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "listing delete", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing delete", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing delete", slot: "[listingId]", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.pr65 },
+	{ command: "listing delete", slot: "[listingId]", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "listing delete", slot: "[listingId]", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "listing delist", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing delist", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing delist", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing delist", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "listing delist", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "listing delist", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "listing delist", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing delist", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing delist", slot: "[listingId]", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.pr65 },
+	{ command: "listing delist", slot: "[listingId]", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "listing delist", slot: "[listingId]", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "listing get", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing get", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing get", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing get", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "listing get", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "listing get", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "listing get", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing get", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing get", slot: "[listingId]", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.pr65 },
+	{ command: "listing get", slot: "[listingId]", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "listing get", slot: "[listingId]", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "listing list", slot: "--org", forms: OWN, channels: ["request", "stdout"], reason: WHY.ownHex },
+	{ command: "listing list", slot: "--org", forms: ["escaped"], channels: ["request", "stdout"], reason: WHY.escaped },
+	{ command: "listing list", slot: "--org", forms: SHAPED, channels: ["request", "stdout"], reason: WHY.unchecked },
+	{ command: "listing list", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "listing list", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "listing list", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "listing list", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing list", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing publish", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing publish", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing publish", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing publish", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "listing publish", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "listing publish", slot: "--timeout", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "listing publish", slot: "--timeout", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "listing publish", slot: "--timeout", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "listing publish", slot: "--visibility", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "listing publish", slot: "--visibility", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "listing publish", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "listing publish", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing publish", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing publish", slot: "[listingId]", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.pr65 },
+	{ command: "listing publish", slot: "[listingId]", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "listing publish", slot: "[listingId]", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "listing set-policy", slot: "--capability", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing set-policy", slot: "--capability", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing set-policy", slot: "--capability", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing set-policy", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing set-policy", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing set-policy", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing set-policy", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "listing set-policy", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "listing set-policy", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "listing set-policy", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing set-policy", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing set-policy", slot: "[listingId]", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.pr65 },
+	{ command: "listing set-policy", slot: "[listingId]", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "listing set-policy", slot: "[listingId]", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "listing set-visibility", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "listing set-visibility", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "listing set-visibility", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "listing set-visibility", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "listing set-visibility", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "listing set-visibility", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "listing set-visibility", slot: "<level>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "listing set-visibility", slot: "<level>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "listing set-visibility", slot: "<level>", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "listing set-visibility", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "listing set-visibility", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "listing set-visibility", slot: "[listingId]", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.pr65 },
+	{ command: "listing set-visibility", slot: "[listingId]", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "listing set-visibility", slot: "[listingId]", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "login", slot: "--api-base-url", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "login", slot: "--api-base-url", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "login", slot: "--api-base-url", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "login", slot: "--org", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "login", slot: "--org", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "login", slot: "--org", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.unchecked },
+	{ command: "login", slot: "--org-name", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "login", slot: "--org-name", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "login", slot: "--org-name", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.unchecked },
+	{ command: "login", slot: "--org-slug", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "login", slot: "--org-slug", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "login", slot: "--org-slug", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.unchecked },
+	{ command: "login", slot: "--profile", forms: SHAPED, channels: ["file-content", "file-name", "stdout"], reason: WHY.pr64_66 },
+	{ command: "login", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name", "stdout"], reason: WHY.profileName },
+	{ command: "login", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "login", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "login", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "logout", slot: "--profile", forms: SHAPED, channels: ["json-stdout", "stdout"], reason: WHY.pr64_66 },
+	{ command: "logout", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stdout", "stdout"], reason: WHY.profileName },
+	{ command: "logout", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "logout", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "logout", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "org", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "org", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "org", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "org", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "org create", slot: "--api-base-url", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "org create", slot: "--api-base-url", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "org create", slot: "--api-base-url", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "org create", slot: "--profile", forms: SHAPED, channels: ["file-content", "file-name", "stdout"], reason: WHY.pr64_66 },
+	{ command: "org create", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "file-name", "stdout"], reason: WHY.profileName },
+	{ command: "org create", slot: "--slug", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "org create", slot: "--slug", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "org create", slot: "--slug", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.unchecked },
+	{ command: "org create", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "org create", slot: "<name>", forms: OWN, channels: ["file-content", "request"], reason: WHY.ownHex },
+	{ command: "org create", slot: "<name>", forms: ["escaped"], channels: ["file-content", "request"], reason: WHY.escaped },
+	{ command: "org create", slot: "<name>", forms: SHAPED, channels: ["file-content", "request"], reason: WHY.unchecked },
+	{ command: "org create", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "org create", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "org list", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "org list", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "org list", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "org list", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "org list", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "peers", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "peers", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "peers", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "peers", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "peers accept", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers accept", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers accept", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers accept", slot: "--peer", forms: SHAPED, channels: ["request"], reason: WHY.pr65 },
+	{ command: "peers accept", slot: "--peer", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers accept", slot: "--peer", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers accept", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "peers accept", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "peers accept", slot: "--reason", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers accept", slot: "--reason", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers accept", slot: "--reason", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers accept", slot: "--team", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers accept", slot: "--team", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers accept", slot: "--team", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers accept", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "peers accept", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "peers accept", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "peers allowlist", slot: "--name", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers allowlist", slot: "--name", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers allowlist", slot: "--name", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers allowlist", slot: "--npub", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers allowlist", slot: "--npub", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers allowlist", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers allowlist", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers allowlist", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers allowlist", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "peers allowlist", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "peers allowlist", slot: "--team", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers allowlist", slot: "--team", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers allowlist", slot: "--team", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers allowlist", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "peers allowlist", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "peers allowlist", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "peers block", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers block", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers block", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers block", slot: "--peer", forms: SHAPED, channels: ["request"], reason: WHY.pr65 },
+	{ command: "peers block", slot: "--peer", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers block", slot: "--peer", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers block", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "peers block", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "peers block", slot: "--reason", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers block", slot: "--reason", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers block", slot: "--reason", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers block", slot: "--team", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers block", slot: "--team", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers block", slot: "--team", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers block", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "peers block", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "peers block", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "peers ignore", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers ignore", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers ignore", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers ignore", slot: "--peer", forms: SHAPED, channels: ["request"], reason: WHY.pr65 },
+	{ command: "peers ignore", slot: "--peer", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers ignore", slot: "--peer", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers ignore", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "peers ignore", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "peers ignore", slot: "--reason", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers ignore", slot: "--reason", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers ignore", slot: "--reason", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers ignore", slot: "--team", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers ignore", slot: "--team", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers ignore", slot: "--team", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers ignore", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "peers ignore", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "peers ignore", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "peers list", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers list", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers list", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers list", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "peers list", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "peers list", slot: "--team", forms: OWN, channels: ["request", "stdout"], reason: WHY.ownHex },
+	{ command: "peers list", slot: "--team", forms: ["escaped"], channels: ["request", "stdout"], reason: WHY.escaped },
+	{ command: "peers list", slot: "--team", forms: SHAPED, channels: ["request", "stdout"], reason: WHY.unchecked },
+	{ command: "peers list", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "peers list", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "peers list", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "peers refuse", slot: "--org", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers refuse", slot: "--org", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers refuse", slot: "--org", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers refuse", slot: "--peer", forms: SHAPED, channels: ["request"], reason: WHY.pr65 },
+	{ command: "peers refuse", slot: "--peer", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers refuse", slot: "--peer", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers refuse", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "peers refuse", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "peers refuse", slot: "--reason", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers refuse", slot: "--reason", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers refuse", slot: "--reason", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers refuse", slot: "--team", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "peers refuse", slot: "--team", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "peers refuse", slot: "--team", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "peers refuse", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "peers refuse", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "peers refuse", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "register", slot: "--capability", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--capability", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--capability", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--category", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--category", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--category", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--description", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--description", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--description", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--display-name", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--display-name", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--display-name", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--domain-id", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--domain-id", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--domain-id", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--handle", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--handle", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--handle", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--org", forms: OWN, channels: ["request", "stdout"], reason: WHY.ownHex },
+	{ command: "register", slot: "--org", forms: ["escaped"], channels: ["request", "stdout"], reason: WHY.escaped },
+	{ command: "register", slot: "--org", forms: SHAPED, channels: ["request", "stdout"], reason: WHY.unchecked },
+	{ command: "register", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "register", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "register", slot: "--runtime", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--runtime", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--runtime", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--slug", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--slug", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--slug", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--summary", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--summary", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--summary", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--tag", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--tag", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--tag", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--use-cases", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "register", slot: "--use-cases", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "register", slot: "--use-cases", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "register", slot: "--visibility", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "register", slot: "--visibility", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "register", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "register", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "register", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "relay", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "relay", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "relay", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "request", slot: "--payload", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "request", slot: "--payload", forms: ["nsec", "NSEC"], channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "request", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "request", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "request", slot: "<capability>", forms: OWN, channels: ["json-stdout", "stdout"], reason: WHY.ownHex },
+	{ command: "request", slot: "<capability>", forms: ["escaped"], channels: ["json-stdout", "stdout"], reason: WHY.escaped },
+	{ command: "request", slot: "<capability>", forms: SHAPED, channels: ["json-stdout", "stdout"], reason: WHY.unchecked },
+	{ command: "request", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "request", slot: "<peer>", forms: OWN, channels: ["json-stderr", "relay", "stderr", "stdout"], reason: WHY.ownHex },
+	{ command: "request", slot: "<peer>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "request", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "request", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "search", slot: "--capability", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "search", slot: "--capability", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "search", slot: "--capability", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "search", slot: "--category", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "search", slot: "--category", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "search", slot: "--category", forms: SHAPED, channels: ["request"], reason: WHY.unchecked },
+	{ command: "search", slot: "--org", forms: OWN, channels: ["request", "stdout"], reason: WHY.ownHex },
+	{ command: "search", slot: "--org", forms: ["escaped"], channels: ["request", "stdout"], reason: WHY.escaped },
+	{ command: "search", slot: "--org", forms: SHAPED, channels: ["request", "stdout"], reason: WHY.unchecked },
+	{ command: "search", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "search", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "search", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "search", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "search", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "search", slot: "[query]", forms: SHAPED, channels: ["request"], reason: WHY.pr65 },
+	{ command: "search", slot: "[query]", forms: OWN, channels: ["request"], reason: WHY.ownHex },
+	{ command: "search", slot: "[query]", forms: ["escaped"], channels: ["request"], reason: WHY.escaped },
+	{ command: "send", slot: "--context-id", forms: ALL, channels: ["file-content", "json-stdout", "stdout"], reason: WHY.sendDecision },
+	{ command: "send", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "send", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "send", slot: "--subject", forms: ALL, channels: ["file-content"], reason: WHY.sendDecision },
+	{ command: "send", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "send", slot: "<message>", forms: ALL, channels: ["file-content"], reason: WHY.sendDecision },
+	{ command: "send", slot: "<peer>", forms: OWN, channels: ["file-content", "json-stdout", "relay", "stdout"], reason: WHY.ownHex },
+	{ command: "send", slot: "<peer>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "send", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "send", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "serve", slot: "--allow", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "serve", slot: "--capability", forms: OWN, channels: ["stdout"], reason: WHY.ownHex },
+	{ command: "serve", slot: "--capability", forms: ["escaped"], channels: ["stdout"], reason: WHY.escaped },
+	{ command: "serve", slot: "--capability", forms: SHAPED, channels: ["stdout"], reason: WHY.unchecked },
+	{ command: "serve", slot: "--handler", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "serve", slot: "--handler", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "serve", slot: "--handler", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "serve", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "serve", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "serve", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "serve", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "serve", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "tailscale", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "tailscale", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "tailscale", slot: "<unknown subcommand>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "tailscale", slot: "<unknown subcommand>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "tailscale disable", slot: "--profile", forms: SHAPED, channels: ["file-content", "json-stdout", "stdout"], reason: WHY.pr64_66 },
+	{ command: "tailscale disable", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "json-stdout", "stdout"], reason: WHY.profileName },
+	{ command: "tailscale disable", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "tailscale disable", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "tailscale disable", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "tailscale enable", slot: "--hostname", forms: OWN, channels: ["file-content", "stdout"], reason: WHY.ownHex },
+	{ command: "tailscale enable", slot: "--hostname", forms: ["escaped"], channels: ["file-content", "stdout"], reason: WHY.escaped },
+	{ command: "tailscale enable", slot: "--hostname", forms: SHAPED, channels: ["file-content", "stdout"], reason: WHY.unchecked },
+	{ command: "tailscale enable", slot: "--oauth-api-base-url", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "tailscale enable", slot: "--oauth-api-base-url", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "tailscale enable", slot: "--oauth-api-base-url", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "tailscale enable", slot: "--oauth-client-id", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "tailscale enable", slot: "--oauth-client-id", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "tailscale enable", slot: "--oauth-client-id", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "tailscale enable", slot: "--oauth-scope", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "tailscale enable", slot: "--oauth-scope", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "tailscale enable", slot: "--oauth-scope", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "tailscale enable", slot: "--oauth-tailnet", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "tailscale enable", slot: "--oauth-tailnet", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "tailscale enable", slot: "--oauth-tailnet", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "tailscale enable", slot: "--oauth-token-auth", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "tailscale enable", slot: "--oauth-token-auth", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "tailscale enable", slot: "--oauth-url", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "tailscale enable", slot: "--oauth-url", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "tailscale enable", slot: "--oauth-url", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "tailscale enable", slot: "--profile", forms: SHAPED, channels: ["file-content", "stdout"], reason: WHY.pr64_66 },
+	{ command: "tailscale enable", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["file-content", "stdout"], reason: WHY.profileName },
+	{ command: "tailscale enable", slot: "--state-dir", forms: OWN, channels: ["file-content", "stdout"], reason: WHY.ownHex },
+	{ command: "tailscale enable", slot: "--state-dir", forms: ["escaped"], channels: ["file-content", "stdout"], reason: WHY.escaped },
+	{ command: "tailscale enable", slot: "--state-dir", forms: SHAPED, channels: ["file-content", "stdout"], reason: WHY.unchecked },
+	{ command: "tailscale enable", slot: "--tag", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "tailscale enable", slot: "--tag", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "tailscale enable", slot: "--tag", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "tailscale enable", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "tailscale enable", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "tailscale enable", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "tailscale status", slot: "--profile", forms: SHAPED, channels: ["json-stdout", "stdout"], reason: WHY.pr64_66 },
+	{ command: "tailscale status", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stdout", "stdout"], reason: WHY.profileName },
+	{ command: "tailscale status", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "tailscale status", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "tailscale status", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "tailscale up", slot: "--hostname", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "tailscale up", slot: "--hostname", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "tailscale up", slot: "--hostname", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "tailscale up", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "tailscale up", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "tailscale up", slot: "--state-dir", forms: OWN, channels: ["file-content"], reason: WHY.ownHex },
+	{ command: "tailscale up", slot: "--state-dir", forms: ["escaped"], channels: ["file-content"], reason: WHY.escaped },
+	{ command: "tailscale up", slot: "--state-dir", forms: SHAPED, channels: ["file-content"], reason: WHY.unchecked },
+	{ command: "tailscale up", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "tailscale up", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "tailscale up", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "thread", slot: "<contextId>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "thread", slot: "<contextId>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "thread", slot: "<contextId>", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "thread", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "thread", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "thread", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "threads", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "threads", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "threads", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "ui", slot: "--compose", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "ui", slot: "--compose", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "ui", slot: "--compose", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "ui", slot: "--idle", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "ui", slot: "--idle", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "ui", slot: "--idle", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "ui", slot: "--port", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "ui", slot: "--port", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "ui", slot: "--port", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "ui", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "ui", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "ui", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "ui", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "ui", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "wait", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.pr64_66 },
+	{ command: "wait", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.profileName },
+	{ command: "wait", slot: "--timeout", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.ownHex },
+	{ command: "wait", slot: "--timeout", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.escaped },
+	{ command: "wait", slot: "--timeout", forms: SHAPED, channels: ["json-stderr", "stderr"], reason: WHY.unchecked },
+	{ command: "wait", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "wait", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "wait", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
+	{ command: "whoami", slot: "--profile", forms: SHAPED, channels: ["json-stderr", "json-stdout", "stderr"], reason: WHY.pr64_66 },
+	{ command: "whoami", slot: "--profile", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "json-stdout", "stderr"], reason: WHY.profileName },
+	{ command: "whoami", slot: "<extra argument>", forms: ["hex", "HEX", "escaped"], channels: ["json-stderr", "stderr"], reason: WHY.tooMany },
+	{ command: "whoami", slot: "<unknown option>", forms: OWN, channels: ["json-stderr", "stderr"], reason: WHY.pr61 },
+	{ command: "whoami", slot: "<unknown option>", forms: ["escaped"], channels: ["json-stderr", "stderr"], reason: WHY.parserEscaped },
 ];
 
 function tupleOf(command: string, slot: string, form: string, channel: string): string {
@@ -1291,13 +2175,10 @@ function tupleOf(command: string, slot: string, form: string, channel: string): 
 interface Universe {
 	/** `command | slot` for every slot the canary probes. */
 	slots: Set<string>;
-	/** Commands that have a slot, for the "*" entries. */
-	commandsWith: Map<string, string[]>;
 }
 
 function universeOf(nodes: CommandNode[]): Universe {
 	const slots = new Set<string>();
-	const commandsWith = new Map<string, string[]>();
 	for (const plan of plansFor(nodes)) {
 		slots.add(`${plan.command} | ${plan.slot}`);
 	}
@@ -1306,38 +2187,35 @@ function universeOf(nodes: CommandNode[]): Universe {
 	}
 	// Not a request: what the gateway leaves in its files once it has stopped.
 	slots.add(`${GATEWAY_API} | ${AFTER_STOP}`);
-	for (const entry of slots) {
-		const [command, slot] = entry.split(" | ") as [string, string];
-		commandsWith.set(slot, [...(commandsWith.get(slot) ?? []), command]);
-	}
-	return { slots, commandsWith };
+	return { slots };
 }
 
-/** Every combination the entries spell out, with the reason it is listed; and what is wrong with the entries themselves. */
+/** Every combination the lines spell out, with the reason it is listed; and what is wrong with the lines themselves. */
 function expand(entries: readonly KnownLeak[], universe: Universe): { tuples: Map<string, string>; problems: string[] } {
 	const tuples = new Map<string, string>();
 	const problems: string[] = [];
+	let before: KnownLeak | null = null;
 	for (const entry of entries) {
+		const where = `${entry.command} | ${entry.slot}`;
+		if (before && (before.command > entry.command || (before.command === entry.command && before.slot > entry.slot))) {
+			problems.push(`out of order: "${where}" comes before "${before.command} | ${before.slot}"`);
+		}
+		before = entry;
+		if (entry.reason.trim() === "") {
+			problems.push(`no reason given for ${where}: say why it is listed`);
+		}
+		if (!universe.slots.has(where)) {
+			problems.push(`"${entry.command}" has no slot "${entry.slot}" that is probed`);
+			continue;
+		}
 		const forms = entry.forms === ALL ? FORMS : entry.forms;
-		for (const slot of entry.slots) {
-			const commands = entry.commands === ALL ? (universe.commandsWith.get(slot) ?? []) : entry.commands;
-			if (commands.length === 0) {
-				problems.push(`"${slot}" is not a slot of any command (${entry.reason})`);
-			}
-			for (const command of commands) {
-				if (!universe.slots.has(`${command} | ${slot}`)) {
-					problems.push(`"${command}" has no slot "${slot}" that is probed (${entry.reason})`);
-					continue;
+		for (const form of forms) {
+			for (const channel of entry.channels) {
+				const tuple = tupleOf(entry.command, entry.slot, form, channel);
+				if (tuples.has(tuple)) {
+					problems.push(`listed twice: ${tuple}`);
 				}
-				for (const form of forms) {
-					for (const channel of entry.channels) {
-						const tuple = tupleOf(command, slot, form, channel);
-						if (tuples.has(tuple)) {
-							problems.push(`listed twice: ${tuple}`);
-						}
-						tuples.set(tuple, entry.reason);
-					}
-				}
+				tuples.set(tuple, entry.reason);
 			}
 		}
 	}
@@ -1416,8 +2294,22 @@ function leakyProgram(): Command {
 		const socket = net.connect({ host: `${value}.invalid`, port: 80 });
 		socket.on("error", () => resolve());
 	}));
+	// The key comes after more than a screenful of other text: a capture that keeps only the first part misses it.
+	add("long-out", (value) => console.log(`${"x".repeat(500)} ${value}`));
+	add("long-err", (value) => console.error(`${"x".repeat(500)} ${value}`));
+	add("query", async (value) => {
+		await fetch(`${world.index.origin}/echo?note=${value}`);
+	});
+	add("tmp-name", (value) => writeFileSync(join(tmpdir(), encodeURIComponent(value).slice(0, 200)), "x"));
+	add("tmp-content", (value) => writeFileSync(join(tmpdir(), "note.txt"), `note: ${value}`));
 	add("remember", (value) => rememberSecret(value));
 	add("clean", () => console.log("all good"));
+	// A command that never ends, and a server that ignores the signal that should stop it.
+	add("hang", () => new Promise<void>(() => undefined));
+	add("stubborn", () => {
+		process.once("SIGINT", () => undefined);
+		return new Promise<void>(() => undefined);
+	});
 	return program;
 }
 
@@ -1434,8 +2326,8 @@ async function runLeaky(args: string[]): Promise<number> {
 }
 
 /** One run of the leaky program through the same code the canary uses for `agx`. */
-function observeLeaky(command: string, planted: Planted, json: boolean): Promise<Observed> {
-	return runOnce((_home) => ({ args: [...(json ? ["--json"] : []), command, planted.value], stdin: null }), planted, json, { run: runLeaky });
+function observeLeaky(command: string, planted: Planted, json: boolean, options: Parameters<typeof runOnce>[3] = {}): Promise<Observed> {
+	return runOnce((_home) => ({ args: [...(json ? ["--json"] : []), command, planted.value], stdin: null }), planted, json, { ...options, run: runLeaky });
 }
 
 // ===================================================================== the tests
@@ -1447,7 +2339,7 @@ describe("the secret-key canary", () => {
 		expect(unclassified(walkProgram(buildProgram()))).toEqual([]);
 	});
 
-	it("names only slots that exist, each combination once", () => {
+	it("lists only slots that exist, each combination once, each with a reason, in order", () => {
 		const universe = universeOf(walkProgram(buildProgram()));
 		expect(expand(KNOWN_LEAKS, universe).problems).toEqual([]);
 		expect(expand(INTENDED, universe).problems).toEqual([]);
@@ -1470,18 +2362,91 @@ describe("the secret-key canary", () => {
 		expect(process.cwd()).toBe(startedIn);
 	}, LONG);
 
+	it("reached every slot that comes out clean, or says why it could not", async () => {
+		const result = await runMatrix();
+		const problems: string[] = [];
+		for (const slot of result.reach) {
+			const named = `${slot.command} | ${slot.slot}`;
+			if (slot.reason === "") {
+				problems.push(`\`unproven\` has no reason: ${named}`);
+			} else if (!slot.reached && slot.reason === null) {
+				problems.push(`never reached, so its clean result means nothing: ${named} (give the command what it needs in SLOT_TABLE, or say why it cannot be reached with \`unproven\`)`);
+			} else if (slot.reached && slot.reason !== null) {
+				problems.push(`reached after all, remove \`unproven\`: ${named} (${slot.reason})`);
+			}
+		}
+		expect(problems).toEqual([]);
+	}, LONG);
+
+	it("leaves a command waiting only where the slot table says it waits", async () => {
+		const result = await runMatrix();
+		const waits = plansFor(walkProgram(buildProgram()))
+			.filter((plan) => inScopeName(plan.command) && plan.target.type === "slot" && plan.target.spec.waits === true)
+			.map((plan) => `${plan.command} | ${plan.slot}`);
+		expect([...result.abandoned].sort()).toEqual([...new Set(waits)].sort());
+	}, LONG);
+
 	describe("the controls", () => {
+		const planOf = (command: string, slot: string): Plan & { target: Extract<Target, { type: "slot" }> } => {
+			const plan = plansFor(walkProgram(buildProgram())).find((candidate) => candidate.command === command && candidate.slot === slot);
+			if (!plan || plan.target.type !== "slot") {
+				throw new Error(`no slot "${slot}" of "${command}"`);
+			}
+			return plan as Plan & { target: Extract<Target, { type: "slot" }> };
+		};
+
+		it("gets as far as the slot in commands that need other options and arguments first", async () => {
+			const cases: Array<[string, string]> = [
+				["login", "--org-name"],
+				["login", "--org-slug"],
+				["listing create", "--display-name"],
+				["listing create", "--handle"],
+				["register", "--display-name"],
+				["register", "--handle"],
+				["listing get", "--org"],
+				["listing set-policy", "--capability"],
+				["tailscale up", "--hostname"],
+				["config set", "--stdin (stdin) (key=org)"],
+			];
+			const missed: string[] = [];
+			for (const [command, slot] of cases) {
+				const plan = planOf(command, slot);
+				const observed = await runPlan(plan, reachMarker(plan), false);
+				if (observed.threw || observed.channels.size === 0) {
+					missed.push(`${command} | ${slot}: ${observed.threw ?? "the marker did not show up"}`);
+				}
+			}
+			expect(missed).toEqual([]);
+		}, LONG);
+
+		it("can tell that a command stopped before it used the slot", async () => {
+			const plan = planOf("listing create", "--display-name");
+			// Without `--pubkey` the command stops with "Pass exactly one of --team or --pubkey".
+			const stopped = { ...plan, target: { ...plan.target, spec: { ...plan.target.spec, without: ["--pubkey"] } } };
+			const missing = await runPlan(stopped, reachMarker(stopped), false);
+			expect(missing.threw).toBeNull();
+			expect([...missing.channels]).toEqual([]);
+			const unused = planOf("serve", "--reply-text");
+			const never = await runPlan(unused, reachMarker(unused), false);
+			expect([...never.channels]).toEqual([]);
+		}, LONG);
+
 		// Every place the canary looks, with a command that repeats its argument there on purpose.
 		const CONTROLS: Array<{ command: string; forms: readonly Form[]; channel: "stdout" | "stderr" | Channel }> = [
 			{ command: "out", forms: FORMS, channel: "stdout" },
 			{ command: "err", forms: FORMS, channel: "stderr" },
-			{ command: "part", forms: ["nsec", "ncryptsec", "hex", "HEX", "nostr"], channel: "stdout" },
+			{ command: "part", forms: ["nsec", "ncryptsec", "hex", "HEX", "nostr", "NSEC"], channel: "stdout" },
 			{ command: "request", forms: FORMS, channel: "request" },
 			{ command: "relay", forms: FORMS, channel: "relay" },
-			{ command: "file-name", forms: ["nsec", "ncryptsec", "hex", "HEX", "nostr"], channel: "file-name" },
+			{ command: "file-name", forms: ["nsec", "ncryptsec", "hex", "HEX", "nostr", "NSEC"], channel: "file-name" },
 			{ command: "file-content", forms: FORMS, channel: "file-content" },
-			{ command: "connect", forms: ["nsec", "ncryptsec", "hex", "HEX"], channel: "connect" },
-			{ command: "socket", forms: ["nsec", "ncryptsec", "hex", "HEX"], channel: "connect" },
+			{ command: "connect", forms: ["nsec", "ncryptsec", "hex", "HEX", "NSEC"], channel: "connect" },
+			{ command: "socket", forms: ["nsec", "ncryptsec", "hex", "HEX", "NSEC"], channel: "connect" },
+			{ command: "long-out", forms: FORMS, channel: "stdout" },
+			{ command: "long-err", forms: FORMS, channel: "stderr" },
+			{ command: "query", forms: FORMS, channel: "request" },
+			{ command: "tmp-name", forms: ["nsec", "ncryptsec", "hex", "HEX", "nostr", "NSEC"], channel: "file-name" },
+			{ command: "tmp-content", forms: FORMS, channel: "file-content" },
 		];
 		const here = (channel: Channel, json: boolean): Channel =>
 			json && channel === "stdout" ? "json-stdout" : json && channel === "stderr" ? "json-stderr" : channel;
@@ -1505,6 +2470,30 @@ describe("the secret-key canary", () => {
 		it("notices a program that teaches the redactor the key", async () => {
 			const observed = await observeLeaky("remember", plant("nsec", "remember"), false);
 			expect(observed.threw).toMatch(/remembered the planted key/);
+		});
+
+		it("fails a command that never ends, and leaves behind only one that is marked as waiting", async () => {
+			const stuck = await observeLeaky("hang", plant("nsec", "hang"), false, { deadline: 300 });
+			expect(stuck.threw).toMatch(/did not finish in 300 ms/);
+			expect(stuck.abandoned).toBe(false);
+			const waiting = await observeLeaky("hang", plant("nsec", "hang"), false, { deadline: 300, waits: true });
+			expect(waiting.threw).toBeNull();
+			expect(waiting.abandoned).toBe(true);
+		});
+
+		it("fails a server that neither ends by itself nor stops on the signal", async () => {
+			const none = await observeLeaky("hang", plant("nsec", "hang"), false, { listens: true, deadline: 2000 });
+			expect(none.threw).toMatch(/has not stopped on a signal \(it registered no handler\)/);
+			const stubborn = await observeLeaky("stubborn", plant("nsec", "stubborn"), false, { listens: true, deadline: 2000 });
+			expect(stubborn.threw).toMatch(/has not stopped on a signal$/);
+		});
+
+		it("does not start a run whose profile does not point at the throwaway relay", async () => {
+			const elsewhere = () => {
+				delete process.env.AGX_RELAY;
+				updateProfile("default", { relays: ["ws://127.0.0.1:9"] });
+			};
+			await expect(observeLeaky("clean", plant("nsec", "pin"), false, { afterSetup: elsewhere })).rejects.toThrow(/does not pin the relay for profile "default"/);
 		});
 
 		it("notices a command, an option and a positional that the slot table does not list", () => {
@@ -1571,13 +2560,51 @@ describe("the secret-key canary", () => {
 			expect(listenPortOf([])).toBeNull();
 		});
 
-		it("sees a key in an HTTP answer and in the gateway's log", async () => {
+		it("refuses a server that listens, and a socket that connects, to a port that is never touched", async () => {
+			// A free port of this machine's own, made off limits for the length of this test: the real ones are never used.
+			const free = await new Promise<number>((resolve) => {
+				const probe = net.createServer();
+				probe.listen(0, "127.0.0.1", () => {
+					const { port } = probe.address() as AddressInfo;
+					probe.close(() => resolve(port));
+				});
+			});
+			const undo = forbidPortForTest(free);
+			const before = world.attempts.length;
+			try {
+				const listened = await new Promise<NodeJS.ErrnoException | null>((resolve) => {
+					const server = net.createServer();
+					server.once("error", resolve);
+					server.listen(free, "127.0.0.1", () => server.close(() => resolve(null)));
+				});
+				expect(listened?.code).toBe("EACCES");
+				const connected = await new Promise<NodeJS.ErrnoException | null>((resolve) => {
+					const socket = net.connect({ host: "127.0.0.1", port: free });
+					socket.once("error", resolve);
+					socket.once("connect", () => {
+						socket.destroy();
+						resolve(null);
+					});
+				});
+				expect(connected?.code).toBe("ECONNREFUSED");
+				expect(world.attempts.slice(before).map((attempt) => `${attempt.host}:${attempt.port}:${attempt.blocked}`)).toEqual([`listen:${free}:port`, `127.0.0.1:${free}:port`]);
+			} finally {
+				undo();
+				world.attempts.splice(before);
+			}
+		});
+
+		it("sees a key in an HTTP answer, in the gateway's log and in a file it changes while it answers", async () => {
 			const box = sandbox();
 			const lines: string[] = [];
+			let kept = 0;
 			const echo = createServer((req, res) => {
 				// What the gateway does with a path: take one level of escaping off before it uses it.
 				const asked = decodeURIComponent(req.url ?? "");
 				lines.push(`${req.method} ${asked}`);
+				// And a file that is there while the request is answered and gone by the time the gateway stops.
+				// A counter in the name: the file system may not tell `abc` from `ABC`, and each request is to leave a file of its own.
+				writeFileSync(join(box.home, `${asked.replaceAll("/", "_")}.${(kept += 1)}`), `asked: ${asked}`);
 				res.end(`you asked for ${asked}`);
 			});
 			await new Promise<void>((resolve) => echo.listen(0, "127.0.0.1", resolve));
@@ -1595,7 +2622,7 @@ describe("the secret-key canary", () => {
 						tree: readTree(box.home),
 					};
 					const sent = await sendProbe(watch, probe, planted);
-					for (const channel of ["response", "log"] as const) {
+					for (const channel of ["response", "log", "file-name", "file-content"] as const) {
 						if (!sent.channels.has(channel)) {
 							missed.push(`${form}: not seen in ${channel}`);
 						}
@@ -1606,6 +2633,53 @@ describe("the secret-key canary", () => {
 				await new Promise<void>((resolve) => echo.close(() => resolve()));
 				box.restore();
 			}
+		});
+	});
+
+	describe("the lists", () => {
+		const universe = { slots: new Set(["a | --x", "a | --y", "b | --x"]) };
+		const line = (command: string, slot: string, reason = "why"): KnownLeak => ({ command, slot, forms: ["nsec"], channels: ["stdout"], reason });
+
+		it("expands every combination a line spells out", () => {
+			const both: KnownLeak = { command: "a", slot: "--x", forms: ["nsec", "hex"], channels: ["stdout", "request"], reason: "why" };
+			const { tuples, problems } = expand([both], universe);
+			expect(problems).toEqual([]);
+			expect([...tuples.keys()].sort()).toEqual(["a | --x | hex | request", "a | --x | hex | stdout", "a | --x | nsec | request", "a | --x | nsec | stdout"]);
+		});
+
+		it("asks for a reason, a slot that is probed, each combination once and the right order", () => {
+			expect(expand([line("a", "--x", "  ")], universe).problems).toEqual(["no reason given for a | --x: say why it is listed"]);
+			expect(expand([line("a", "--z")], universe).problems).toEqual(['"a" has no slot "--z" that is probed']);
+			expect(expand([line("a", "--x"), line("a", "--x")], universe).problems).toEqual(["listed twice: a | --x | nsec | stdout"]);
+			expect(expand([line("b", "--x"), line("a", "--y")], universe).problems).toEqual(['out of order: "a | --y" comes before "b | --x"']);
+			expect(expand([line("a", "--y"), line("a", "--x")], universe).problems).toEqual(['out of order: "a | --x" comes before "a | --y"']);
+			expect(expand([line("a", "--x"), line("a", "--y"), line("b", "--x")], universe).problems).toEqual([]);
+		});
+	});
+
+	describe("the comparison with the lists", () => {
+		const leak = "a | --x | nsec | stdout";
+		const other = "a | --y | hex | request";
+		const listed = (...tuples: string[]) => new Map(tuples.map((tuple) => [tuple, "why"] as const));
+
+		it("accepts exactly what is listed", () => {
+			expect(compare(new Set([leak, other]), listed(leak), listed(other))).toEqual([]);
+		});
+
+		it("reports a leak that is not listed", () => {
+			expect(compare(new Set([leak, other]), listed(leak), listed())).toEqual([`new leak, not in KNOWN_LEAKS: ${other}`]);
+		});
+
+		it("reports a listed leak that is gone, and says to remove it", () => {
+			expect(compare(new Set([other]), listed(leak), listed(other))).toEqual([`no longer leaks, remove it from KNOWN_LEAKS: ${leak} (why)`]);
+		});
+
+		it("reports an intended slot that no longer stores or sends the key, and says to remove it", () => {
+			expect(compare(new Set([leak]), listed(leak), listed(other))).toEqual([`no longer stored or sent, remove it from INTENDED: ${other} (why)`]);
+		});
+
+		it("reports a combination that is in both lists", () => {
+			expect(compare(new Set([leak]), listed(leak), listed(leak))).toEqual([`in both KNOWN_LEAKS and INTENDED: ${leak}`]);
 		});
 	});
 
@@ -1636,9 +2710,25 @@ describe("the secret-key canary", () => {
 			expect(holdsKey(nip19.npubEncode(own.value), own.needles)).toBe(true);
 		});
 
+		it("counts the prefix as part of the key: a stretch that runs into it is found", () => {
+			// `nsec1` and 5 characters of key data is a 10-character stretch of the key; with 4 it is not enough.
+			expect(holdsKey(`"${planted.value.slice(0, 10)}"... is not valid JSON`, planted.needles)).toBe(true);
+			expect(holdsKey(`"${planted.value.slice(0, 9)}"... is not valid JSON`, planted.needles)).toBe(false);
+			const protectedKey = plant("ncryptsec");
+			expect(holdsKey(protectedKey.value.slice(5, 15), protectedKey.needles)).toBe(true);
+			expect(holdsKey(protectedKey.value.slice(4, 14), protectedKey.needles)).toBe(false);
+			// In capitals as well.
+			const capitals = plant("NSEC");
+			expect(capitals.value.startsWith("NSEC1")).toBe(true);
+			expect(holdsKey(capitals.value.slice(0, 10), capitals.needles)).toBe(true);
+		});
+
 		it("does not take the prefix every key shares for a key", () => {
-			for (const form of ["nsec", "ncryptsec"] as const) {
-				expect(holdsKey("give an nsec1… or an ncryptsec1… key, or 64 hex characters", plant(form).needles)).toBe(false);
+			for (const form of ["nsec", "ncryptsec", "NSEC"] as const) {
+				const needles = plant(form).needles;
+				expect(holdsKey("give an nsec1… or an ncryptsec1… key, or 64 hex characters", needles)).toBe(false);
+				expect(holdsKey("NSEC1 and NCRYPTSEC1 and nostr:nsec1, then 5 words", needles)).toBe(false);
+				expect(holdsKey("the key starts with nsec1 and is 63 characters long", needles)).toBe(false);
 			}
 		});
 
@@ -1651,6 +2741,7 @@ describe("the secret-key canary", () => {
 				nostr: /^nostr:nsec1[0-9a-z]{58}$/,
 				escaped: /^(%[0-9A-F]{2}){63}$/,
 				sentence: /^my key is nsec1[0-9a-z]{58} and please keep it safe$/,
+				NSEC: /^NSEC1[0-9A-Z]{58}$/,
 			};
 			for (const form of FORMS) {
 				const value = plant(form);

@@ -27,9 +27,10 @@ import { type IdentityFile, identityFromSecret } from "../lib/identity.js";
  * The ways a pasted key can look. `hex` and `HEX` are the profile's OWN secret
  * key (an exact value the CLI could know); the others are keys of a stranger,
  * which only their shape can give away. A stranger's 64-hex key cannot be told
- * from a public key, which is why it is not planted.
+ * from a public key, which is why it is not planted. `NSEC` is the same key
+ * written in capitals, which bech32 allows.
  */
-export const FORMS = ["nsec", "ncryptsec", "hex", "HEX", "nostr", "escaped", "sentence"] as const;
+export const FORMS = ["nsec", "ncryptsec", "hex", "HEX", "nostr", "escaped", "sentence", "NSEC"] as const;
 export type Form = (typeof FORMS)[number];
 
 export const FORM_DESCRIPTION: Record<Form, string> = {
@@ -40,6 +41,7 @@ export const FORM_DESCRIPTION: Record<Form, string> = {
 	nostr: "nostr:nsec1…",
 	escaped: "nsec1… with every character %xx-escaped",
 	sentence: "nsec1… inside a longer sentence",
+	NSEC: "NSEC1… in capitals",
 };
 
 /** How many characters of a key must show up for a run to count as a leak. */
@@ -51,6 +53,24 @@ export function windowsOf(data: string, size = WINDOW): string[] {
 	const out: string[] = [];
 	for (let i = 0; i + size <= text.length; i++) {
 		out.push(text.slice(i, i + size));
+	}
+	return out;
+}
+
+/**
+ * Every `size`-character stretch of the encoded key `text` (lower case) that holds
+ * at least `minData` characters of key data after the `prefixLength`-character
+ * prefix. The prefix is part of the key's text, so a stretch that runs into it
+ * counts; a stretch of the prefix alone is what every key of that kind starts with
+ * and is not the key, which keeps help text that names `nsec1` or `ncryptsec1` clean.
+ */
+export function windowsWithPrefix(text: string, prefixLength: number, minData = 5, size = WINDOW): string[] {
+	const lower = text.toLowerCase();
+	const out: string[] = [];
+	for (let i = 0; i + size <= lower.length; i++) {
+		if (i + size - prefixLength >= minData) {
+			out.push(lower.slice(i, i + size));
+		}
 	}
 	return out;
 }
@@ -75,17 +95,17 @@ export interface Planted {
 	identity: IdentityFile;
 }
 
-const NSEC_DATA_START = "nsec1".length;
-const NCRYPTSEC_DATA_START = "ncryptsec1".length;
-const NPUB_DATA_START = "npub1".length;
+const NSEC_PREFIX = "nsec1".length;
+const NCRYPTSEC_PREFIX = "ncryptsec1".length;
+const NPUB_PREFIX = "npub1".length;
 
 /** Every shape the same 32 secret bytes can come back in: hex, nsec1… and npub1… (a secret read as a public key). */
 function needlesOfSecret(secretHex: string): string[] {
 	const bytes = hexToBytes(secretHex);
 	return [
 		...windowsOf(secretHex),
-		...windowsOf(nip19.nsecEncode(bytes).slice(NSEC_DATA_START)),
-		...windowsOf(nip19.npubEncode(secretHex).slice(NPUB_DATA_START)),
+		...windowsWithPrefix(nip19.nsecEncode(bytes), NSEC_PREFIX),
+		...windowsWithPrefix(nip19.npubEncode(secretHex), NPUB_PREFIX),
 	];
 }
 
@@ -146,18 +166,20 @@ export function plant(form: Form, label = ""): Planted {
 	if (form === "ncryptsec") {
 		// A real NIP-49 string from a throwaway key and password (scrypt cost 2^4: quick). Salt and nonce are random.
 		const value = encrypt(secret, "throwaway-password", 4);
-		return { form, value, needles: windowsOf(value.slice(NCRYPTSEC_DATA_START)), identity: own };
+		return { form, value, needles: windowsWithPrefix(value, NCRYPTSEC_PREFIX), identity: own };
 	}
 	const nsec = nip19.nsecEncode(secret);
 	const needles = needlesOfSecret(bytesToHex(secret));
 	const value =
 		form === "nsec"
 			? nsec
-			: form === "nostr"
-				? `nostr:${nsec}`
-				: form === "escaped"
-					? percentEscapeAll(nsec)
-					: `my key is ${nsec} and please keep it safe`;
+			: form === "NSEC"
+				? nsec.toUpperCase()
+				: form === "nostr"
+					? `nostr:${nsec}`
+					: form === "escaped"
+						? percentEscapeAll(nsec)
+						: `my key is ${nsec} and please keep it safe`;
 	return { form, value, needles, identity: own };
 }
 
@@ -170,8 +192,8 @@ export function mask(value: string): string {
 
 /**
  * True when any 10-character stretch of the key (any case; also after `%xx`
- * decoding of `text`) appears in `text`. The prefix that every key shares
- * (`nsec1`, `ncryptsec1`) is not part of what is looked for: help text may say it.
+ * decoding of `text`) appears in `text`. For `nsec1…` and `ncryptsec1…` the stretch
+ * may run into the prefix, but must hold 5 characters of key data (see `windowsWithPrefix`).
  */
 export function holdsKey(text: string, needles: readonly string[]): boolean {
 	if (text === "") {
@@ -180,6 +202,26 @@ export function holdsKey(text: string, needles: readonly string[]): boolean {
 	const lower = text.toLowerCase();
 	const decoded = lower.includes("%") ? percentDecode(lower) : lower;
 	return needles.some((needle) => lower.includes(needle) || (decoded !== lower && decoded.includes(needle)));
+}
+
+/**
+ * How many times the key's stretches appear in `text` (a key that appears twice counts double). Used where
+ * the same key goes into every request: a file that holds it already is only a new leak when it holds it more often.
+ */
+export function countKey(text: string, needles: readonly string[]): number {
+	if (text === "") {
+		return 0;
+	}
+	const lower = text.toLowerCase();
+	const decoded = lower.includes("%") ? percentDecode(lower) : lower;
+	let total = 0;
+	for (const needle of needles) {
+		total += lower.split(needle).length - 1;
+		if (decoded !== lower) {
+			total += decoded.split(needle).length - 1;
+		}
+	}
+	return total;
 }
 
 // ----------------------------------------------------------------------- files
@@ -220,7 +262,9 @@ export function readTree(home: string, skip: ReadonlySet<string> = new Set()): T
 			if (stat.isDirectory()) {
 				walk(full);
 			} else if (stat.isFile() && !skip.has(rel) && stat.size <= 4 * 1024 * 1024) {
-				contents.push(`${rel}\n${readFileSync(full, "utf8")}`);
+				const text = readFileSync(full, "utf8");
+				files.set(rel, text);
+				contents.push(`${rel}\n${text}`);
 			}
 		}
 	};
@@ -288,7 +332,20 @@ export function walkProgram(program: Command): CommandNode[] {
 // ----------------------------------------------------------------- the guard
 
 /** Ports that belong to other work on this machine and are never touched. */
-export const FORBIDDEN_PORTS: ReadonlySet<number> = new Set([7447, 53505]);
+const forbiddenPorts = new Set<number>([7447, 53505]);
+export const FORBIDDEN_PORTS: ReadonlySet<number> = forbiddenPorts;
+
+/**
+ * Adds a port to the forbidden ones until the returned function is called. Only the
+ * controls use it, on a port their own listener holds, to show the guard is wired
+ * without ever going near the real ones.
+ */
+export function forbidPortForTest(port: number): () => void {
+	forbiddenPorts.add(port);
+	return () => {
+		forbiddenPorts.delete(port);
+	};
+}
 
 export interface ConnectAttempt {
 	host: string;
