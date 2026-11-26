@@ -11,6 +11,7 @@ import {
 	withConfigLock,
 } from "./config-lock.js";
 import { AgxCliError } from "./errors.js";
+import { configPath } from "./paths.js";
 import { holdConfigLockUntilSomeoneWaits, PATIENT_TEST_MS, PATIENT_WAIT_MS } from "../test/config-lock-helpers.js";
 
 let home: string;
@@ -90,6 +91,40 @@ describe("withConfigLock", () => {
 			withConfigLock(async () => 1);
 		};
 		expect(neverCalled).toBeTypeOf("function");
+	});
+
+	describe("a function that returns a promise, past the types", () => {
+		// The types refuse an async function, but a function typed `any`, a hand-made thenable and an open
+		// generic all compile. The lock is let go when the function returns, so a promise would settle
+		// later without it: it has to be refused when it runs.
+		it("is refused for an async function cast through any: the lock is let go and nothing is written", () => {
+			const later = (async () => 1) as any;
+			expect(() => withConfigLock(later)).toThrow(/must be synchronous/);
+			expect(existsSync(configLockPath())).toBe(false);
+			expect(existsSync(configPath())).toBe(false);
+			expect(withConfigLock(() => "again")).toBe("again");
+		});
+
+		it("is refused for a hand-made thenable", () => {
+			const thenable = { then: () => undefined } as any;
+			expect(() => withConfigLock(() => thenable)).toThrow(/must be synchronous/);
+			expect(existsSync(configLockPath())).toBe(false);
+		});
+
+		it("is refused for a nested call too, and the outer lock is let go", () => {
+			const later = (async () => 1) as any;
+			expect(() => withConfigLock(() => withConfigLock(later))).toThrow(/must be synchronous/);
+			expect(existsSync(configLockPath())).toBe(false);
+		});
+
+		it("lets an ordinary value through, including one that merely has a property called then", () => {
+			expect(withConfigLock(() => 42)).toBe(42);
+			expect(withConfigLock(() => null)).toBeNull();
+			expect(withConfigLock(() => undefined)).toBeUndefined();
+			const notThenable = { then: "not a function" };
+			expect(withConfigLock(() => notThenable)).toBe(notThenable);
+			expect(existsSync(configLockPath())).toBe(false);
+		});
 	});
 
 	it("releases the lock when the function throws", () => {
