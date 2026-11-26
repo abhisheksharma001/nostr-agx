@@ -142,7 +142,11 @@ let relay: RunningRelay;
 let socks: SocksProxy;
 let launcher: string;
 
-function start(...args: string[]): { child: ChildProcess; done: Promise<Run> } {
+function start(...args: string[]): {
+	child: ChildProcess;
+	done: Promise<Run>;
+	output: () => string;
+} {
 	const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1" };
 	for (const key of Object.keys(env)) {
 		if (key.startsWith("AGX_")) delete env[key];
@@ -168,7 +172,17 @@ function start(...args: string[]): { child: ChildProcess; done: Promise<Run> } {
 		child.on("error", reject);
 		child.on("close", (code) => resolve({ code, stdout, stderr }));
 	});
-	return { child, done };
+	return { child, done, output: () => stdout };
+}
+
+async function until(condition: () => boolean, timeoutMs: number): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() > deadline) {
+			throw new Error("condition not met in time");
+		}
+		await new Promise((r) => setTimeout(r, 25));
+	}
 }
 
 async function agx(...args: string[]): Promise<Run> {
@@ -212,6 +226,11 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		expect(
 			(await agx("config", "set", "relays", `ws://127.0.0.1:${relay.port}`)).code,
 		).toBe(0);
+		// Every run below dials this throwaway relay, never the default relay on
+		// port 7447 that a developer may have running.
+		const shown = await agx("config", "show");
+		expect(shown.stdout).toContain(`ws://127.0.0.1:${relay.port}`);
+		expect(shown.stdout).not.toMatch(/ws:\/\/127\.0\.0\.1:7447\b/);
 	});
 
 	afterEach(async () => {
@@ -243,6 +262,54 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 		expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
 		expectTailscaleRunWasPerRunAndCleanedUp();
 	}, 30_000);
+
+	it("serve reports a launcher that dies mid-run and exits non-zero", async () => {
+		// The launcher reports its proxy, then ends by itself once `trigger` exists.
+		const trigger = join(home, "launcher-die");
+		writeFileSync(
+			launcher,
+			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\nwhile [ ! -e ${JSON.stringify(trigger)} ]; do sleep 0.1; done\nexit 7\n`,
+			{ mode: 0o755 },
+		);
+		const serve = start("serve", "--no-reply", "--no-tasks", "--poll-interval", "500");
+		try {
+			await until(() => serve.output().includes("watching for messages"), 20_000);
+			writeFileSync(trigger, "");
+			const run = await Promise.race([
+				serve.done,
+				new Promise<null>((resolve) => setTimeout(() => resolve(null), 15_000)),
+			]);
+			expect(run, "serve was still running 15 s after its launcher died").not.toBeNull();
+			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(5);
+			expect(run!.stderr).toContain("Tailscale launcher");
+			expect(run!.stderr).toContain("exit code 7");
+			expect(run!.stderr).not.toContain(SOCKS_PASS);
+			expectTailscaleRunWasPerRunAndCleanedUp();
+		} finally {
+			if (serve.child.exitCode === null && serve.child.signalCode === null) {
+				serve.child.kill("SIGINT");
+			}
+			await serve.done;
+		}
+	}, 60_000);
+
+	it("serve stops cleanly on Ctrl-C and says nothing about the launcher it stopped itself", async () => {
+		const serve = start("serve", "--no-reply", "--no-tasks", "--poll-interval", "500");
+		try {
+			await until(() => serve.output().includes("watching for messages"), 20_000);
+			await new Promise((r) => setTimeout(r, 500));
+			serve.child.kill("SIGINT");
+			const run = await serve.done;
+			expect(run.code, `${run.stdout}\n${run.stderr}`).toBe(0);
+			expect(run.stderr).not.toContain("Tailscale launcher");
+			expectTailscaleRunWasPerRunAndCleanedUp();
+		} finally {
+			if (serve.child.exitCode === null && serve.child.signalCode === null) {
+				serve.child.kill("SIGINT");
+			}
+			await serve.done;
+		}
+	}, 60_000);
 
 	it("inbox exits on its own and removes the run's state dir", async () => {
 		const run = await agx("inbox", "--json", "--wait", "2");

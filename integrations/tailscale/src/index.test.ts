@@ -92,6 +92,37 @@ describe("startTailscaleRelayProxy", () => {
 	});
 });
 
+describe("the launcher exit notice", () => {
+	it("hands a listener to the launcher and returns its way to remove it", async () => {
+		const unsubscribe = vi.fn();
+		const onExit = vi.fn((_listener: (exit: { code: number | null; signal: NodeJS.Signals | null }) => void) => unsubscribe);
+		const start = vi.fn(async (_options: TailscaleStartOptions) => ({
+			url: PROXY_URL,
+			stop: async () => {},
+			onExit,
+		}));
+		const proxy = await startTailscaleRelayProxy({ authKey: KEY, start });
+
+		const listener = vi.fn();
+		const off = proxy.onExit(listener);
+		expect(onExit).toHaveBeenCalledWith(listener);
+		off();
+		expect(unsubscribe).toHaveBeenCalledOnce();
+	});
+
+	it("accepts a listener for a launcher that offers no exit notice, and never calls it", async () => {
+		const { start } = fakeStart();
+		const proxy = await startTailscaleRelayProxy({ authKey: KEY, start });
+
+		const listener = vi.fn();
+		const off = proxy.onExit(listener);
+		expect(typeof off).toBe("function");
+		off();
+		await proxy.stop();
+		expect(listener).not.toHaveBeenCalled();
+	});
+});
+
 describe("tailscaleRelayProxy", () => {
 	it("hands the node's lifecycle to the transport", async () => {
 		const { start, stop } = fakeStart();

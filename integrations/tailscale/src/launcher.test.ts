@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { bundledBinaryPath, ensureExecutable, startBundledTailscale } from "./launcher";
 
 const posix = process.platform !== "win32";
@@ -31,6 +31,28 @@ async function fakeBinary(source: string): Promise<{ dir: string; path: string }
 
 /** A launcher that reports a proxy and then waits for stdin to close, like the real one. */
 const RUNNING = "echo socks5://agx:secret@127.0.0.1:43220\nexec cat >/dev/null\n";
+
+/**
+ * Reports a proxy, then ends the way `ending` says once the file `trigger`
+ * exists. `<trigger>.gone` is written just before it ends.
+ */
+function endingTail(trigger: string, ending: string): string {
+	return (
+		"echo socks5://agx:secret@127.0.0.1:43230\n" +
+		`while [ ! -e ${JSON.stringify(trigger)} ]; do sleep 0.05; done\n` +
+		`: > ${JSON.stringify(`${trigger}.gone`)}\n` +
+		`${ending}\n`
+	);
+}
+
+/** Fail with `what` if `promise` has not settled within `ms`. */
+function within<T>(promise: Promise<T>, what: string, ms = 10_000): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	const late = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`${what} did not arrive within ${ms} ms`)), ms);
+	});
+	return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
 
 /** Wait until `condition` holds, or fail after `timeoutMs`. */
 async function until(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
@@ -337,6 +359,123 @@ describe("the default state directory", () => {
 		} finally {
 			await rm(fake.dir, { recursive: true, force: true });
 			await rm(named, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("the exit notice", () => {
+	it.skipIf(!posix)("gives a listener the exit code when the launcher exits on its own", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-exit-"));
+		const trigger = join(dir, "go");
+		const fake = await fakeBinary("#!/bin/sh\n" + endingTail(trigger, "exit 7"));
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+			const exit = new Promise<unknown>((resolve) => proxy.onExit(resolve));
+			await writeFile(trigger, "");
+			expect(await within(exit, "the exit notice")).toEqual({ code: 7, signal: null });
+			// The handle is still safe to stop afterwards.
+			await proxy.stop();
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("gives a listener the signal when the launcher is killed", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-exit-"));
+		const trigger = join(dir, "go");
+		const fake = await fakeBinary("#!/bin/sh\n" + endingTail(trigger, "kill -KILL $$"));
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+			const exit = new Promise<unknown>((resolve) => proxy.onExit(resolve));
+			await writeFile(trigger, "");
+			expect(await within(exit, "the exit notice")).toEqual({ code: null, signal: "SIGKILL" });
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("tells a listener that subscribes after the launcher already ended", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-exit-"));
+		const trigger = join(dir, "go");
+		const fake = await fakeBinary("#!/bin/sh\n" + endingTail(trigger, "exit 9"));
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+			await writeFile(trigger, "");
+			await until(() => existsSync(`${trigger}.gone`));
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			const exit = new Promise<unknown>((resolve) => proxy.onExit(resolve));
+			expect(await within(exit, "the exit notice")).toEqual({ code: 9, signal: null });
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("does not call a listener that was removed", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-exit-"));
+		const trigger = join(dir, "go");
+		const fake = await fakeBinary("#!/bin/sh\n" + endingTail(trigger, "exit 7"));
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+			const removed = vi.fn();
+			const off = proxy.onExit(removed);
+			const kept = new Promise<unknown>((resolve) => proxy.onExit(resolve));
+			off();
+			await writeFile(trigger, "");
+			// The second listener was added after the first, so it has been called by
+			// the time this resolves; the first never is.
+			await within(kept, "the exit notice");
+			expect(removed).not.toHaveBeenCalled();
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("is not given when stop() ended the launcher", async () => {
+		const fake = await fakeBinary("#!/bin/sh\n" + RUNNING);
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+			const listener = vi.fn();
+			proxy.onExit(listener);
+			await proxy.stop();
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(listener).not.toHaveBeenCalled();
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!posix)("comes after the launcher's own state directory has been deleted", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agx-launcher-exit-"));
+		const trigger = join(dir, "go");
+		const fake = await recordingBinary(endingTail(trigger, "exit 7"));
+		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
+		try {
+			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
+			const stateDir = stateDirArg(await firstLaunch(fake.dir));
+			const seenByListener = new Promise<boolean>((resolve) =>
+				proxy.onExit(() => resolve(existsSync(stateDir))),
+			);
+			expect(existsSync(stateDir)).toBe(true);
+			await writeFile(trigger, "");
+			expect(await within(seenByListener, "the exit notice")).toBe(false);
+		} finally {
+			await proxy?.stop();
+			await rm(fake.dir, { recursive: true, force: true });
+			await rm(dir, { recursive: true, force: true });
 		}
 	});
 });

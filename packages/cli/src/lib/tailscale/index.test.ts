@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join, sep } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { effectiveProfile } from "../config.js";
 import { sandbox } from "../../test/helpers.js";
 import {
+	describeTailscaleExit,
 	setTailscaleStarterForTests,
 	startTailscaleForProfile,
 	tailscaleRelayProxyForProfile,
@@ -119,5 +120,53 @@ describe("startTailscaleForProfile state directory", () => {
 		).rejects.toThrow(/launcher failed/);
 		expect(failedDir).toBeTruthy();
 		expect(existsSync(failedDir!)).toBe(false);
+	});
+});
+
+describe("startTailscaleForProfile launcher exit", () => {
+	it("tells onTailscaleExit when the launcher ends on its own", async () => {
+		let notify:
+			| ((exit: { code: number | null; signal: NodeJS.Signals | null }) => void)
+			| undefined;
+		restoreStarter = setTailscaleStarterForTests(async () => ({
+			url: PROXY_URL,
+			stop: async () => undefined,
+			onExit: (listener) => {
+				notify = listener;
+				return () => undefined;
+			},
+		}));
+		const onTailscaleExit = vi.fn();
+
+		const handle = await startTailscaleForProfile("default", effectiveProfile("default"), {
+			onTailscaleExit,
+		});
+		expect(onTailscaleExit).not.toHaveBeenCalled();
+		expect(notify).toBeDefined();
+		notify?.({ code: 7, signal: null });
+		expect(onTailscaleExit).toHaveBeenCalledExactlyOnceWith({ code: 7, signal: null });
+		await handle.stop();
+	});
+
+	it("starts a launcher that offers no exit notice when a listener is given", async () => {
+		restoreStarter = setTailscaleStarterForTests(async () => ({
+			url: PROXY_URL,
+			stop: async () => undefined,
+		}));
+		const onTailscaleExit = vi.fn();
+
+		const handle = await startTailscaleForProfile("default", effectiveProfile("default"), {
+			onTailscaleExit,
+		});
+		expect(handle.url).toBe(PROXY_URL);
+		await handle.stop();
+		expect(onTailscaleExit).not.toHaveBeenCalled();
+	});
+});
+
+describe("describeTailscaleExit", () => {
+	it("names the exit code, or the signal when there is one", () => {
+		expect(describeTailscaleExit({ code: 7, signal: null })).toBe("exit code 7");
+		expect(describeTailscaleExit({ code: null, signal: "SIGKILL" })).toBe("signal SIGKILL");
 	});
 });
