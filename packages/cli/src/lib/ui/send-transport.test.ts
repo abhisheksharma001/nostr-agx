@@ -128,6 +128,25 @@ describe("createUiSendTransport", () => {
 		}
 	});
 
+	it("counts the pause down in whole seconds, rounded up, and is 0 when nothing is waiting", async () => {
+		mocks.createTransport.mockRejectedValueOnce(new Error("launcher could not start"));
+		const ui = holder();
+		expect(ui.retryInSeconds(), "before any start").toBe(0);
+		await expect(ui.get()).rejects.toThrow(/could not start/);
+		expect(ui.retryInSeconds()).toBe(30);
+		vi.advanceTimersByTime(12_500);
+		expect(ui.retryInSeconds(), "17.5 s left rounds up").toBe(18);
+		vi.advanceTimersByTime(17_499);
+		expect(ui.retryInSeconds(), "a millisecond left rounds up").toBe(1);
+		vi.advanceTimersByTime(1);
+		expect(ui.retryInSeconds(), "pause over").toBe(0);
+		vi.advanceTimersByTime(5_000);
+		expect(ui.retryInSeconds(), "well after the pause").toBe(0);
+		await ui.get();
+		expect(ui.retryInSeconds(), "after a good start").toBe(0);
+		await ui.close();
+	});
+
 	it("gives sends that wait on the same failed start the same failure", async () => {
 		let fail!: (error: Error) => void;
 		mocks.createTransport.mockImplementationOnce(

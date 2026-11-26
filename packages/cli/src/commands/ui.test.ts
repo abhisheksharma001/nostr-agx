@@ -280,7 +280,7 @@ describe("agx ui when Tailscale cannot start", () => {
 			expect(error.message).toMatch(/Tailscale is not available/);
 			expect(error.message).toMatch(/about 30 seconds/);
 
-			vi.advanceTimersByTime(12_000);
+			vi.advanceTimersByTime(12_500);
 			const later = await ui.send("two");
 			expect(later.status, later.body).toBe(502);
 			expect((JSON.parse(later.body) as { error: { message: string } }).error.message).toMatch(/about 18 seconds/);
