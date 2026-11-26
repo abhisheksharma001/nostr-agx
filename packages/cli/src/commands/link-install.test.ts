@@ -623,6 +623,7 @@ describe("agx link install: an agx entry in any other form", () => {
 		expect(run.code).toBe(EXIT.config);
 		expect(run.stderr).toContain(path(FILE.claude));
 		expect(run.stderr).toContain("Stop");
+		expect(run.stderr).toContain("different agx entry");
 		expect(run.stderr.toLowerCase()).toContain("nothing was changed");
 		expect(`${run.stdout}${run.stderr}`).not.toContain(existing);
 		expect(tree(userHome)).toEqual(before);

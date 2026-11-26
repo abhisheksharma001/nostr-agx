@@ -326,7 +326,7 @@ function plan(host: HookHost, data: Json, profile: string | undefined, file: str
 	if (conflicts.length > 0) {
 		// Which event, never the command: it may hold a secret in an environment prefix or terminal control codes.
 		throw refusal(
-			`${file} already has an entry under ${conflicts.join(", ")} that mentions agx and is not the one this would write. Its text is not shown, in case it holds a secret.`,
+			`${file} already has a different agx entry under ${conflicts.join(", ")}: a command that mentions agx and is not the one this would write. Its text is not shown, in case it holds a secret.`,
 			`agx never replaces an entry it did not write this time. To keep it, do nothing. To use the new one, delete that entry from ${file} and run this again.`,
 		);
 	}

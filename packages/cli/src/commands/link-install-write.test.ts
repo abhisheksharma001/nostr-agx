@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EXIT } from "../lib/errors.js";
 import { agx, sandbox } from "../test/helpers.js";
@@ -13,7 +13,7 @@ import { agx, sandbox } from "../test/helpers.js";
  * temporary file and no lock file behind.
  */
 
-const calls = vi.hoisted(() => ({ log: [] as string[], failRename: false, failFsync: false }));
+const calls = vi.hoisted(() => ({ log: [] as string[], renames: [] as [string, string][], failRename: false, failFsync: false }));
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
@@ -28,6 +28,7 @@ vi.mock("node:fs", async (importOriginal) => {
 		},
 		renameSync: (from: string, to: string): void => {
 			calls.log.push(`rename ${to.split(sep).pop()}`);
+			calls.renames.push([from, to]);
 			if (calls.failRename) {
 				throw new Error("the disk said no (rename)");
 			}
@@ -53,6 +54,7 @@ beforeEach(() => {
 		throw new Error(`refusing to run: homedir() is ${homedir()}, not the throwaway ${userHome}`);
 	}
 	calls.log = [];
+	calls.renames = [];
 	calls.failRename = false;
 	calls.failFsync = false;
 });
@@ -85,6 +87,9 @@ describe("agx link install: replacing the file", () => {
 		const first = calls.log.indexOf("rename settings.json");
 		expect(first).toBeGreaterThan(-1);
 		expect(calls.log.slice(0, first)).toContain("fsync");
+		// The temporary file is in the file's own folder, so the rename cannot cross onto another disk.
+		expect(calls.renames).toHaveLength(1);
+		expect(dirname(calls.renames[0]?.[0] ?? "")).toBe(dirname(SETTINGS()));
 
 		calls.log = [];
 		writeFileSync(SETTINGS(), "{}\n");
