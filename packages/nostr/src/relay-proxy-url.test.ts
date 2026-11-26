@@ -1,4 +1,5 @@
 import { createServer, type Socket } from "node:net";
+import { inspect } from "node:util";
 import { describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { NostrTransport } from "./nostr-transport";
@@ -20,6 +21,47 @@ function transportWith(relayProxy: Parameters<typeof NostrTransport.create>[0]["
 		relayProxy,
 	});
 }
+
+describe("a transport printed or written as JSON", () => {
+	// A host that logs the transport object must not log the proxy's user name and password.
+	function shownIn(transport: unknown): string[] {
+		return [
+			inspect(transport, { depth: null, showHidden: true }),
+			inspect(transport, { depth: null }),
+			JSON.stringify(transport),
+		];
+	}
+
+	it("does not hold the proxy's user name or password (borrowed URL)", async () => {
+		const transport = await transportWith(`socks5://${USER}:${PASS}@127.0.0.1:45678`);
+		for (const text of shownIn(transport)) {
+			expect(text).not.toContain(USER);
+			expect(text).not.toContain(PASS);
+		}
+	});
+
+	it("does not hold the proxy's user name or password (owned handle)", async () => {
+		const transport = await transportWith(() => ({
+			url: `socks5h://${USER}:${PASS}@127.0.0.1:45679`,
+			stop: async () => {},
+		}));
+		for (const text of shownIn(transport)) {
+			expect(text).not.toContain(USER);
+			expect(text).not.toContain(PASS);
+		}
+		await transport.stop();
+	});
+
+	it("still shows a proxy without credentials, and a transport without a proxy", async () => {
+		const plain = await transportWith("socks5://127.0.0.1:1080");
+		expect(plain.relayProxyUrl).toBe("socks5://127.0.0.1:1080");
+		const none = await transportWith(undefined);
+		expect(none.relayProxyUrl).toBeUndefined();
+		for (const text of [...shownIn(plain), ...shownIn(none)]) {
+			expect(text.length).toBeGreaterThan(0);
+		}
+	});
+});
 
 describe("relayProxyUrl", () => {
 	it("does not hold the proxy's user name or password (borrowed URL)", async () => {
