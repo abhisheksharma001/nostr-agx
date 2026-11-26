@@ -146,6 +146,7 @@ function start(...args: string[]): {
 	child: ChildProcess;
 	done: Promise<Run>;
 	output: () => string;
+	errors: () => string;
 } {
 	return startWith(args);
 }
@@ -164,6 +165,7 @@ function startWith(
 	child: ChildProcess;
 	done: Promise<Run>;
 	output: () => string;
+	errors: () => string;
 } {
 	const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1" };
 	for (const key of Object.keys(env)) {
@@ -194,7 +196,7 @@ function startWith(
 		child.on("error", reject);
 		child.on("close", (code) => resolve({ code, stdout, stderr }));
 	});
-	return { child, done, output: () => stdout };
+	return { child, done, output: () => stdout, errors: () => stderr };
 }
 
 async function until(condition: () => boolean, timeoutMs: number): Promise<void> {
@@ -409,6 +411,158 @@ describe.skipIf(!posix)("agx send through Tailscale (built CLI)", () => {
 				}
 				await request.done;
 			}
+		}
+	}, 90_000);
+
+	/**
+	 * A launcher that ends when it is sent SIGINT, as the real one does, and
+	 * writes its pid where the test can read it.
+	 */
+	function interruptibleLauncher(): string {
+		const pidFile = join(home, "launcher-pid");
+		writeFileSync(
+			launcher,
+			`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(join(home, "launcher-args"))}\necho $$ > ${JSON.stringify(pidFile)}\ntrap 'exit 0' INT\necho socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${socks.port}\nwhile :; do sleep 1 & wait $!; done\n`,
+			{ mode: 0o755 },
+		);
+		return pidFile;
+	}
+
+	const LAUNCHER_NOTICE = "The Tailscale launcher stopped on its own";
+
+	/**
+	 * Start `serve` with a task that runs until `release()`, so that serve is
+	 * inside its stop for as long as the test wants. Returns once the task runs.
+	 */
+	async function serveHoldingATask(): Promise<{
+		serve: ReturnType<typeof start>;
+		release: () => void;
+		cleanUp: () => Promise<void>;
+	}> {
+		const release = join(home, "release-task");
+		const handler = join(home, "held-handler.mjs");
+		writeFileSync(
+			handler,
+			[
+				'import { existsSync } from "node:fs";',
+				"export default {",
+				"	'held.echo': async () => {",
+				`		while (!existsSync(${JSON.stringify(release)})) await new Promise((r) => setTimeout(r, 50));`,
+				"		return { held: true };",
+				"	},",
+				"};",
+			].join("\n"),
+		);
+		// The asker dials the throwaway relay directly; check that before it connects.
+		expect((await agx("--profile", "asker", "identity", "new")).code).toBe(0);
+		expect(
+			(await agx("--profile", "asker", "config", "set", "relays", `ws://127.0.0.1:${relay.port}`)).code,
+		).toBe(0);
+		const askerConfig = await agx("--profile", "asker", "config", "show");
+		expect(askerConfig.stdout).toContain(`ws://127.0.0.1:${relay.port}`);
+		expect(askerConfig.stdout).not.toMatch(/ws:\/\/127\.0\.0\.1:7447\b/);
+		const me = await agx("identity", "show");
+		const npub = /npub1[0-9a-z]+/.exec(me.stdout)?.[0];
+		expect(npub).toBeTruthy();
+
+		const serve = start("serve", "--allow-all", "--handler", handler, "--poll-interval", "500");
+		let request: ReturnType<typeof startWith> | undefined;
+		const cleanUp = async (): Promise<void> => {
+			writeFileSync(release, "");
+			for (const running of [serve, request]) {
+				if (!running) continue;
+				if (running.child.exitCode === null && running.child.signalCode === null) {
+					running.child.kill("SIGKILL");
+				}
+				await running.done;
+			}
+		};
+		try {
+			await until(() => serve.output().includes("watching for messages"), 20_000);
+			request = startWith(
+				["--profile", "asker", "request", npub!, "held.echo", "--payload", "{}", "--timeout", "30000"],
+				WITHOUT_TAILSCALE,
+			);
+			await until(() => serve.output().includes("TASK"), 20_000);
+		} catch (error) {
+			await cleanUp();
+			throw error;
+		}
+		return { serve, release: () => writeFileSync(release, ""), cleanUp };
+	}
+
+	// A Ctrl-C in a terminal reaches serve and the launcher it started at the same
+	// moment. Either one can notice first; both orders must stop serve properly.
+	it("a Ctrl-C that reaches serve after the launcher ended does not cut its stop short", async () => {
+		const pidFile = interruptibleLauncher();
+		const held = await serveHoldingATask();
+		try {
+			process.kill(Number(readFileSync(pidFile, "utf8").trim()), "SIGINT");
+			await until(() => held.serve.errors().includes(LAUNCHER_NOTICE), 10_000);
+			// serve is now stopping, and waits for the task. The same Ctrl-C reaches it.
+			held.serve.child.kill("SIGINT");
+			await new Promise((r) => setTimeout(r, 1_500));
+			expect(
+				held.serve.child.exitCode === null && held.serve.child.signalCode === null,
+				"serve ended at once instead of finishing its stop",
+			).toBe(true);
+			held.release();
+			const run = await Promise.race([
+				held.serve.done,
+				new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
+			]);
+			expect(run, "serve was still running 20 s after its task was released").not.toBeNull();
+			// The launcher ending is what started the stop, so that is the exit status.
+			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(5);
+			expect(run!.stderr.split(LAUNCHER_NOTICE)).toHaveLength(2);
+			expectTailscaleRunWasPerRunAndCleanedUp();
+		} finally {
+			await held.cleanUp();
+		}
+	}, 90_000);
+
+	it("a Ctrl-C that reaches serve before the launcher ends stops it with status 0", async () => {
+		const pidFile = interruptibleLauncher();
+		const held = await serveHoldingATask();
+		try {
+			const pid = Number(readFileSync(pidFile, "utf8").trim());
+			held.serve.child.kill("SIGINT");
+			await until(() => held.serve.output().includes("stopping"), 10_000);
+			process.kill(pid, "SIGINT");
+			await new Promise((r) => setTimeout(r, 1_500));
+			held.release();
+			const run = await Promise.race([
+				held.serve.done,
+				new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
+			]);
+			expect(run, "serve was still running 20 s after its task was released").not.toBeNull();
+			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(0);
+			expect(run!.stderr).not.toContain("Tailscale launcher");
+			expectTailscaleRunWasPerRunAndCleanedUp();
+		} finally {
+			await held.cleanUp();
+		}
+	}, 90_000);
+
+	it("leaves no node keys behind when a second Ctrl-C ends a stop that is waiting", async () => {
+		// A second signal while serve is stopping ends it at once, with status 130,
+		// as it always has. The run's state directory must not outlive it.
+		const pidFile = interruptibleLauncher();
+		const held = await serveHoldingATask();
+		try {
+			held.serve.child.kill("SIGINT");
+			await until(() => held.serve.output().includes("stopping"), 10_000);
+			held.serve.child.kill("SIGINT");
+			const run = await Promise.race([
+				held.serve.done,
+				new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
+			]);
+			expect(run, "serve did not end on the second signal").not.toBeNull();
+			expect(run!.code, `${run!.stdout}\n${run!.stderr}`).toBe(130);
+			expect(existsSync(pidFile)).toBe(true);
+			expectTailscaleRunWasPerRunAndCleanedUp();
+		} finally {
+			await held.cleanUp();
 		}
 	}, 90_000);
 
