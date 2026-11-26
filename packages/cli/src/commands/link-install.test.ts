@@ -924,6 +924,20 @@ describe("agx link install: two installs at once, and a lock that was left behin
 		expect((await install("claude")).code).toBe(EXIT.ok);
 	});
 
+	it("respects a young lock it cannot read (another install may be writing it right now) and leaves it alone", () => {
+		put(FILE.claude, "{}");
+		put(LOCK, "");
+		const before = tree(userHome);
+		let error: unknown;
+		try {
+			linkInstallCommand({ agent: "claude" }, { lockWaitMs: 300 });
+		} catch (caught) {
+			error = caught;
+		}
+		expect((error as AgxCliError).exitCode).toBe(EXIT.config);
+		expect(tree(userHome)).toEqual(before);
+	});
+
 	it("waits a bounded time for a live install and then refuses, changing nothing and leaving that lock alone", () => {
 		put(FILE.claude, "{}");
 		lockFor(liveProcess());
