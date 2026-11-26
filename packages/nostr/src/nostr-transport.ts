@@ -45,6 +45,7 @@ import {
 	type UnwrappedRumor,
 	unwrapRumor,
 } from "./giftwrap";
+import { redactProxyUrl } from "./proxy-url";
 import {
 	listenEvents,
 	pollInbox,
@@ -250,9 +251,12 @@ export class NostrTransport implements AgxTransport {
 		this.relayProxy = proxy;
 	}
 
-	/** The SOCKS5 URL in use, if any. Useful for logs and diagnostics. */
+	/** The SOCKS5 URL in use, if any, with any user name and password replaced:
+	 * safe for logs and diagnostics. The credentials stay inside the transport,
+	 * which hands them to the SOCKS client itself. */
 	get relayProxyUrl(): string | undefined {
-		return this.relayProxy?.url;
+		const url = this.relayProxy?.url;
+		return url === undefined ? undefined : redactProxyUrl(url);
 	}
 
 	/** The WebSocket implementation this transport dials through — the

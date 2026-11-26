@@ -74,7 +74,7 @@ async function recordingSocks(): Promise<{
 		socket.on("error", () => undefined);
 		let buffer = Buffer.alloc(0);
 		let greeted = false;
-		socket.on("data", (chunk) => {
+		socket.on("data", (chunk: Buffer) => {
 			buffer = Buffer.concat([buffer, chunk]);
 			if (!greeted) {
 				if (buffer.length < 2 || buffer.length < 2 + buffer[1]!) return;
