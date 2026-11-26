@@ -34,6 +34,24 @@ const INHERITED_ENV = [
 	"no_proxy",
 	"TS_NO_LOGS_NO_SUPPORT",
 ] as const;
+/**
+ * The spellings Go's strconv.ParseBool accepts. tsnet reads TS_NO_LOGS_NO_SUPPORT
+ * with it and ends the program at start on any other value.
+ */
+const TAILSCALE_BOOLEANS = new Set([
+	"1",
+	"t",
+	"T",
+	"TRUE",
+	"true",
+	"True",
+	"0",
+	"f",
+	"F",
+	"FALSE",
+	"false",
+	"False",
+]);
 const BINARY_NAME = process.platform === "win32" ? "agx-tailscale.exe" : "agx-tailscale";
 
 /**
@@ -100,7 +118,9 @@ export interface StartBundledTailscaleOptions {
 	 * launcher; Tailscale's documentation says that also opts the device out of
 	 * support that would need those logs. When false or omitted the launcher's
 	 * default applies, unless TS_NO_LOGS_NO_SUPPORT is already set in this process,
-	 * in which case that value is passed on.
+	 * in which case that value is passed on if Tailscale accepts it as a boolean
+	 * (true, false, 1, 0, t, f and the usual capitalisations). Any other value is
+	 * left out, with one line on stderr that names the variable and not its value.
 	 */
 	disableLogUpload?: boolean;
 	/** ACL tags such as tag:agx. */
@@ -231,9 +251,17 @@ export async function startBundledTailscale(
 	const env: NodeJS.ProcessEnv = {};
 	for (const name of INHERITED_ENV) {
 		const value = process.env[name];
-		if (value) {
-			env[name] = value;
+		if (!value) continue;
+		if (name === "TS_NO_LOGS_NO_SUPPORT" && !TAILSCALE_BOOLEANS.has(value)) {
+			// The switch sets its own value below, so only say so when it is not on.
+			if (!disableLogUpload) {
+				process.stderr.write(
+					`@nostr-agx/tailscale: ignoring ${name} from the environment, because Tailscale does not accept its value (use true or false).\n`,
+				);
+			}
+			continue;
 		}
+		env[name] = value;
 	}
 	if (disableLogUpload) {
 		env.TS_NO_LOGS_NO_SUPPORT = "true";
