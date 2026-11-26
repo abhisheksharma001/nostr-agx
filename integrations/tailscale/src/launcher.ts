@@ -72,7 +72,7 @@ const PROXY_ADDRESS_VARIABLES = new Set(["HTTP_PROXY", "HTTPS_PROXY", "http_prox
  *   "Basic settings") is hidden too.
  */
 const URL_CREDENTIALS = /(:\/\/)[^\s/?#@"'\\]+@/g;
-const AUTH_LOG_VALUE = /\(auth "[^"]{0,120}"\)/g;
+const AUTH_LOG_VALUE = /(\(auth ")[^"]{0,120}"/g;
 const AUTH_HEADER = /(proxy-authorization):?[^\n\r]*/gi;
 const BASIC_VALUE = /\bBasic[ \t]+[A-Za-z0-9+/]{8,}={0,2}/g;
 
@@ -93,7 +93,7 @@ function describeThrown(thrown: unknown): string {
 function maskSecrets(text: string): string {
 	return text
 		.replace(URL_CREDENTIALS, "$1***@")
-		.replace(AUTH_LOG_VALUE, '(auth "***")')
+		.replace(AUTH_LOG_VALUE, '$1***"')
 		.replace(AUTH_HEADER, "$1: ***")
 		.replace(BASIC_VALUE, "Basic ***");
 }
@@ -447,24 +447,68 @@ export async function startBundledTailscale(
 	};
 }
 
+/** The most of one launcher line that is held, in characters. */
+const MAX_HELD_LINE = 64 * 1024;
+const LINE_CUT_MARKER = " [line cut]\n";
+
+/**
+ * The start of a line that is too long, masked. The cut can fall in the middle of
+ * a login, so what the patterns above cannot see yet (a login without its `@`, an
+ * `(auth "` without its closing quote, a `Basic` value) is hidden up to the cut.
+ */
+function maskCutLine(head: string): string {
+	// Never end on half of a character that takes two UTF-16 units.
+	const last = head.charCodeAt(head.length - 1);
+	const whole = last >= 0xd800 && last <= 0xdbff ? head.slice(0, -1) : head;
+	return maskSecrets(whole)
+		.replace(/(:\/\/)[^\s/?#@"'\\]*$/, "$1***")
+		.replace(/(\(auth ")[^"]*$/, "$1***")
+		.replace(/\bBasic[ \t]+[A-Za-z0-9+/=]*$/, "Basic ***");
+}
+
 /**
  * Write the launcher's stderr to this process's stderr, one whole line at a time
- * and with the credentials of any URL masked. Settles once that stderr has ended.
+ * and with logins masked. Settles once that stderr has ended.
+ *
+ * A line is held until it ends, so that a login is never written in two pieces.
+ * Holding is capped at `MAX_HELD_LINE` characters of one line: a longer line is
+ * written as its masked start and a marker, and the rest of it is thrown away up
+ * to its newline. Each new piece is searched for a newline once, so the time is
+ * linear in the amount written.
  */
 function relayStderr(source: Readable): Promise<void> {
-	let pending = "";
+	let held = "";
+	let dropping = false;
 	source.setEncoding("utf8");
 	source.on("data", (chunk: string) => {
-		pending += chunk;
-		const end = pending.lastIndexOf("\n");
-		if (end === -1) return;
-		process.stderr.write(maskSecrets(pending.slice(0, end + 1)));
-		pending = pending.slice(end + 1);
+		let out = "";
+		let from = 0;
+		while (from < chunk.length) {
+			const newline = chunk.indexOf("\n", from);
+			const end = newline === -1 ? chunk.length : newline + 1;
+			const piece = chunk.slice(from, end);
+			from = end;
+			if (dropping) {
+				if (newline !== -1) dropping = false;
+				continue;
+			}
+			if (held.length + piece.length > MAX_HELD_LINE) {
+				out += maskCutLine((held + piece).slice(0, MAX_HELD_LINE)) + LINE_CUT_MARKER;
+				held = "";
+				dropping = newline === -1;
+			} else if (newline === -1) {
+				held += piece;
+			} else {
+				out += maskSecrets(held + piece);
+				held = "";
+			}
+		}
+		if (out) process.stderr.write(out);
 	});
 	return new Promise<void>((resolve) => {
 		source.once("close", () => {
-			if (pending) process.stderr.write(maskSecrets(pending));
-			pending = "";
+			if (held) process.stderr.write(maskSecrets(held));
+			held = "";
 			resolve();
 		});
 	});
