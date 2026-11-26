@@ -166,6 +166,10 @@ is never logged.
   comes only from the `authKey` option: `startTailscaleRelayProxy()` reads `TS_AUTHKEY` and
   `AGX_TAILSCALE_AUTH_KEY` for you when `authKey` is omitted, `startBundledTailscale()` does not.
   Windows has not been tried.
+- **Log upload.** tsnet uploads Tailscale client logs to `log.tailscale.com` by default.
+  `disableLogUpload: true` sets `TS_NO_LOGS_NO_SUPPORT=true` for the launcher to turn that off;
+  Tailscale says this also opts the device out of support that would need those logs. It is off
+  unless you ask, and the `agx` command line has no flag for it yet.
 
 ### Using a proxy that is already running
 
