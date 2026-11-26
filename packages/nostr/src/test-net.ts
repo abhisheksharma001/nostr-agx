@@ -22,6 +22,56 @@ export async function until(
 	}
 }
 
+export interface ConnectWatch {
+	/** Attempts to open a socket to this port, on any address. */
+	to(port: number): number;
+	/** Every attempt to open a socket, to a port or to a local socket path. */
+	readonly total: number;
+	/** Attempts to a network port on any address: `total` without the local
+	 * socket paths. */
+	readonly network: number;
+	stop(): void;
+}
+
+/**
+ * Count the attempts this process makes to open a socket, from the moment of
+ * the call until `stop()`. Every socket goes through `Socket.prototype.connect`:
+ * `net.connect` for a plain address, `tls.connect` for `wss:`, and the HTTP
+ * agents of both. Watching `net.connect` alone misses `wss:`. An attempt is
+ * counted when it is made, not when a listener accepts it, so it does not
+ * depend on timing. The attempt still goes ahead as usual.
+ */
+export function watchConnects(): ConnectWatch {
+	const ports: (number | undefined)[] = [];
+	const original = net.Socket.prototype.connect;
+	net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) {
+		// `net.connect` hands over its arguments already normalised, as an array.
+		const first = Array.isArray(args[0]) ? args[0][0] : args[0];
+		const options = typeof first === "object" && first !== null ? first : undefined;
+		// A socket path wins over a port in the same options: Node ignores the port.
+		const port = options
+			? typeof (options as { path?: unknown }).path === "string"
+				? undefined
+				: (options as { port?: unknown }).port
+			: first;
+		const number = Number(port);
+		ports.push(port === undefined || Number.isNaN(number) ? undefined : number);
+		return (original as (...rest: unknown[]) => net.Socket).apply(this, args);
+	} as typeof net.Socket.prototype.connect;
+	return {
+		to: (port) => ports.filter((seen) => seen === port).length,
+		get total() {
+			return ports.length;
+		},
+		get network() {
+			return ports.filter((seen) => seen !== undefined).length;
+		},
+		stop() {
+			net.Socket.prototype.connect = original;
+		},
+	};
+}
+
 function listen(server: net.Server): Promise<number> {
 	return new Promise((resolve) =>
 		server.listen(0, "127.0.0.1", () =>

@@ -1,23 +1,16 @@
-import net from "node:net";
 import WebSocket, { type ClientOptions } from "ws";
 import { generateSecretKey } from "nostr-tools";
-import {
-	afterEach,
-	beforeEach,
-	describe,
-	expect,
-	it,
-	type MockInstance,
-	vi,
-} from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NostrTransport } from "./nostr-transport";
 import { createProxyWebSocket, RelayProxyError } from "./relay-proxy";
 import { localSigner } from "./signer";
 import {
+	type ConnectWatch,
 	type FakeSocks5,
 	startFakeSocks5,
 	startTcpListener,
 	type TcpListener,
+	watchConnects,
 } from "./test-net";
 
 // A relay that is a bare IP address is the case where a wrong WebSocket class
@@ -28,36 +21,27 @@ import {
 
 let relay: TcpListener;
 let proxy: FakeSocks5;
-let connect: MockInstance<typeof net.connect>;
+let watch: ConnectWatch;
 
+// Whether a listener sees a connection depends on timing: a socket destroyed at
+// once can be gone before the listener accepts it, although the address has
+// already been contacted. So the tests count the attempts to open a socket (all
+// of them, `wss:` included) as well as the connections the listener accepted.
+// The attempts are read before anything in the test makes a connection of its
+// own, because the listener's `settle()` connects too.
 beforeEach(async () => {
 	relay = await startTcpListener();
 	proxy = await startFakeSocks5();
-	connect = vi.spyOn(net, "connect");
+	watch = watchConnects();
 });
 
 afterEach(async () => {
-	connect.mockRestore();
+	watch.stop();
 	await relay.close();
 	await proxy.close();
 });
 
-/**
- * How many times the process asked the OS to open a connection to the relay.
- * Whether the listener then sees that connection depends on timing: a socket
- * destroyed at once can be gone before the listener accepts it, although the
- * address has already been contacted. So the attempt itself is what is counted,
- * before anything in the test makes a connection of its own.
- */
-function attemptsToRelay(): number {
-	return connect.mock.calls.filter(([first]) => {
-		const port =
-			typeof first === "object" && first !== null
-				? (first as { port?: unknown }).port
-				: first;
-		return String(port) === String(relay.port);
-	}).length;
-}
+const attemptsToRelay = () => watch.to(relay.port);
 
 const proxyUrl = () => `socks5://127.0.0.1:${proxy.port}`;
 const relayUrl = () => `ws://127.0.0.1:${relay.port}`;
@@ -111,15 +95,23 @@ describe("a WebSocket class that drops the proxy agent", () => {
 				lookup: vi.fn(),
 			}),
 		).rejects.toBeInstanceOf(RelayProxyError);
+		// The class is checked without reaching any network address: not the relay,
+		// not the proxy, not a port on any other host. (A class that drops its
+		// options does try the local socket path of the check, which no network
+		// reaches.)
+		expect(watch.network).toBe(0);
 	});
 
-	it("opens no connection to a relay that is a bare IP address", async () => {
-		await createAndDial(DroppingWebSocket, relayUrl());
+	it.each(["ws", "wss"])(
+		"opens no connection to a relay that is a bare IP address (%s)",
+		async (scheme) => {
+			await createAndDial(DroppingWebSocket, `${scheme}://127.0.0.1:${relay.port}`);
 
-		expect(attemptsToRelay()).toBe(0);
-		expect(await relay.settle()).toBe(0);
-		expect(proxy.connections()).toBe(0);
-	});
+			expect(attemptsToRelay()).toBe(0);
+			expect(await relay.settle()).toBe(0);
+			expect(proxy.connections()).toBe(0);
+		},
+	);
 
 	it("is refused when a transport is created, and the proxy it started is released", async () => {
 		const stop = vi.fn(async () => {});
@@ -132,12 +124,28 @@ describe("a WebSocket class that drops the proxy agent", () => {
 
 		expect(error).toBeInstanceOf(RelayProxyError);
 		expect(stop).toHaveBeenCalledOnce();
-		expect(attemptsToRelay()).toBe(0);
+		expect(watch.network).toBe(0);
 		expect(await relay.settle()).toBe(0);
 	});
 });
 
 describe("a WebSocket class that forwards its options", () => {
+	it("is accepted when a transport is created, and nothing is dialed until it is used", async () => {
+		const stop = vi.fn(async () => {});
+		const transport = await NostrTransport.create({
+			signer: localSigner(generateSecretKey()),
+			relays: [relayUrl()],
+			ws: WebSocket,
+			relayProxy: () => ({ url: proxyUrl(), stop }),
+		});
+
+		expect(watch.total).toBe(0);
+		expect(await relay.settle()).toBe(0);
+		expect(proxy.connections()).toBe(0);
+		await transport.stop();
+		expect(stop).toHaveBeenCalledOnce();
+	});
+
 	it.each([
 		["the ws class itself", WebSocket],
 		["a subclass that adds an option of its own", MergingWebSocket],
@@ -148,7 +156,7 @@ describe("a WebSocket class that forwards its options", () => {
 			lookup: vi.fn(),
 		});
 
-		expect(connect).not.toHaveBeenCalled();
+		expect(watch.total).toBe(0);
 		expect(await relay.settle()).toBe(0);
 		expect(proxy.connections()).toBe(0);
 	});
