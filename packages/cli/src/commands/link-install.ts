@@ -1,7 +1,9 @@
 import { randomBytes } from "node:crypto";
 import {
+	accessSync,
 	chmodSync,
 	closeSync,
+	constants,
 	fsyncSync,
 	lstatSync,
 	mkdirSync,
@@ -609,6 +611,30 @@ function withLock<T>(target: string, deps: LinkInstallDeps, run: (stillMine: () 
 	}
 }
 
+/**
+ * Refuses what a real run could not do either, so that a dry run says the same: the folder the file goes in (or the
+ * nearest one that exists, when it is not there yet) is a link to nothing, is not a folder, or cannot be written into.
+ */
+function requireWritableFolder(folder: string, file: string): void {
+	let dir = folder;
+	while (!lookedAt(dir) && dirname(dir) !== dir) {
+		dir = dirname(dir);
+	}
+	let problem: string | null = null;
+	try {
+		if (!statSync(dir).isDirectory()) {
+			problem = "is not a folder";
+		} else {
+			accessSync(dir, constants.W_OK | constants.X_OK);
+		}
+	} catch (error) {
+		problem = (error as NodeJS.ErrnoException).code === "ENOENT" ? "is a link to a folder that does not exist" : "is not writable";
+	}
+	if (problem !== null) {
+		throw refusal(`${dir} ${problem}, so ${file} cannot be created or replaced there.`, "Fix that folder or its permissions, or add the entries yourself: see docs/hooks.md.");
+	}
+}
+
 interface Prepared {
 	loaded: Loaded;
 	result: Plan;
@@ -631,6 +657,10 @@ function prepare(host: HookHost, file: string, profile: string | undefined): Pre
 				"Add the entries yourself: see docs/hooks.md.",
 			);
 		}
+	}
+	if (action !== "unchanged") {
+		// A dry run says what the real run would find: a folder it could not write into is refused in both.
+		requireWritableFolder(dirname(loaded.target), file);
 	}
 	return { loaded, result, action };
 }
