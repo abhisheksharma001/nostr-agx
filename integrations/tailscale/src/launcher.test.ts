@@ -371,7 +371,7 @@ describe("the exit notice", () => {
 		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
 		try {
 			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
-			const exit = new Promise<unknown>((resolve) => proxy.onExit(resolve));
+			const exit = new Promise<unknown>((resolve) => proxy?.onExit(resolve));
 			await writeFile(trigger, "");
 			expect(await within(exit, "the exit notice")).toEqual({ code: 7, signal: null });
 			// The handle is still safe to stop afterwards.
@@ -390,7 +390,7 @@ describe("the exit notice", () => {
 		let proxy: Awaited<ReturnType<typeof startBundledTailscale>> | undefined;
 		try {
 			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
-			const exit = new Promise<unknown>((resolve) => proxy.onExit(resolve));
+			const exit = new Promise<unknown>((resolve) => proxy?.onExit(resolve));
 			await writeFile(trigger, "");
 			expect(await within(exit, "the exit notice")).toEqual({ code: null, signal: "SIGKILL" });
 		} finally {
@@ -410,7 +410,7 @@ describe("the exit notice", () => {
 			await writeFile(trigger, "");
 			await until(() => existsSync(`${trigger}.gone`));
 			await new Promise((resolve) => setTimeout(resolve, 500));
-			const exit = new Promise<unknown>((resolve) => proxy.onExit(resolve));
+			const exit = new Promise<unknown>((resolve) => proxy?.onExit(resolve));
 			expect(await within(exit, "the exit notice")).toEqual({ code: 9, signal: null });
 		} finally {
 			await proxy?.stop();
@@ -428,7 +428,7 @@ describe("the exit notice", () => {
 			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
 			const removed = vi.fn();
 			const off = proxy.onExit(removed);
-			const kept = new Promise<unknown>((resolve) => proxy.onExit(resolve));
+			const kept = new Promise<unknown>((resolve) => proxy?.onExit(resolve));
 			off();
 			await writeFile(trigger, "");
 			// The second listener was added after the first, so it has been called by
@@ -467,7 +467,7 @@ describe("the exit notice", () => {
 			proxy = await startBundledTailscale({ binary: fake.path, timeoutMs: 5_000 });
 			const stateDir = stateDirArg(await firstLaunch(fake.dir));
 			const seenByListener = new Promise<boolean>((resolve) =>
-				proxy.onExit(() => resolve(existsSync(stateDir))),
+				proxy?.onExit(() => resolve(existsSync(stateDir))),
 			);
 			expect(existsSync(stateDir)).toBe(true);
 			await writeFile(trigger, "");

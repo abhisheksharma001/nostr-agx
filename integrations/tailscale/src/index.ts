@@ -7,7 +7,7 @@ import {
 	type TailscaleAuthKeyInput,
 } from "./auth-key";
 import { TailscaleError } from "./errors";
-import { startBundledTailscale } from "./launcher";
+import { startBundledTailscale, type BundledTailscaleExit } from "./launcher";
 
 export {
 	DEFAULT_TAILSCALE_AUTH_KEY_ENV,
@@ -27,6 +27,7 @@ export { TailscaleError, type TailscaleErrorCode } from "./errors";
 export {
 	bundledBinaryPath,
 	startBundledTailscale,
+	type BundledTailscaleExit,
 	type BundledTailscaleProxy,
 	type StartBundledTailscaleOptions,
 } from "./launcher";
@@ -67,6 +68,27 @@ export interface TailscaleProxy {
 	readonly port?: number;
 	/** Stop the child process. Idempotent. */
 	stop(): Promise<void>;
+	/**
+	 * Call `listener` if the launcher ends on its own; returns a function that
+	 * removes it. Optional, so a custom {@link TailscaleStarter} need not offer it.
+	 */
+	onExit?(listener: (exit: BundledTailscaleExit) => void): () => void;
+}
+
+/**
+ * What {@link startTailscaleRelayProxy} returns: a relay proxy handle that can
+ * also tell you when the launcher ends without `stop()`. A transport that is
+ * given this handle keeps only `url` and `stop()`, so subscribe before handing
+ * it over.
+ */
+export interface TailscaleRelayProxyHandle extends RelayProxyHandle {
+	/**
+	 * Call `listener` if the launcher ends without `stop()` having been called, for
+	 * example because it crashed. From then on `url` no longer works. Returns a
+	 * function that removes the listener. A launcher that offers no such notice
+	 * (a custom {@link TailscaleStarter}) never calls it.
+	 */
+	onExit(listener: (exit: BundledTailscaleExit) => void): () => void;
 }
 
 /** Replace the default launcher, e.g. to inject a fake in tests. */
@@ -116,7 +138,7 @@ export interface TailscaleRelayConfig
  */
 export async function startTailscaleRelayProxy(
 	config: TailscaleRelayConfig = {},
-): Promise<RelayProxyHandle> {
+): Promise<TailscaleRelayProxyHandle> {
 	const starter = config.start ?? startBundledTailscale;
 	const authKey = await resolveTailscaleAuthKey(config.authKey);
 	const options: TailscaleStartOptions = {
@@ -154,6 +176,7 @@ export async function startTailscaleRelayProxy(
 	return {
 		url: proxy.url,
 		stop: () => proxy.stop(),
+		onExit: (listener) => proxy.onExit?.(listener) ?? (() => {}),
 	};
 }
 

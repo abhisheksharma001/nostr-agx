@@ -43,6 +43,14 @@ export interface StartBundledTailscaleOptions {
 	binary?: string;
 }
 
+/** How the launcher ended. */
+export interface BundledTailscaleExit {
+	/** The exit code, or null when a signal ended the launcher. */
+	readonly code: number | null;
+	/** The signal that ended the launcher, or null when it exited by itself. */
+	readonly signal: NodeJS.Signals | null;
+}
+
 export interface BundledTailscaleProxy {
 	/** SOCKS5 proxy URL, suitable for a relayProxy setting. */
 	readonly url: string;
@@ -52,6 +60,16 @@ export interface BundledTailscaleProxy {
 	readonly port: number;
 	/** Stop the child process. Safe to call more than once. */
 	stop(): Promise<void>;
+	/**
+	 * Call `listener` if the launcher ends without `stop()` having been called, for
+	 * example because it crashed or was killed from outside. From then on the proxy
+	 * no longer works. A launcher stopped through `stop()` does not trigger it.
+	 *
+	 * The listener is called once, after the launcher's temporary state directory
+	 * has been deleted. A listener added after the launcher already ended is called
+	 * on the next tick. Returns a function that removes the listener.
+	 */
+	onExit(listener: (exit: BundledTailscaleExit) => void): () => void;
 }
 
 /**
@@ -166,10 +184,16 @@ export async function startBundledTailscale(
 
 	// Whatever ends the launcher (stop, a failed start, or its own exit), its
 	// state directory goes with it, and `exited` settles only after that.
+	let stopRequested = false;
+	let endedOnItsOwn: BundledTailscaleExit | undefined;
+	const exitListeners = new Set<(exit: BundledTailscaleExit) => void>();
 	const exited = new Promise<void>((resolve) =>
-		child.once("exit", () => {
+		child.once("exit", (code, signal) => {
 			removeOwnedStateDir();
 			resolve();
+			if (stopRequested) return;
+			endedOnItsOwn = { code, signal };
+			for (const listener of [...exitListeners]) listener(endedOnItsOwn);
 		}),
 	);
 	let url: string;
@@ -208,8 +232,25 @@ export async function startBundledTailscale(
 		host: parsed.hostname,
 		port,
 		stop(): Promise<void> {
+			stopRequested = true;
 			stopping ??= stopChild(child, stdin, exited);
 			return stopping;
+		},
+		onExit(listener): () => void {
+			const ended = endedOnItsOwn;
+			if (ended) {
+				let removed = false;
+				queueMicrotask(() => {
+					if (!removed) listener(ended);
+				});
+				return () => {
+					removed = true;
+				};
+			}
+			exitListeners.add(listener);
+			return () => {
+				exitListeners.delete(listener);
+			};
 		},
 	};
 }
