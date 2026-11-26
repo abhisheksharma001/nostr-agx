@@ -1,7 +1,7 @@
 import { createServer, type Socket } from "node:net";
 import { generateKeypair } from "@nostr-agx/nostr";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { effectiveProfile } from "../lib/config.js";
+import { effectiveProfile, updateProfile } from "../lib/config.js";
 import { toDisplayNpub } from "../lib/peer.js";
 import { setStdinForTests } from "../lib/stdin.js";
 import { setTailscaleStarterForTests } from "../lib/tailscale/index.js";
@@ -295,6 +295,19 @@ describe("agx ui when Tailscale cannot start", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe("agx ui when the transport cannot start for a reason other than Tailscale", () => {
+	it("does not blame Tailscale and leaves the answer as it was", async () => {
+		// No relays configured: the transport refuses to start, and Tailscale is not involved.
+		updateProfile("default", { relays: [] });
+		const ui = await startUi();
+		const sent = await ui.send("one");
+		expect(sent.status, sent.body).toBe(500);
+		expect(sent.body).not.toMatch(/Tailscale/);
+		expect(starts).toBe(0);
+		await ui.stop();
 	});
 });
 
