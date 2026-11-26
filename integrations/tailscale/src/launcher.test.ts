@@ -35,12 +35,14 @@ const RUNNING = "echo socks5://agx:secret@127.0.0.1:43220\nexec cat >/dev/null\n
 
 /**
  * Reports a proxy, then ends the way `ending` says once the file `trigger`
- * exists. `<trigger>.gone` is written just before it ends.
+ * exists, or once the process that started it is gone. `<trigger>.gone` is
+ * written just before it ends.
  */
 function endingTail(trigger: string, ending: string): string {
 	return (
 		"echo socks5://agx:secret@127.0.0.1:43230\n" +
-		`while [ ! -e ${JSON.stringify(trigger)} ]; do sleep 0.05; done\n` +
+		"p=$PPID\n" +
+		`while [ ! -e ${JSON.stringify(trigger)} ] && kill -0 $p 2>/dev/null; do sleep 0.05; done\n` +
 		`: > ${JSON.stringify(`${trigger}.gone`)}\n` +
 		`${ending}\n`
 	);
