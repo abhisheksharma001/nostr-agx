@@ -218,13 +218,15 @@ export async function tailscaleEnableCommand(
 					{ authKey, oauthClientSecret: oauthSecret },
 				);
 	try {
-		const next = updateProfile(profileName, change);
+		// The key first: if it cannot be written, the profile is still as it was. A
+		// stored key without the opt-in does nothing.
 		if (authKey || oauthSecret) {
 			saveTailscaleSecret(profileName, {
 				...(authKey ? { authKey } : {}),
 				...(oauthSecret ? { oauthClientSecret: oauthSecret } : {}),
 			});
 		}
+		const next = updateProfile(profileName, change);
 
 		const status = tailscaleStatusForProfile(profileName, next);
 		heading("agx tailscale enable");
