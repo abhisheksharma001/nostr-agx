@@ -196,6 +196,25 @@ To opt out, `TS_NO_LOGS_NO_SUPPORT=true` has to be in the environment of the
 launcher process. Tailscale's documentation says this also opts the device out
 of any support that would need those logs.
 
+The opt-out has side effects. These come from reading tsnet v1.104.7 and
+Tailscale's pages on [logging](https://tailscale.com/docs/features/logging) and
+[network flow logs](https://tailscale.com/docs/features/logging/network-flow-logs);
+none of it was run against a tailnet.
+
+- The node tells the control server that it opted out: the host information it
+  sends carries a `NoLogsNoSupport` field that is set from the variable.
+- The node does not report network flow logs (the admin console's record of
+  which nodes connected to which). Tailscale's page says nodes report flow
+  information "when network flow logs are enabled (and not using
+  `--no-logs-no-support`)".
+- A tailnet that has network flow logs turned on can stop the node. When the
+  opt-out is set and this node's capabilities in the control server's network map
+  include `data-plane-audit-logs` (the same source uses that capability to switch
+  network flow logging on for a node), tsnet sets the node to not running and
+  reports that the "tailnet requires logging to be enabled"
+  (`ipn/ipnlocal/local.go`, `setControlClientStatusLocked`). So do not use the
+  opt-out on a tailnet that needs flow logs; ask whoever runs the tailnet first.
+
 Today that variable does not reach the launcher on its own: the SDK starts it
 with only `HOME` and the auth key, so setting `TS_NO_LOGS_NO_SUPPORT` in your
 shell has no effect. There is no `agx` or SDK option for it. What works today is
