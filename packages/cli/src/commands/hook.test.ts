@@ -437,6 +437,15 @@ describe("agx hook: held senders and other mail that never nudges", () => {
 		expectSilent(await hook("session-start", "claude"));
 	});
 
+	it("stays silent for a message this profile sent even when its stored line has no read time", async () => {
+		// The store marks what it sends as read; a hand-edited or older line may not.
+		const line = JSON.stringify({ id: "out-raw", direction: "out", peer: PEER, subject: null, contextId: T_A, contextIdWithheld: false, text: BODY, at: at(1), deliveryStatus: "sent", readAt: null });
+		mkdirSync(profileDir("default"), { recursive: true });
+		writeFileSync(join(profileDir("default"), "messages.jsonl"), `${line}\n`);
+		expectSilent(await hook("stop", "claude"));
+		expectSilent(await hook("session-start", "claude"));
+	});
+
 	it("stays silent for a profile that has no store at all", async () => {
 		expectSilent(await hook("stop", "claude"));
 		expectSilent(await hook("stop", "claude", { profile: "nobody" }));
