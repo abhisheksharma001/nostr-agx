@@ -140,8 +140,8 @@ is never logged.
 
 ## Other entry points
 
-- `startTailscaleRelayProxy(config)` starts the bundled node immediately and returns a bare
-  `{ url, stop() }` handle. Use it when you need the proxy lifecycle in your own code.
+- `startTailscaleRelayProxy(config)` starts the bundled node immediately and returns a
+  `{ url, stop(), onExit() }` handle. Use it when you need the proxy lifecycle in your own code.
 - `startBundledTailscale(options)` is the underlying launcher, and `bundledBinaryPath()` reports the
   binary selected for the current platform.
 - `TailscaleError` carries a `code` (`configuration | auth | network | module`) and a `remediation`
@@ -150,6 +150,11 @@ is never logged.
 
 ### State directory, exit notice, environment and logs
 
+- **Exit notice.** The handle from `startTailscaleRelayProxy()` and `startBundledTailscale()` has
+  `onExit(listener)`. The listener gets `{ code, signal }` if the launcher ends without `stop()`
+  having been called (it crashed, or was killed from outside); after that the proxy URL no longer
+  works. It returns a function that removes the listener. A transport that is given the handle keeps
+  only `url` and `stop()`, so subscribe before handing it over.
 - **State directory.** Without `stateDir`, each node gets its own private temporary directory,
   deleted when the node stops (a process that is killed outright leaves it behind). Pass `stateDir`
   to keep a node's identity between runs; a directory you pass is never deleted. tsnet ignores a
