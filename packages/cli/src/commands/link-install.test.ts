@@ -718,6 +718,7 @@ describe("agx link install: an agx entry in any other form", () => {
 		["a command substitution", "echo $(agx hook stop --host claude)"],
 		["a pipe", "true | agx hook stop --host claude"],
 		["a bare agx", "agx"],
+		["a command in backticks", "echo `agx hook stop --host claude`"],
 	];
 
 	it.each(MENTIONS)("refuses when Stop has a command with %s: a different agx entry, not a second copy", async (_label, existing) => {
@@ -1131,6 +1132,33 @@ describe("agx link install: two installs at once, and a lock that was left behin
 		expect((error as AgxCliError).message.toLowerCase()).toContain("nothing was changed");
 		expect(waited).toBeGreaterThanOrEqual(300);
 		expect(waited).toBeLessThan(4000);
+		expect(tree(userHome)).toEqual(before);
+	});
+
+	it("takes over a lock even when the short-lived file used for taking over was left by an install that died", async () => {
+		put(FILE.claude, "{}");
+		lockFor(deadPid());
+		put(`${LOCK}.takeover`, `${JSON.stringify({ pid: deadPid() })}\n`);
+		const run = await install("claude");
+		expect(run.code).toBe(EXIT.ok);
+		expect(readdirSync(path(".claude"))).toEqual(["settings.json"]);
+		expect(readJson(FILE.claude)).toEqual(expected("claude"));
+	});
+
+	it("leaves a left-over lock and a takeover that a live install is making alone, and refuses after the bounded wait", () => {
+		put(FILE.claude, "{}");
+		lockFor(deadPid());
+		const takeover = `${JSON.stringify({ pid: liveProcess() })}\n`;
+		put(`${LOCK}.takeover`, takeover);
+		const before = tree(userHome);
+		let error: unknown;
+		try {
+			linkInstallCommand({ agent: "claude" }, { lockWaitMs: 400 });
+		} catch (caught) {
+			error = caught;
+		}
+		expect((error as AgxCliError).exitCode).toBe(EXIT.config);
+		expect(read(`${LOCK}.takeover`)).toBe(takeover);
 		expect(tree(userHome)).toEqual(before);
 	});
 
