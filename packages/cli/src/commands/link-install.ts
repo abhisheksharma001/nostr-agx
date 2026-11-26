@@ -255,13 +255,17 @@ function lossyContent(text: string): "number" | "key" | "deep" | null {
 }
 
 /**
- * Whether a hook command mentions agx at all, in any form: a path (with or without spaces), `npx agx`,
- * `env X=y agx`, `agx.js`, `sh -c '...'`, a folder named for it. Cheap to get wrong in the other
- * direction, so it errs on the side of refusing: the one thing worse than a refusal is a second copy
- * of the hook.
+ * `agx` used as a command or a path component: the word `agx`, or a file called `agx.js`, `agx.cmd` or
+ * `agx.exe`, after the start of the text, white space, a slash, a backslash, a quote or a shell separator
+ * and before the end, white space, a quote or a shell separator. That covers `agx hook ...`, a path with or
+ * without spaces, `npx agx`, `env X=y agx`, `sh -c '...'` and `$(agx ...)`, in any case. It leaves out `tagx`,
+ * `~/nostr-agx/lint.sh`, `AGX_DONE` and the like, which are other tools.
  */
+const AGX_AS_A_COMMAND = /(?:^|[\s/\\'"(;&|`])agx(?:\.(?:js|cmd|exe))?(?=$|[\s'");&|)`])/i;
+
+/** Whether a hook command runs agx. It errs on the side of yes: the one thing worse than a refusal is a second copy of the hook. */
 function mentionsAgx(command: string): boolean {
-	return /agx/i.test(command);
+	return AGX_AS_A_COMMAND.test(command);
 }
 
 /** The commands registered under one event, however the host nests them. */
@@ -310,9 +314,12 @@ function plan(host: HookHost, data: Json, profile: string | undefined, file: str
 		if (current !== undefined && !Array.isArray(current)) {
 			throw refusal(`"${event}" in ${file} is not a list, so agx will not edit it.`, "Fix the file by hand, or add the entries yourself: see docs/hooks.md.");
 		}
-		const existing = commandsOf(host, current ?? []).filter(mentionsAgx);
+		const all = commandsOf(host, current ?? []);
+		const existing = all.filter(mentionsAgx);
 		if (existing.some((command) => command !== wanted)) {
-			conflicts.push(event);
+			// Where the command is among those of the event, so it can be found without printing it.
+			const positions = all.flatMap((command, index) => (mentionsAgx(command) && command !== wanted ? [index + 1] : []));
+			conflicts.push(`${event} (command${positions.length > 1 ? "s" : ""} ${positions.join(", ")} of ${all.length})`);
 			continue;
 		}
 		if (existing.length > 0) {
@@ -328,7 +335,7 @@ function plan(host: HookHost, data: Json, profile: string | undefined, file: str
 	if (conflicts.length > 0) {
 		// Which event, never the command: it may hold a secret in an environment prefix or terminal control codes.
 		throw refusal(
-			`${file} already has a different agx entry under ${conflicts.join(", ")}: a command that mentions agx and is not the one this would write. Its text is not shown, in case it holds a secret.`,
+			`${file} (${host}) already has a different agx entry: ${conflicts.join(", ")}. It runs agx and is not the one this would write. Its text is not shown, in case it holds a secret.`,
 			`agx never replaces an entry it did not write this time. To keep it, do nothing. To use the new one, delete that entry from ${file} and run this again.`,
 		);
 	}
