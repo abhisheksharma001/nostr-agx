@@ -255,6 +255,26 @@ describe("agx ui and Tailscale", () => {
 	});
 });
 
+describe("agx ui and the relay from the environment", () => {
+	it("pulls from, and checks, the relay the environment names rather than the stored one", async () => {
+		const stored = await droppingListener();
+		try {
+			expect((await agx("config", "set", "relays", `ws://127.0.0.1:${stored.port}`)).code).toBe(0);
+			process.env.AGX_RELAY = `ws://127.0.0.1:${relay.port}`;
+			expect(effectiveProfile("default").relays).toEqual([`ws://127.0.0.1:${relay.port}`]);
+			const ui = await startUi();
+			// The first pull, then the reachability check that follows it.
+			await until(() => stored.connections > 0 || relay.connections >= 2, "the first pull and its reachability check");
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(stored.connections, "the stored relay was dialled although the environment names another").toBe(0);
+			expect(relay.connections).toBeGreaterThanOrEqual(2);
+			await ui.stop();
+		} finally {
+			await stored.close();
+		}
+	});
+});
+
 describe("agx ui without Tailscale", () => {
 	it("pulls and sends directly and starts no launcher", async () => {
 		const ui = await startUi();
