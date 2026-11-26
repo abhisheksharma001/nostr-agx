@@ -226,6 +226,8 @@ describe("agx link install: a fresh home", () => {
 				],
 				present: [],
 				undo: expect.stringContaining(path(FILE.codex)),
+				// The sandbox sets AGX_HOME, which the hook commands do not carry.
+				warnings: ["AGX_HOME"],
 			},
 		]);
 	});

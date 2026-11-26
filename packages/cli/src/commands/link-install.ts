@@ -644,5 +644,6 @@ export function linkInstallCommand(options: LinkInstallOptions, deps: LinkInstal
 		added: result.added,
 		present: result.present,
 		undo,
+		warnings: uncarried,
 	});
 }
