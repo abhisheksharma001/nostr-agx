@@ -38,7 +38,7 @@ import {
 	type TailscaleOAuthOptions,
 } from "../src/index";
 import { redactProxyUrl } from "../src/proxy-url";
-import { requiredRelay, runAgents } from "./run-agents";
+import { requiredRelay, runAgents, unknownArgument } from "./run-agents";
 
 interface Options {
 	clientId?: string;
@@ -174,7 +174,7 @@ function parseArgs(argv: string[]): Options {
 		} else if (arg.startsWith("--state-dir=")) {
 			opts.stateDir = arg.slice("--state-dir=".length);
 		} else {
-			throw new Error(`Unknown argument: ${arg}`);
+			throw unknownArgument(arg);
 		}
 	}
 	return opts;
