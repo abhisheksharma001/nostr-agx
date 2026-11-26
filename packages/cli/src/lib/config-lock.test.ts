@@ -84,6 +84,14 @@ describe("withConfigLock", () => {
 		expect(existsSync(configLockPath())).toBe(false);
 	});
 
+	it("refuses, in its type, a function that returns a promise (checked by type-check)", () => {
+		const neverCalled = (): void => {
+			// @ts-expect-error the lock would be let go before the promise settles
+			withConfigLock(async () => 1);
+		};
+		expect(neverCalled).toBeTypeOf("function");
+	});
+
 	it("releases the lock when the function throws", () => {
 		expect(() =>
 			withConfigLock(() => {

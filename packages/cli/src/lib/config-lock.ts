@@ -208,11 +208,14 @@ function acquire(waitMs: number): () => void {
 
 let depth = 0;
 
+/** A function that returns a promise is refused: the lock is let go when `fn` returns, before the promise settles. */
+type NotAPromise<T> = T extends PromiseLike<unknown> ? never : T;
+
 /**
  * Run `fn` while holding the config lock. Re-entrant within one process, so a
  * caller that already holds it can call `updateProfile` without waiting for itself.
  */
-export function withConfigLock<T>(fn: () => T, options: { waitMs?: number } = {}): T {
+export function withConfigLock<T>(fn: () => NotAPromise<T>, options: { waitMs?: number } = {}): T {
 	if (depth > 0) {
 		return fn();
 	}
