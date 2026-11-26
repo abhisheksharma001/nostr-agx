@@ -1,4 +1,5 @@
 import dns from "node:dns";
+import { lookup as namedLookup } from "node:dns/promises";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ import { setCredential } from "../lib/credentials.js";
 import { saveIdentity } from "../lib/identity.js";
 import { redactSecrets, rememberSecret } from "../lib/secrets.js";
 import { startGateway } from "../lib/gateway/gateway.js";
+import { assertWebhookHost } from "../lib/gateway/subscriptions.js";
 import { createGatewayKey } from "../lib/gateway/keys.js";
 import { setStdinForTests } from "../lib/stdin.js";
 import { setTailscaleSdkLoaderForTests } from "../lib/tailscale/index.js";
@@ -2590,6 +2592,21 @@ describe("the secret-key canary", () => {
 				expect(world.attempts.slice(before).map((attempt) => `${attempt.host}:${attempt.port}:${attempt.blocked}`)).toEqual([`listen:${free}:port`, `127.0.0.1:${free}:port`]);
 			} finally {
 				undo();
+				world.attempts.splice(before);
+			}
+		});
+
+		it("sees a lookup that code makes through a named import, and refuses it", async () => {
+			// `subscriptions.ts` does `import { lookup } from "node:dns/promises"`: a name imported like that is the guard's
+			// only if the guard says so to Node (`syncBuiltinESMExports`). Checked first, so that no lookup goes out when it is not.
+			expect(namedLookup).toBe(dns.promises.lookup);
+			const before = world.attempts.length;
+			try {
+				await expect(namedLookup("canary-named.invalid")).rejects.toMatchObject({ code: "ENOTFOUND" });
+				// And the code that does it: a webhook whose host is a name, as a subscription may carry.
+				await assertWebhookHost("http://canary-webhook.invalid/hook");
+				expect(world.attempts.slice(before).map((attempt) => `${attempt.host}:${attempt.blocked}`)).toEqual(["canary-named.invalid:name", "canary-webhook.invalid:name"]);
+			} finally {
 				world.attempts.splice(before);
 			}
 		});

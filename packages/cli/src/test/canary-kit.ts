@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import dns from "node:dns";
+import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import { join, relative, sep } from "node:path";
 import { bytesToHex, hexToBytes } from "@nostr-agx/nostr";
@@ -451,6 +452,10 @@ export function guardConnections(): { attempts: ConnectAttempt[]; restore: () =>
 		throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: "ENOTFOUND", hostname: host });
 	}) as never);
 
+	// `import { lookup } from "node:dns/promises"` keeps the function it was given when the code was loaded,
+	// not the one that is on the module object now: it sees the spies only after this call.
+	syncBuiltinESMExports();
+
 	return {
 		attempts,
 		restore: () => {
@@ -458,6 +463,7 @@ export function guardConnections(): { attempts: ConnectAttempt[]; restore: () =>
 			listenSpy.mockRestore();
 			lookupSpy.mockRestore();
 			promiseLookupSpy.mockRestore();
+			syncBuiltinESMExports();
 		},
 	};
 }
