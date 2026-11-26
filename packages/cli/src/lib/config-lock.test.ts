@@ -111,9 +111,14 @@ describe("withConfigLock", () => {
 			expect(existsSync(configLockPath())).toBe(false);
 		});
 
-		it("is refused for a nested call too, and the outer lock is let go", () => {
+		it("is refused for a nested call too, even when the outer function drops the value, and the outer lock is let go", () => {
 			const later = (async () => 1) as any;
-			expect(() => withConfigLock(() => withConfigLock(later))).toThrow(/must be synchronous/);
+			expect(() =>
+				withConfigLock(() => {
+					withConfigLock(later);
+					return 1;
+				}),
+			).toThrow(/must be synchronous/);
 			expect(existsSync(configLockPath())).toBe(false);
 		});
 
