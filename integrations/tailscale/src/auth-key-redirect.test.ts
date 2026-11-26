@@ -197,6 +197,43 @@ describe("oauthAuthKey redirects", () => {
 			expect((error as Error).message).toMatch(/answered with a redirect/);
 		});
 
+		it("names only the address that was called, not its path or query, and adds nothing from the failure", async () => {
+			const target = await serve((_request, response) => reply(response, 200, { authKey: MINTED_KEY }));
+			const service = await serve((_request, response) => {
+				response.writeHead(302, { location: `http://127.0.0.1:${target.port}/collect` });
+				response.end();
+			});
+			const error = await oauthAuthKey({
+				clientId: "client",
+				clientSecret: CLIENT_SECRET,
+				tokenAuth: "post",
+				tokenUrl: `http://127.0.0.1:${service.port}/oauth/token?${secretQuery}`,
+			})
+				.resolve()
+				.catch((e: unknown) => e);
+			expect((error as Error).message).toBe(
+				`OAuth token request to http://127.0.0.1:${service.port} was answered with a redirect, which is not followed.`,
+			);
+			expect(textOf(error)).not.toContain(secretQuery);
+		});
+
+		it("finds the redirect when it sits several causes down in the failure", async () => {
+			const fetch = (async () => {
+				throw new TypeError("fetch failed", {
+					cause: new Error("request failed", { cause: new Error("connection step", { cause: new Error("unexpected redirect") }) }),
+				});
+			}) as typeof globalThis.fetch;
+			const error = await oauthAuthKey({
+				clientId: "client",
+				clientSecret: CLIENT_SECRET,
+				tokenUrl: "https://auth.example.test/token",
+				fetch,
+			})
+				.resolve()
+				.catch((e: unknown) => e);
+			expect((error as Error).message).toMatch(/answered with a redirect/);
+		});
+
 		it("still says it could not reach a service that is not there", async () => {
 			const closed = await serve(() => undefined);
 			const port = closed.port;
