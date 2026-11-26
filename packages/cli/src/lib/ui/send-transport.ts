@@ -26,9 +26,19 @@ export function createUiSendTransport(
 	let closing: Promise<void> | undefined;
 	return {
 		get(): Promise<NostrTransport> {
-			pending ??= createTransport(profile, identity, makeLogger(options.verbose), {
-				profileName: options.profileName,
-			});
+			if (!pending) {
+				const attempt = createTransport(profile, identity, makeLogger(options.verbose), {
+					profileName: options.profileName,
+				});
+				pending = attempt;
+				// A failed start is not kept: the next call tries again, so one bad
+				// start does not break every later send until `agx ui` restarts.
+				attempt.catch(() => {
+					if (pending === attempt) {
+						pending = undefined;
+					}
+				});
+			}
 			return pending;
 		},
 		close(): Promise<void> {
