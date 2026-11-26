@@ -389,12 +389,20 @@ function writeFailure(target: string, error: unknown): AgxCliError {
 	});
 }
 
+/** This install lost its lock: another install took it over (this one was probably paused for longer than the lock's age limit). */
+function displaced(target: string): AgxCliError {
+	return new AgxCliError(
+		`Another agx link install took over the lock on ${target} while this one was working (this one was probably paused for more than a minute), so this one wrote nothing. The file is as the other install left it.`,
+		{ exitCode: EXIT.config, remediation: "Run this again." },
+	);
+}
+
 /**
  * Replace the file in one rename, keeping its mode: the new text is written to a temporary file beside
  * it and forced to disk first, so a power loss leaves the old file or the new one and never an empty one.
  * Nothing is left behind when a step fails.
  */
-function writeFile(target: string, text: string, mode: number | null): void {
+function writeFile(target: string, text: string, mode: number | null, beforeRename: () => void): void {
 	const temporary = join(dirname(target), `.${basename(target)}.agx-${process.pid}-${randomBytes(4).toString("hex")}.tmp`);
 	try {
 		// A new file is 0644 whatever the umask; an existing one keeps the mode it had.
@@ -407,10 +415,11 @@ function writeFile(target: string, text: string, mode: number | null): void {
 			closeSync(fd);
 		}
 		chmodSync(temporary, finalMode);
+		beforeRename();
 		renameSync(temporary, target);
 	} catch (error) {
 		rmSync(temporary, { force: true });
-		throw writeFailure(target, error);
+		throw error instanceof AgxCliError ? error : writeFailure(target, error);
 	}
 }
 
@@ -424,6 +433,14 @@ function holderIsGone(lockText: string): boolean {
 		return false;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ESRCH";
+	}
+}
+
+function readText(file: string): string | null {
+	try {
+		return readFileSync(file, "utf8");
+	} catch {
+		return null;
 	}
 }
 
@@ -481,7 +498,8 @@ function takeOverLeftOverLock(lock: string, judged: string, afterJudged: (() => 
  * the file and then each replace it with a version that lacks the other's entries. Waits a bounded time
  * for another install, and takes over a lock that is left over from one that died.
  */
-function withLock<T>(target: string, waitMs: number, run: () => T, afterLockJudged: (() => void) | undefined): T {
+function withLock<T>(target: string, deps: LinkInstallDeps, run: (stillMine: () => boolean) => T): T {
+	const waitMs = deps.lockWaitMs ?? LOCK_WAIT_MS;
 	const folder = dirname(target);
 	const lock = join(folder, `.${basename(target)}.agx-lock`);
 	try {
@@ -489,12 +507,15 @@ function withLock<T>(target: string, waitMs: number, run: () => T, afterLockJudg
 	} catch (error) {
 		throw writeFailure(target, error);
 	}
+	// What this install's lock holds: its process number and a random token, so that its own lock can be told from any other.
+	const mine = `${JSON.stringify({ pid: process.pid, token: randomBytes(8).toString("hex") })}\n`;
+	const stillMine = (): boolean => readText(lock) === mine;
 	const deadline = Date.now() + waitMs;
 	for (;;) {
 		try {
 			const fd = openSync(lock, "wx", 0o600);
 			try {
-				writeFileSync(fd, `${JSON.stringify({ pid: process.pid, token: randomBytes(8).toString("hex") })}\n`);
+				writeFileSync(fd, mine);
 			} finally {
 				closeSync(fd);
 			}
@@ -504,7 +525,7 @@ function withLock<T>(target: string, waitMs: number, run: () => T, afterLockJudg
 				throw writeFailure(target, error);
 			}
 			const stale = staleLockText(lock);
-			if (stale !== null && takeOverLeftOverLock(lock, stale, afterLockJudged)) {
+			if (stale !== null && takeOverLeftOverLock(lock, stale, deps.afterLockJudged)) {
 				continue;
 			}
 			if (Date.now() >= deadline) {
@@ -517,9 +538,12 @@ function withLock<T>(target: string, waitMs: number, run: () => T, afterLockJudg
 		}
 	}
 	try {
-		return run();
+		return run(stillMine);
 	} finally {
-		rmSync(lock, { force: true });
+		// Never a lock that is not this install's own: another install may have taken it over while this one was paused.
+		if (stillMine()) {
+			rmSync(lock, { force: true });
+		}
 	}
 }
 
@@ -593,18 +617,18 @@ export function linkInstallCommand(options: LinkInstallOptions, deps: LinkInstal
 	if (state.action !== "unchanged" && !dryRun) {
 		deps.afterFirstRead?.();
 		// Under the lock the file is read and planned again, so a change made since the first read is kept.
-		state = withLock(
-			state.loaded.target,
-			deps.lockWaitMs ?? LOCK_WAIT_MS,
-			() => {
-				const fresh = prepare(host, file, profile);
-				if (fresh.action !== "unchanged") {
-					writeFile(fresh.loaded.target, serialize(fresh.result.next, fresh.loaded.text), fresh.loaded.mode);
-				}
-				return fresh;
-			},
-			deps.afterLockJudged,
-		);
+		state = withLock(state.loaded.target, deps, (stillMine) => {
+			const fresh = prepare(host, file, profile);
+			if (fresh.action !== "unchanged") {
+				writeFile(fresh.loaded.target, serialize(fresh.result.next, fresh.loaded.text), fresh.loaded.mode, () => {
+					deps.beforePublish?.();
+					if (!stillMine()) {
+						throw displaced(fresh.loaded.target);
+					}
+				});
+			}
+			return fresh;
+		});
 	}
 	const { action, result } = state;
 
