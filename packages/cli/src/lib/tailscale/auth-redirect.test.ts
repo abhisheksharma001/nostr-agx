@@ -57,7 +57,7 @@ describe("the CLI's OAuth key request and redirects", () => {
 				clientId: "client",
 				clientSecret: CLIENT_SECRET,
 			}),
-		).rejects.toThrow(/could not reach/);
+		).rejects.toThrow(/answered with a redirect/);
 		expect(service.requests()).toBe(1);
 		expect(target.requests(), "the redirect target was asked").toBe(0);
 	});

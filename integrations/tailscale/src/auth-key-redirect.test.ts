@@ -131,6 +131,105 @@ describe("oauthAuthKey redirects", () => {
 		expect(target.seen, "the redirect target was asked").toHaveLength(0);
 	});
 
+	describe("what the error says", () => {
+		const secretQuery = `code=${hex(16)}`;
+		const textOf = (error: unknown): string =>
+			`${(error as Error).message}\n${(error as TailscaleError).remediation ?? ""}`;
+
+		for (const status of [301, 302, 307]) {
+			it(`says the token endpoint answered with a redirect (${status}) and does not repeat where to`, async () => {
+				const target = await serve((_request, response) => reply(response, 200, { authKey: MINTED_KEY }));
+				const service = await serve((_request, response) => {
+					response.writeHead(status, { location: `http://127.0.0.1:${target.port}/collect?${secretQuery}` });
+					response.end();
+				});
+				const error = await oauthAuthKey({
+					clientId: "client",
+					clientSecret: CLIENT_SECRET,
+					tokenAuth: "post",
+					tokenUrl: `http://127.0.0.1:${service.port}/oauth/token`,
+				})
+					.resolve()
+					.catch((e: unknown) => e);
+				expect(error).toBeInstanceOf(TailscaleError);
+				expect(error).toMatchObject({ code: "network" });
+				expect((error as Error).message).toMatch(/answered with a redirect/);
+				expect(textOf(error)).not.toMatch(/could not reach/);
+				expect(textOf(error)).not.toContain(secretQuery);
+				expect(textOf(error)).not.toContain(String(target.port));
+				expect(textOf(error)).not.toContain(CLIENT_SECRET);
+			});
+		}
+
+		it("says the key endpoint answered with a redirect", async () => {
+			const service = await serve((request, response) => {
+				if (request.url === "/api/oauth/token") {
+					reply(response, 200, { access_token: ACCESS_TOKEN });
+					return;
+				}
+				response.writeHead(307, { location: `https://example.invalid/collect?${secretQuery}` });
+				response.end();
+			});
+			const error = await oauthAuthKey({
+				clientId: "client",
+				clientSecret: CLIENT_SECRET,
+				apiBaseUrl: `http://127.0.0.1:${service.port}/api`,
+			})
+				.resolve()
+				.catch((e: unknown) => e);
+			expect((error as Error).message).toMatch(/key request.*answered with a redirect/);
+			expect(textOf(error)).not.toContain(secretQuery);
+			expect(textOf(error)).not.toContain(ACCESS_TOKEN);
+		});
+
+		it("finds the redirect in the failure a fetch implementation throws", async () => {
+			const fetch = (async () => {
+				throw new TypeError("fetch failed", { cause: new Error("unexpected redirect") });
+			}) as typeof globalThis.fetch;
+			const error = await oauthAuthKey({
+				clientId: "client",
+				clientSecret: CLIENT_SECRET,
+				tokenUrl: "https://auth.example.test/token",
+				fetch,
+			})
+				.resolve()
+				.catch((e: unknown) => e);
+			expect((error as Error).message).toMatch(/answered with a redirect/);
+		});
+
+		it("still says it could not reach a service that is not there", async () => {
+			const closed = await serve(() => undefined);
+			const port = closed.port;
+			closed.server.closeAllConnections();
+			await new Promise<void>((resolve) => closed.server.close(() => resolve()));
+			const error = await oauthAuthKey({
+				clientId: "client",
+				clientSecret: CLIENT_SECRET,
+				tokenUrl: `http://127.0.0.1:${port}/oauth/token`,
+			})
+				.resolve()
+				.catch((e: unknown) => e);
+			expect(error).toMatchObject({ code: "network" });
+			expect((error as Error).message).toMatch(/could not reach/);
+			expect((error as Error).message).not.toMatch(/redirect/);
+		});
+
+		it("still says it could not reach a service when the failure is an ordinary network error", async () => {
+			const fetch = (async () => {
+				throw new TypeError("fetch failed", { cause: new Error("connect ECONNREFUSED") });
+			}) as typeof globalThis.fetch;
+			const error = await oauthAuthKey({
+				clientId: "client",
+				clientSecret: CLIENT_SECRET,
+				tokenUrl: "https://auth.example.test/token",
+				fetch,
+			})
+				.resolve()
+				.catch((e: unknown) => e);
+			expect((error as Error).message).toMatch(/could not reach/);
+		});
+	});
+
 	it("still mints a key from a service that answers directly", async () => {
 		const service = await serve((request, response) => {
 			if (request.url === "/api/oauth/token") {
