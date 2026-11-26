@@ -14,10 +14,35 @@ import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
+/**
+ * The only variables the launcher inherits from this process, when they are set:
+ * where it lives (HOME; USERPROFILE and SystemRoot, which a Windows process
+ * looks for, not tried on Windows), where it may write temporary files
+ * (TMPDIR), the proxy a host sits behind (the HTTP_PROXY family, in both cases)
+ * and Tailscale's own log setting.
+ */
+const INHERITED_ENV = [
+	"HOME",
+	"USERPROFILE",
+	"SystemRoot",
+	"TMPDIR",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"NO_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"no_proxy",
+	"TS_NO_LOGS_NO_SUPPORT",
+] as const;
 const BINARY_NAME = process.platform === "win32" ? "agx-tailscale.exe" : "agx-tailscale";
 
 export interface StartBundledTailscaleOptions {
-	/** Tailscale auth key. Defaults to TS_AUTHKEY. */
+	/**
+	 * Tailscale auth key, handed to the launcher as TS_AUTHKEY. The launcher does
+	 * not inherit this process's TS_AUTHKEY (startTailscaleRelayProxy reads it for
+	 * you when its authKey is omitted). Without a key the launcher can only resume
+	 * a node already enrolled in stateDir.
+	 */
 	authKey?: string;
 	/** Tailscale hostname. Defaults to agx-tailscale. */
 	hostname?: string;
@@ -148,12 +173,15 @@ export async function startBundledTailscale(
 	if (ephemeral) args.push("--ephemeral");
 	if (tags.length > 0) args.push("--tags", tags.join(","));
 
-	// Minimal environment: the launcher only needs HOME and the resolved auth
-	// key. Do not pass the parent's full environment through, so host secrets
-	// cannot reach the child (and the tailnet node) unintentionally.
+	// Minimal environment: the allowlist above and the auth key. Do not pass the
+	// parent's full environment through, so host secrets cannot reach the child
+	// (and the tailnet node) unintentionally.
 	const env: NodeJS.ProcessEnv = {};
-	if (process.env.HOME) {
-		env.HOME = process.env.HOME;
+	for (const name of INHERITED_ENV) {
+		const value = process.env[name];
+		if (value) {
+			env[name] = value;
+		}
 	}
 	if (authKey !== undefined) {
 		env.TS_AUTHKEY = authKey;
