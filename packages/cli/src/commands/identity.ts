@@ -18,7 +18,7 @@ import {
 } from "../lib/identity.js";
 import { heading, info, json, kv, ok, say, warn } from "../lib/output.js";
 import { identityPath } from "../lib/paths.js";
-import { refuseOwnSecretKey, toDisplayNpub, toHexPubkey } from "../lib/peer.js";
+import { isOwnSecretKey, refuseOwnSecretKey, toDisplayNpub, toHexPubkey } from "../lib/peer.js";
 import { signNonceEvent } from "../lib/proof.js";
 import { readStdin } from "../lib/stdin.js";
 
@@ -203,7 +203,12 @@ export function identityDenyCommand(
 		allow: profile.allow.filter((hex) => !remove.has(hex)),
 	});
 	for (const peer of peers) {
-		ok(`Removed ${toDisplayNpub(peer)} from the allowlist.`);
+		// This profile's own secret key is taken off the list like any entry, but an npub of it would show it.
+		ok(
+			isOwnSecretKey(peer, profileName)
+				? "This profile's own secret key is off the allowlist (not shown here)."
+				: `Removed ${toDisplayNpub(peer)} from the allowlist.`,
+		);
 	}
 }
 

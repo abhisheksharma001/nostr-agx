@@ -41,9 +41,7 @@ export type HeldDecision = "allow" | "ignore" | "block";
 export function heldDecideCommand(decision: HeldDecision, peer: string, options: HeldOptions): void {
 	const profileName = resolveProfileName(options.profile);
 	effectiveProfile(profileName);
-	if (decision === "allow") {
-		refuseOwnSecretKey(peer, profileName, "sender");
-	}
+	refuseOwnSecretKey(peer, profileName, "sender");
 	const hex = toHexPubkey(peer, "sender");
 	const npub = toDisplayNpub(hex);
 	const dir = profileDir(profileName);

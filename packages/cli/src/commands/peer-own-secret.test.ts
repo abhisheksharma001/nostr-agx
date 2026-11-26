@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { effectiveProfile, getProfile, updateProfile } from "../lib/config.js";
 import { createIdentity, saveIdentity } from "../lib/identity.js";
 import { identityPath } from "../lib/paths.js";
-import { refuseOwnSecretKey } from "../lib/peer.js";
+import { isOwnSecretKey, refuseOwnSecretKey } from "../lib/peer.js";
 import { agx, sandbox } from "../test/helpers.js";
 
 // A secret key is also 64 hex characters, so `agx` cannot tell one from a public key by its shape. The one
@@ -330,5 +330,29 @@ describe("refuseOwnSecretKey", () => {
 		}
 		expect(() => refuseOwnSecretKey(mine.secretKeyHex, "other")).not.toThrow();
 		expect(() => refuseOwnSecretKey(mine.secretKeyHex, "profile-without-identity")).not.toThrow();
+	});
+});
+
+describe("isOwnSecretKey", () => {
+	it("is true for this profile's secret key however it is written", () => {
+		for (const form of [
+			mine.secretKeyHex,
+			mine.secretKeyHex.toUpperCase(),
+			`  ${mine.secretKeyHex}  `,
+			nip19.npubEncode(mine.secretKeyHex),
+		]) {
+			expect(isOwnSecretKey(form, "default"), form).toBe(true);
+		}
+	});
+
+	it("is false for anything else, and where there is no identity to compare with", () => {
+		for (const input of [friend.publicKey, friend.npub, mine.publicKey, mine.npub, other.secretKeyHex, "hello", "", "nostr:npub1abc"]) {
+			expect(isOwnSecretKey(input, "default"), input).toBe(false);
+		}
+		expect(isOwnSecretKey(mine.secretKeyHex, "other")).toBe(false);
+		expect(isOwnSecretKey(mine.secretKeyHex, "profile-without-identity")).toBe(false);
+		mkdirSync(dirname(identityPath("broken")), { recursive: true });
+		writeFileSync(identityPath("broken"), "not json", { mode: 0o600 });
+		expect(isOwnSecretKey(mine.secretKeyHex, "broken")).toBe(false);
 	});
 });

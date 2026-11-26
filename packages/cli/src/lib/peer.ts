@@ -19,25 +19,32 @@ export function refuseSecretKey(input: string, label = "identity"): void {
 }
 
 /**
- * Refuse this profile's own secret key given as a peer, without showing it. A secret key is also 64 hex
- * characters, or an npub that carries the same bytes, so by its shape it passes for a public key and would be
- * stored, printed back as an npub or sent to a relay. Only the profile's own key can be told apart, by
- * comparing it with the identity file; another agent's secret key still passes, and that cannot be helped.
- * A profile with no identity file, or one that cannot be read, has no key to compare with.
+ * True when `input` is the secret key of this profile, as 64 hex characters in any case or as the npub that
+ * carries the same bytes. A profile with no identity file, or one that cannot be read, has no key to compare
+ * with, so it is false there.
  */
-export function refuseOwnSecretKey(input: string, profileName: string, label = "peer"): void {
+export function isOwnSecretKey(input: string, profileName: string): boolean {
 	const hex = normalizePubkey(input);
 	if (hex === null) {
-		return;
+		return false;
 	}
-	let own: string;
 	try {
 		// The key is only compared here, never used, so loose file permissions do not matter.
-		own = loadIdentityFile(profileName, { allowInsecurePerms: true }).secretKeyHex.toLowerCase();
+		return hex === loadIdentityFile(profileName, { allowInsecurePerms: true }).secretKeyHex.toLowerCase();
 	} catch {
-		return;
+		return false;
 	}
-	if (hex === own) {
+}
+
+/**
+ * Refuse this profile's own secret key given as a peer, without showing it. A secret key is also 64 hex
+ * characters, or an npub that carries the same bytes, so by its shape it passes for a public key and would be
+ * stored, printed back as an npub or sent to a relay. Only the key in the identity file of the profile named
+ * here is compared. The secret key of another profile, or of another agent, is not recognised and passes
+ * like a public key.
+ */
+export function refuseOwnSecretKey(input: string, profileName: string, label = "peer"): void {
+	if (isOwnSecretKey(input, profileName)) {
 		throw usageError(
 			`The ${label} you gave is this profile's own secret key, not a public one, so it is not shown here. Expected the npub1… or 64-character hex pubkey of another agent.`,
 		);
