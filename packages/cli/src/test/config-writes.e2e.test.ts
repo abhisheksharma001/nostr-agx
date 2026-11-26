@@ -271,8 +271,14 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 	// one. A preload stands in for the stop: it holds the first command back when it flushes its new
 	// file (after it is written, before it is renamed into place), and the test makes the lock look old,
 	// so nothing waits for 30 real seconds.
+	//
+	// No clock decides how the test goes. The held command waits for the test's go file for as long as
+	// the test that started it is alive, and the test waits for the held command's marker file, or for
+	// the command to end, whichever comes first. Whatever happens, the held command is killed at the end,
+	// so a failing test leaves nothing running.
 	it("a command whose lock was taken over while it was stopped saves nothing, says so, and keeps the other command's change", async () => {
 		const scratch = mkdtempSync(join(tmpdir(), "agx-e2e-stopped-"));
+		let stopped: { child: ChildProcess; done: Promise<Run> } | undefined;
 		try {
 			const mark = join(scratch, "stopped");
 			const go = join(scratch, "go");
@@ -289,8 +295,8 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 					"    stopped = true;",
 					"    fs.writeFileSync(process.env.STOP_MARK, String(process.pid));",
 					"    const sleeper = new Int32Array(new SharedArrayBuffer(4));",
-					"    const giveUpAt = Date.now() + 60000;",
-					"    while (!fs.existsSync(process.env.STOP_GO) && Date.now() < giveUpAt) Atomics.wait(sleeper, 0, 0, 20);",
+					"    const parent = Number(process.env.STOP_PARENT);",
+					"    while (!fs.existsSync(process.env.STOP_GO) && process.ppid === parent) Atomics.wait(sleeper, 0, 0, 20);",
 					"  }",
 					"  return real.call(this, fd);",
 					"};",
@@ -301,13 +307,18 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 			const x = createIdentity().npub;
 			const y = createIdentity().npub;
 
-			const stopped = startAgx(
-				{ NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, STOP_MARK: mark, STOP_GO: go },
+			stopped = startAgx(
+				{ NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, STOP_MARK: mark, STOP_GO: go, STOP_PARENT: String(process.pid) },
 				"identity",
 				"allow",
 				x,
 			);
-			await until(() => existsSync(mark), 30_000);
+			let ended: Run | null = null;
+			void stopped.done.then((run) => {
+				ended = run;
+			});
+			await until(() => existsSync(mark) || ended !== null, 250_000);
+			expect(ended, `the command ended before it was held: ${JSON.stringify(ended)}`).toBeNull();
 			// It holds the lock and has not saved. Make the lock old, as if it had been stopped for a minute.
 			const past = new Date(Date.now() - 60_000);
 			utimesSync(join(home, "config.json.lock"), past, past);
@@ -324,7 +335,16 @@ describe.skipIf(!existsSync(AGX))("overlapping config writes", () => {
 			expect({ stopped: have.has(x), other: have.has(y) }).toEqual({ stopped: false, other: true });
 			expect(readdirSync(home).filter((name) => name.endsWith(".tmp") || name.startsWith("config.json.lock"))).toEqual([]);
 		} finally {
+			// Kill the one command this test started (a no-op when it has already ended), then wait for it.
+			if (stopped !== undefined) {
+				try {
+					stopped.child.kill("SIGKILL");
+				} catch {
+					// Already gone.
+				}
+				await stopped.done.catch(() => undefined);
+			}
 			rmSync(scratch, { recursive: true, force: true });
 		}
-	}, 120_000);
+	}, 300_000);
 });
