@@ -545,8 +545,20 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 		});
 	}
 
+	// Set when the launcher's end started the stop. A Ctrl-C in a terminal reaches
+	// serve and the launcher together, so one signal is expected to follow.
+	let stoppingBecauseLauncherEnded = false;
+	let signalExpectedAfterLauncherEnd = false;
+
 	async function shutdown(exitCode: number = EXIT.ok): Promise<void> {
 		if (draining) {
+			if (stoppingBecauseLauncherEnded && !signalExpectedAfterLauncherEnd) {
+				// That signal is the same Ctrl-C that ended the launcher: the stop is
+				// already under way, and it is not a request to quit without finishing it.
+				// A second signal still ends the process at once.
+				signalExpectedAfterLauncherEnd = true;
+				return;
+			}
 			process.exit(EXIT.interrupted);
 		}
 		draining = true;
@@ -589,6 +601,7 @@ export async function serveCommand(options: ServeOptions): Promise<void> {
 		notice(
 			`The Tailscale launcher stopped on its own (${describeTailscaleExit(launcherExit)}), so agx serve can no longer reach its relays. Stopping; start it again to reconnect.`,
 		);
+		stoppingBecauseLauncherEnded = true;
 		void shutdown(EXIT.network);
 	};
 	if (launcherExit) {
