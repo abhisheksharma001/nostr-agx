@@ -34,9 +34,7 @@ export function createUiSendTransport(
 				// A failed start is not kept: the next call tries again, so one bad
 				// start does not break every later send until `agx ui` restarts.
 				attempt.catch(() => {
-					if (pending === attempt) {
-						pending = undefined;
-					}
+					pending = undefined;
 				});
 			}
 			return pending;
