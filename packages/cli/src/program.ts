@@ -731,7 +731,7 @@ It prints the change and one line to undo it. The rest of the file is kept. It s
 nothing, when the file is not a JSON object, holds something a rewrite would change (a number it
 cannot keep, a repeated key), is read-only or hard-linked, or already has a command that runs
 agx and is not the one it would write (its event and position are named, the command is not printed). Two installs at once wait for
-each other. --profile <name> makes the hook read that profile. AGX_HOME and AGX_PROFILE are not
+each other, and one that finds its lock was taken over writes nothing and stops. --profile <name> makes the hook read that profile. AGX_HOME and AGX_PROFILE are not
 carried into the hook commands. See docs/hooks.md.`,
 		)
 		.action((options) => linkInstallCommand(withGlobals(options)));
