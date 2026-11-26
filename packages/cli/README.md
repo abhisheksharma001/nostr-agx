@@ -403,7 +403,9 @@ updates its status.
 `agx hook <stop|session-start|prompt> --host <claude|cursor|codex>` is the command to put in a coding
 agent's hook configuration. It reads the message store (no lock, so it works next to `agx serve`) and
 prints one short line of counts and thread ids, never peer text, in that host's own JSON shape, once per
-new message; otherwise it prints nothing. It never fails the host: any error is exit `0` with no output,
+new message; otherwise it prints nothing. It counts only mail from senders on the current allowlist, names
+a thread only when its id is a UUID, and stays silent when the host says it is already continuing because
+of a stop hook. It never fails the host: any error is exit `0` with no output,
 within a 3-second cap. A hook cannot wake an agent that is idle; it only runs while a turn is ending,
 a session is starting or a prompt is sent. Shapes, rules, sources and the configuration to add:
 [docs/hooks.md](../../docs/hooks.md).
