@@ -786,6 +786,76 @@ describe("the exit notice", () => {
 			});
 		});
 
+		// Whatever a listener throws, describing it must not throw too.
+		it.skipIf(!posix).each([
+			[
+				"an object with no prototype",
+				() => {
+					throw Object.create(null);
+				},
+			],
+			[
+				"an error whose message cannot be read",
+				() => {
+					const error = new Error("hidden");
+					Object.defineProperty(error, "message", {
+						get() {
+							throw new Error("message getter failed");
+						},
+					});
+					throw error;
+				},
+			],
+			[
+				"a value that cannot be turned into text",
+				() => {
+					throw { toString: () => { throw new Error("toString failed"); } };
+				},
+			],
+			[
+				"a string",
+				() => {
+					throw "plain text";
+				},
+			],
+			[
+				"nothing",
+				() => {
+					throw undefined;
+				},
+			],
+		] as const)("keeps going when a listener throws %s", async (_what, thrower) => {
+			await withEndingLauncher(async (proxy, end, uncaught, warnings) => {
+				const later = vi.fn();
+				proxy.onExit(thrower);
+				proxy.onExit(later);
+				await end();
+				await until(() => later.mock.calls.length > 0);
+				await until(() => listenerErrorsOf(proxy).length === 1);
+				await until(() => warnings.some((w) => w.code === "AGX_TAILSCALE_ONEXIT_LISTENER"));
+				expect(later).toHaveBeenCalledTimes(1);
+				expect(uncaught).toEqual([]);
+			});
+		});
+
+		it.skipIf(!posix)("does not print a login that is in the thrown error", async () => {
+			await withEndingLauncher(async (proxy, end, uncaught, warnings) => {
+				const later = vi.fn();
+				proxy.onExit(() => {
+					throw new Error("hook failed for http://huser:hpass-throwaway@proxy.invalid:3128");
+				});
+				proxy.onExit(later);
+				await end();
+				await until(() => warnings.some((w) => w.code === "AGX_TAILSCALE_ONEXIT_LISTENER"));
+				const warning = warnings.find((w) => w.code === "AGX_TAILSCALE_ONEXIT_LISTENER")!;
+				expect(warning.message).toBe(
+					"An onExit listener threw: hook failed for http://***@proxy.invalid:3128",
+				);
+				expect(later).toHaveBeenCalledTimes(1);
+				expect(uncaught).toEqual([]);
+			});
+		});
+
 		it.skipIf(!posix)("treats a listener that subscribes after the launcher ended the same way", async () => {
 			await withEndingLauncher(async (proxy, end, uncaught) => {
 				await end();
