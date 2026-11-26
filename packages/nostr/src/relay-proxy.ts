@@ -283,6 +283,9 @@ type WebSocketConstructor = new (
  *    relay is dialed to find out. It is repeated on every dial as well: a
  *    class that dropped the agent only for some addresses would otherwise
  *    start a direct connection that this check could only cut short.
+ * 3. The runtime's built-in WebSocket (and a class extending it) takes no
+ *    socket options and records no request, so it cannot be verified and is
+ *    refused: with it the agent would be ignored without a sign.
  */
 export function wrapWebSocket(
 	base: WebSocketImpl | undefined,
@@ -331,7 +334,7 @@ interface RecordedRequest {
 }
 
 /** Only a `ws`-derived implementation records its request; anything else (test
- * doubles, a global WebSocket) gives us nothing to check. */
+ * doubles) gives us nothing to check. */
 function recordedRequest(instance: object): RecordedRequest | undefined {
 	return (instance as { _req?: RecordedRequest })._req;
 }
@@ -359,15 +362,42 @@ function droppedAgentError(): RelayProxyError {
 const CHECK_ADDRESS = "ws+unix:///agx-relay-proxy-check.sock:/";
 
 /**
+ * True for the WebSocket the runtime ships (Node 22 and later) and for a class
+ * that extends it. It takes no socket options, so a proxy agent handed to it is
+ * ignored and every dial goes straight to the relay. It records no request and
+ * refuses the check address, so neither check below can see that.
+ */
+function isBuiltInWebSocket(Base: WebSocketConstructor): boolean {
+	const builtIn = (globalThis as { WebSocket?: unknown }).WebSocket;
+	return (
+		typeof builtIn === "function" &&
+		(Base === builtIn || Base.prototype instanceof builtIn)
+	);
+}
+
+function builtInWebSocketError(): RelayProxyError {
+	return new RelayProxyError(
+		"The built-in WebSocket of this runtime cannot be used with a relay proxy: it ignores the proxy agent.",
+		"Pass the WebSocket class of the `ws` package (npm install ws) as `ws` in the transport config.",
+	);
+}
+
+/**
  * Check, once, that a WebSocket class forwards its options: build one socket
  * with a stand-in agent that never connects, and see whether the request `ws`
- * recorded carries it. A class that cannot be checked (it records no request,
- * or refuses the check address) is left to the check on each dial.
+ * recorded carries it. The runtime's built-in WebSocket cannot be checked this
+ * way and is refused outright. Any other class that cannot be checked (it
+ * records no request, or refuses the check address) is accepted here and not
+ * covered by the check on each dial either, which also needs the recorded
+ * request.
  */
 function assertAgentForwarded(
 	Base: WebSocketConstructor,
 	options: Record<string, unknown>,
 ): void {
+	if (isBuiltInWebSocket(Base)) {
+		throw builtInWebSocketError();
+	}
 	const standIn = { addRequest(): void {} };
 	let probe: object;
 	try {
