@@ -34,7 +34,7 @@ from its GitHub mirror; `golang.zx2c4.com/wintun` from `git.zx2c4.com`.
 | [`github.com/hdevalence/ed25519consensus`](https://github.com/hdevalence/ed25519consensus/blob/v0.2.0/LICENSE) | `v0.2.0` | BSD-3-Clause | all platforms |
 | [`github.com/huin/goupnp`](https://github.com/huin/goupnp/blob/v1.3.0/LICENSE) | `v1.3.0` | BSD-2-Clause | all platforms |
 | [`github.com/jsimonetti/rtnetlink`](https://github.com/jsimonetti/rtnetlink/blob/v1.4.2/LICENSE.md) | `v1.4.2` | MIT | Linux only |
-| [`github.com/klauspost/compress`](https://github.com/klauspost/compress/blob/v1.20.0/LICENSE) | `v1.20.0` | BSD-3-Clause, MIT and Apache-2.0 (one combined file) | all platforms |
+| [`github.com/klauspost/compress`](https://github.com/klauspost/compress/blob/v1.20.0/LICENSE) | `v1.20.0` | BSD-3-Clause, MIT and Apache-2.0 (one combined file); MIT for `zstd/internal/xxhash` (its own file) | all platforms |
 | [`github.com/mdlayher/netlink`](https://github.com/mdlayher/netlink/blob/v1.11.2/LICENSE.md) | `v1.11.2` | MIT | Linux only |
 | [`github.com/mdlayher/socket`](https://github.com/mdlayher/socket/blob/v0.7.0/LICENSE.md) | `v0.7.0` | MIT | Linux only |
 | [`github.com/mitchellh/go-ps`](https://github.com/mitchellh/go-ps/blob/v1.0.0/LICENSE.md) | `v1.0.0` | MIT | all platforms |
@@ -69,9 +69,17 @@ from its GitHub mirror; `golang.zx2c4.com/wintun` from `git.zx2c4.com`.
   file named Inter) into every binary. Banner comments in its JavaScript name React (MIT) and
   classnames (MIT) next to Tailscale's own code. The bundle may contain other npm packages without
   a banner, and the licence of the font file itself was not read; neither is listed here.
-- Only each module's top-level licence file was read. A module can carry other licence files for code
-  inside its subdirectories; those were not looked for, except where the top-level file says so
-  (`gvisor.dev/gvisor`, `github.com/klauspost/compress`).
+- A module can carry other licence files for code inside its subdirectories. Each module's repository
+  tree at the pinned version was searched for files named `LICENSE`, `LICENCE`, `COPYING`, `NOTICE` or
+  `PATENTS` below the top level, and the result was compared with the package paths found in the five
+  binaries. Two are linked: `internal/snapref` in `github.com/klauspost/compress` (the top-level file there
+  covers it) and `zstd/internal/xxhash` in the same module (its own MIT file, reproduced below). The Go
+  standard library vendors four `golang.org/x/*` packages whose licence files are the Go licence text
+  above. `crypto/internal/boring` has a licence file for a BoringSSL object file that, as that file says,
+  is used only when building with `GOEXPERIMENT=boringcrypto`; `go version -m` shows `CGO_ENABLED=0` and
+  no `GOEXPERIMENT` setting for these binaries, so it is not reproduced. `PATENTS` files (an additional
+  patent grant in the Go repositories) are not reproduced either. `golang.zx2c4.com/wintun` is hosted on
+  `git.zx2c4.com` and has no subdirectories.
 - No top-level `NOTICE` file was found in the Apache-2.0 modules (`groupcache`, `btree`, `go-proxyproto`,
   `ethtool`, `go4.org/mem`, `gvisor`, `klauspost/compress`); this was checked once at the pinned versions.
 - This list has not had a legal review.
@@ -1069,7 +1077,9 @@ Some files carry the "BSD" license, noted at the top of each file:
 ### `github.com/klauspost/compress`: BSD-3-Clause, MIT and Apache-2.0
 
 The LICENSE file is a combination of several licences. Its Apache-2.0 section, which is the standard text
-given above, is replaced here by a bracketed note; everything else is copied unchanged.
+given above, is replaced here by a bracketed note; everything else is copied unchanged. The module's
+`zstd/internal/xxhash` directory has a separate licence file that this top-level file does not mention;
+it follows in the next section.
 
 ```text
 Copyright (c) 2012 The Go Authors. All rights reserved.
@@ -1177,4 +1187,36 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### MIT: `github.com/klauspost/compress/zstd/internal/xxhash`
+
+A copy of `github.com/cespare/xxhash` that lives inside `github.com/klauspost/compress` and is linked into
+every binary. Copied from the module's own
+[`zstd/internal/xxhash/LICENSE.txt`](https://github.com/klauspost/compress/blob/v1.20.0/zstd/internal/xxhash/LICENSE.txt)
+at `v1.20.0`.
+
+```text
+Copyright (c) 2016 Caleb Spare
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
