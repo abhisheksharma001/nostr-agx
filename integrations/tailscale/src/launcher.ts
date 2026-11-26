@@ -53,11 +53,37 @@ const TAILSCALE_BOOLEANS = new Set([
 	"False",
 ]);
 /**
- * What sits between `://` and `@` in a URL (`user:password` or a bare token). The
- * Tailscale code in the launcher logs the proxy URL it uses, credentials
- * included, on the launcher's stderr.
+ * The variables that name a proxy. A value with an `@` in it holds a login
+ * (`user:password@host`), and the Tailscale code in the launcher prints the
+ * proxy it uses in its log, login included, so such a value is not passed on.
  */
-const URL_CREDENTIALS = /([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@"'\\]+@/gi;
+const PROXY_ADDRESS_VARIABLES = new Set(["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]);
+
+/**
+ * What the launcher's log can show of a proxy login, and what is replaced. All
+ * four patterns start at a fixed piece of text and look ahead only along a run
+ * of characters that cannot start another match, so the time is linear.
+ *
+ * - What sits between `://` and `@` in a URL (`user:password` or a bare token).
+ * - The `(auth "...")` of a CONNECT line: the first 20 characters of the
+ *   Proxy-Authorization header, "Basic " and the start of base64(user:password).
+ * - A Proxy-Authorization header written out in full, to the end of its line.
+ * - Any other `Basic <base64>` text. A plain word that follows "Basic" (such as
+ *   "Basic settings") is hidden too.
+ */
+const URL_CREDENTIALS = /(:\/\/)[^\s/?#@"'\\]+@/g;
+const AUTH_LOG_VALUE = /\(auth "[^"]{0,120}"\)/g;
+const AUTH_HEADER = /(proxy-authorization):?[^\n\r]*/gi;
+const BASIC_VALUE = /\bBasic[ \t]+[A-Za-z0-9+/]{8,}={0,2}/g;
+
+function maskSecrets(text: string): string {
+	return text
+		.replace(URL_CREDENTIALS, "$1***@")
+		.replace(AUTH_LOG_VALUE, '(auth "***")')
+		.replace(AUTH_HEADER, "$1: ***")
+		.replace(BASIC_VALUE, "Basic ***");
+}
+
 const BINARY_NAME = process.platform === "win32" ? "agx-tailscale.exe" : "agx-tailscale";
 
 /**
@@ -274,6 +300,12 @@ export async function startBundledTailscale(
 			}
 			continue;
 		}
+		if (PROXY_ADDRESS_VARIABLES.has(name) && value.includes("@")) {
+			process.stderr.write(
+				`@nostr-agx/tailscale: not passing ${name} to the launcher, because its value holds a login (a user name and password) that the launcher would print in its log. Use a proxy address without one.\n`,
+			);
+			continue;
+		}
 		env[name] = value;
 	}
 	if (disableLogUpload) {
@@ -403,19 +435,18 @@ export async function startBundledTailscale(
  * and with the credentials of any URL masked. Settles once that stderr has ended.
  */
 function relayStderr(source: Readable): Promise<void> {
-	const mask = (text: string): string => text.replace(URL_CREDENTIALS, "$1***@");
 	let pending = "";
 	source.setEncoding("utf8");
 	source.on("data", (chunk: string) => {
 		pending += chunk;
 		const end = pending.lastIndexOf("\n");
 		if (end === -1) return;
-		process.stderr.write(mask(pending.slice(0, end + 1)));
+		process.stderr.write(maskSecrets(pending.slice(0, end + 1)));
 		pending = pending.slice(end + 1);
 	});
 	return new Promise<void>((resolve) => {
 		source.once("close", () => {
-			if (pending) process.stderr.write(mask(pending));
+			if (pending) process.stderr.write(maskSecrets(pending));
 			pending = "";
 			resolve();
 		});
