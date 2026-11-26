@@ -893,6 +893,7 @@ describe("agx link install: which commands count as an agx entry", () => {
 		"agx.bat hook",
 		"agx.sh hook",
 		"~/nostr-agx/packages/cli/dist/agx.js hook stop",
+		"node /x/node_modules/@nostr-agx/cli/dist/index.js hook stop",
 		// upper and mixed case
 		"NPX -Y AGX@LATEST HOOK",
 		"npx @NOSTR-AGX/CLI hook",
