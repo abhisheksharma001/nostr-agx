@@ -1,6 +1,15 @@
+import net from "node:net";
 import WebSocket, { type ClientOptions } from "ws";
 import { generateSecretKey } from "nostr-tools";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	type MockInstance,
+	vi,
+} from "vitest";
 import { NostrTransport } from "./nostr-transport";
 import { createProxyWebSocket, RelayProxyError } from "./relay-proxy";
 import { localSigner } from "./signer";
@@ -19,16 +28,36 @@ import {
 
 let relay: TcpListener;
 let proxy: FakeSocks5;
+let connect: MockInstance<typeof net.connect>;
 
 beforeEach(async () => {
 	relay = await startTcpListener();
 	proxy = await startFakeSocks5();
+	connect = vi.spyOn(net, "connect");
 });
 
 afterEach(async () => {
+	connect.mockRestore();
 	await relay.close();
 	await proxy.close();
 });
+
+/**
+ * How many times the process asked the OS to open a connection to the relay.
+ * Whether the listener then sees that connection depends on timing: a socket
+ * destroyed at once can be gone before the listener accepts it, although the
+ * address has already been contacted. So the attempt itself is what is counted,
+ * before anything in the test makes a connection of its own.
+ */
+function attemptsToRelay(): number {
+	return connect.mock.calls.filter(([first]) => {
+		const port =
+			typeof first === "object" && first !== null
+				? (first as { port?: unknown }).port
+				: first;
+		return String(port) === String(relay.port);
+	}).length;
+}
 
 const proxyUrl = () => `socks5://127.0.0.1:${proxy.port}`;
 const relayUrl = () => `ws://127.0.0.1:${relay.port}`;
@@ -87,6 +116,7 @@ describe("a WebSocket class that drops the proxy agent", () => {
 	it("opens no connection to a relay that is a bare IP address", async () => {
 		await createAndDial(DroppingWebSocket, relayUrl());
 
+		expect(attemptsToRelay()).toBe(0);
 		expect(await relay.settle()).toBe(0);
 		expect(proxy.connections()).toBe(0);
 	});
@@ -102,6 +132,7 @@ describe("a WebSocket class that drops the proxy agent", () => {
 
 		expect(error).toBeInstanceOf(RelayProxyError);
 		expect(stop).toHaveBeenCalledOnce();
+		expect(attemptsToRelay()).toBe(0);
 		expect(await relay.settle()).toBe(0);
 	});
 });
@@ -117,6 +148,7 @@ describe("a WebSocket class that forwards its options", () => {
 			lookup: vi.fn(),
 		});
 
+		expect(connect).not.toHaveBeenCalled();
 		expect(await relay.settle()).toBe(0);
 		expect(proxy.connections()).toBe(0);
 	});
@@ -138,6 +170,7 @@ describe("a WebSocket class that forwards its options", () => {
 			host: "127.0.0.1",
 			port: relay.port,
 		});
+		expect(attemptsToRelay()).toBe(0);
 		expect(await relay.settle()).toBe(0);
 		socket.terminate();
 	});
