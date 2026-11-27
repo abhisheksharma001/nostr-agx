@@ -132,6 +132,24 @@ export function hexKeyRuns(text: string): HexRun[] {
 	return runs;
 }
 
+/**
+ * True when `text` holds 64 hex digits in a row, in either case, as given or after the
+ * `%xx` decoding {@link holdsSecretKey} reads. The run does not have to stand alone: it
+ * may be stuck to other letters, or be part of a longer run (a key pasted twice).
+ * Looser than {@link hexKeyRuns} on purpose: it is for a slot where no hex string
+ * belongs at all, so a run that is not alone is no more welcome there.
+ *
+ * With `only`, true just when the text holds those 64 digits (any case): for asking
+ * whether a text holds one known key.
+ *
+ * A candidate, like {@link hexKeyRuns}: the same run is a public key, an event id or a
+ * hash anywhere else. Never throws and takes time in proportion to the length of the text.
+ */
+export function holdsHexKey(text: string, only?: string): boolean {
+	const wanted = only?.toLowerCase();
+	return escapeRounds(text).some((round) => (wanted === undefined ? /[0-9a-f]{64}/i.test(round) : round.toLowerCase().includes(wanted)));
+}
+
 /** A stretch of text: `start` up to, not including, `end`. */
 interface Span {
 	start: number;
