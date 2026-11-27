@@ -226,11 +226,12 @@ const held = new Map<string, string>();
 type NotAPromise<T> = T extends PromiseLike<unknown> ? never : T;
 
 /** The type refuses a promise, but a function typed `any` or a hand-made thenable gets past it, so it is refused here too. */
-function runSynchronously<T>(fn: () => NotAPromise<T>): T {
+function runSynchronously<T>(fn: () => NotAPromise<T>, label: string): T {
 	const result = fn();
 	if (typeof (result as { then?: unknown } | null | undefined)?.then === "function") {
+		const caller = label === "config" ? "withConfigLock" : `withFileLock (${label})`;
 		throw new Error(
-			"withConfigLock: the function must be synchronous. The lock is let go when it returns, so whatever a promise does later would run without the lock.",
+			`${caller}: the function must be synchronous. The lock is let go when it returns, so whatever a promise does later would run without the lock.`,
 		);
 	}
 	return result;
@@ -251,12 +252,12 @@ export function withFileLock<T>(
 	options: { waitMs?: number } = {},
 ): T {
 	if (held.has(file)) {
-		return runSynchronously(fn);
+		return runSynchronously(fn, label);
 	}
 	const { token, release } = acquire(file, label, options.waitMs ?? CONFIG_LOCK_WAIT_MS);
 	held.set(file, token);
 	try {
-		return runSynchronously(fn);
+		return runSynchronously(fn, label);
 	} finally {
 		held.delete(file);
 		release();

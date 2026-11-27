@@ -15,7 +15,7 @@ import * as fs from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { withFileLock } from "../config-lock.js";
+import { withConfigLock, withFileLock } from "../config-lock.js";
 import { AgxCliError, EXIT } from "../errors.js";
 import { profileDir, tailscaleSecretsPath } from "../paths.js";
 import { setStdinForTests } from "../stdin.js";
@@ -363,6 +363,25 @@ describe("the lock of one file", () => {
 		expect(Date.now() - started).toBeLessThan(2_000);
 		expect(stored().authKey).toBe(KEY);
 		expect(profileFiles()).toEqual(["tailscale.json"]);
+	});
+
+	it("refuses a function that returns a promise, names the lock it was asked for, and lets go of it", () => {
+		makeProfileDir();
+		const later = (async () => 1) as any;
+		const run = (): unknown => withFileLock(secretsFile(), "Tailscale secrets", later);
+		expect(run).toThrow(/must be synchronous/);
+		expect(run).toThrow(/Tailscale secrets/);
+		expect(run).not.toThrow(/withConfigLock/);
+		expect(existsSync(lockFile())).toBe(false);
+	});
+
+	it("keeps the wording it has always had when the function given to the config lock returns a promise", () => {
+		const later = (async () => 1) as any;
+		expect(() => withConfigLock(later)).toThrow(
+			new Error(
+				"withConfigLock: the function must be synchronous. The lock is let go when it returns, so whatever a promise does later would run without the lock.",
+			),
+		);
 	});
 
 	it("is not the lock of another file: holding one does not stand in for the other", () => {
