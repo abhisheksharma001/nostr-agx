@@ -6,6 +6,7 @@ import {
 	hexToBytes,
 	localSigner,
 	publicKeyFromSecret,
+	readSecretKeyInput,
 	toNpub,
 } from "@nostr-agx/nostr";
 import { nip19 } from "nostr-tools";
@@ -87,11 +88,10 @@ const SECRET_IS_NOT_USABLE =
 
 /** Accept either an `nsec1…` (also in capitals, or behind `nostr:`) or a bare 64-char hex secret. */
 export function parseSecretInput(input: string): Uint8Array {
-	const trimmed = input.trim();
-	const unprefixed = trimmed.replace(/^nostr:/i, "");
-	if (/^nsec1/i.test(unprefixed)) {
+	const key = readSecretKeyInput(input);
+	if (key?.kind === "nsec") {
 		try {
-			const decoded = nip19.decode(unprefixed);
+			const decoded = nip19.decode(key.bech32);
 			if (decoded.type !== "nsec") {
 				throw new Error(`expected an nsec, got ${decoded.type}`);
 			}
@@ -100,8 +100,8 @@ export function parseSecretInput(input: string): Uint8Array {
 			throw usageError(NSEC_DOES_NOT_DECODE);
 		}
 	}
-	if (/^[0-9a-f]{64}$/i.test(trimmed)) {
-		return hexToBytes(trimmed.toLowerCase());
+	if (key?.kind === "hex") {
+		return hexToBytes(key.hex);
 	}
 	throw usageError(
 		"Expected an `nsec1…` key or a 64-character hex secret key.",

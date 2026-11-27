@@ -1,8 +1,8 @@
-import { hexToBytes } from "@nostr-agx/nostr";
+import { bytesToHex, hexToBytes } from "@nostr-agx/nostr";
 import { nip19 } from "nostr-tools";
 import { encrypt } from "nostr-tools/nip49";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createIdentity, loadIdentityFile, saveIdentity } from "./identity.js";
+import { createIdentity, loadIdentityFile, parseSecretInput, saveIdentity } from "./identity.js";
 import { holdsSecretKey, redactSecrets } from "./secrets.js";
 import { agx, sandbox } from "../test/helpers.js";
 
@@ -145,5 +145,96 @@ describe("the profile's own secret key", () => {
 		// A key that no test in this file has read.
 		const stranger = createIdentity();
 		expect(redactSecrets(`value ${stranger.secretKeyHex}`)).toBe(`value ${stranger.secretKeyHex}`);
+	});
+});
+
+describe("parseSecretInput reads a typed-in key as it did before the rule was shared", () => {
+	/** `parseSecretInput` as it was written before it used the shared rule: the answer to compare with. */
+	function before(input: string): Uint8Array {
+		const trimmed = input.trim();
+		const unprefixed = trimmed.replace(/^nostr:/i, "");
+		if (/^nsec1/i.test(unprefixed)) {
+			try {
+				const decoded = nip19.decode(unprefixed);
+				if (decoded.type !== "nsec") {
+					throw new Error(`expected an nsec, got ${decoded.type}`);
+				}
+				return decoded.data as Uint8Array;
+			} catch {
+				throw new Error("nsec does not decode");
+			}
+		}
+		if (/^[0-9a-f]{64}$/i.test(trimmed)) {
+			return hexToBytes(trimmed.toLowerCase());
+		}
+		throw new Error("not a key");
+	}
+
+	/** What `parseSecretInput` gives for `input`, as text that can be compared: the key's bytes in hex, or a short name for the refusal. */
+	function outcome(read: (input: string) => Uint8Array, input: string): string {
+		try {
+			return bytesToHex(read(input));
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "";
+			if (/Could not decode that nsec|nsec does not decode/.test(message)) {
+				return "nsec does not decode";
+			}
+			if (/Expected an `nsec1…` key|not a key/.test(message)) {
+				return "not a key";
+			}
+			return `other: ${message.slice(0, 40)}`;
+		}
+	}
+
+	const hex = mine.secretKeyHex;
+	const nsec = nip19.nsecEncode(hexToBytes(hex));
+	const inputs: [string, string][] = [
+		["an nsec1…", nsec],
+		["an nsec1… in capitals", nsec.toUpperCase()],
+		["an nsec1… behind nostr:", `nostr:${nsec}`],
+		["an nsec1… in capitals behind NOSTR:", `NOSTR:${nsec.toUpperCase()}`],
+		["an nsec1… with a new line after it", `  ${nsec}\n`],
+		["an nsec1… behind nostr: with white space around it", `\t nostr:${nsec} `],
+		["64 hex digits", hex],
+		["64 hex digits in capitals", hex.toUpperCase()],
+		["64 hex digits with white space around them", ` ${hex} `],
+		["64 hex digits behind nostr:", `nostr:${hex}`],
+		["65 hex digits", `${hex}a`],
+		["63 hex digits", hex.slice(1)],
+		["64 zeros", "0".repeat(64)],
+		["64 f", "f".repeat(64)],
+		["an nsec1… with a character too many", `${nsec}q`],
+		["an nsec1… cut short", nsec.slice(0, 40)],
+		["an nsec1… with a character changed", `${nsec.slice(0, 30)}${nsec[30] === "q" ? "p" : "q"}${nsec.slice(31)}`],
+		["an nsec1… with a space in it", `${nsec.slice(0, 30)} ${nsec.slice(30)}`],
+		["only nsec1", "nsec1"],
+		["nsec1 and zeros", `nsec1${"q".repeat(58)}`],
+		["an nsec1… of an odd key", nip19.nsecEncode(new Uint8Array(32).fill(1))],
+		["an encrypted key", NCRYPTSEC],
+		["an npub1…", mine.npub],
+		["a public key as hex", mine.publicKey],
+		["an nsec1… escaped", escapeAll(nsec)],
+		["an nsec1… in a sentence", `my key is ${nsec}`],
+		["nothing", ""],
+		["white space", "  "],
+		["a word", "nope"],
+		["NSEC1", "NSEC1"],
+		["nostr:", "nostr:"],
+		["nostr:nsec1", "nostr:nsec1"],
+	];
+
+	it.each(inputs)("%s gets the answer it got before", (_name, input) => {
+		expect(outcome(parseSecretInput, input)).toBe(outcome(before, input));
+	});
+
+	it("the table holds every kind of answer: a key, a key that does not decode, and a refusal", () => {
+		const answers = new Set(inputs.map(([, input]) => outcome(before, input).replace(/^[0-9a-f]{64}$/, "a key")));
+		expect([...answers].sort()).toEqual(["a key", "not a key", "nsec does not decode"]);
+	});
+
+	it("takes the key in each of the forms it took before", () => {
+		for (const input of [nsec, nsec.toUpperCase(), `nostr:${nsec}`, hex, hex.toUpperCase()]) {
+			expect(bytesToHex(parseSecretInput(input))).toBe(hex);
+		}
 	});
 });
