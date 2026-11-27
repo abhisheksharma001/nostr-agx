@@ -141,6 +141,12 @@ describe("scrubbedJson", () => {
 		expect(text).not.toContain(NSEC.slice(5, 25));
 	});
 
+	it("keeps a name that is __proto__ as an ordinary name when another name of the same object holds a key", () => {
+		// JSON.parse makes `__proto__` an own name; an object built the usual way would turn it into a prototype and lose it.
+		const value = JSON.parse(`{"__proto__":{"a":1},"${NSEC}":2}`);
+		expect(scrubbedJson(value)).toBe(`{"__proto__":{"a":1},"${REDACTED}":2}`);
+	});
+
 	it("replaces the profile's own key, once read", () => {
 		const own = createIdentity();
 		saveIdentity("default", own);
