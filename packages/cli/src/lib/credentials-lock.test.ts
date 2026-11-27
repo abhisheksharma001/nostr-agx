@@ -36,12 +36,12 @@ import { setStdinForTests } from "./stdin.js";
 // entry and writes the whole file back. Two agx commands that overlap each read the same old file, and the
 // later write drops the earlier one's change, with both exiting 0. These tests cover the lock that stops that.
 //
-// Only `fsyncSync` and `unlinkSync` are wrapped (each does the real thing unless a test says otherwise).
-// A file is written to a temp file, flushed, and then renamed into place, so the flush is the point where
-// a test can let "another command" have its turn, between a write's read and its rename.
+// Only `fsyncSync` is wrapped (it does the real thing unless a test says otherwise). A file is written to a
+// temp file, flushed, and then renamed into place, so the flush is the point where a test can let "another
+// command" have its turn, between a write's read and its rename.
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
-	return { ...actual, fsyncSync: vi.fn(actual.fsyncSync), unlinkSync: vi.fn(actual.unlinkSync) };
+	return { ...actual, fsyncSync: vi.fn(actual.fsyncSync) };
 });
 
 // Made when the tests start, so no key written here exists anywhere else.
