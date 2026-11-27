@@ -1,3 +1,6 @@
+import { bytesToHex, generateKeypair } from "@nostr-agx/nostr";
+import { nip19 } from "nostr-tools";
+import { encrypt } from "nostr-tools/nip49";
 import { describe, expect, it } from "vitest";
 import { scanForSecrets } from "./secrets-scan.js";
 
@@ -31,5 +34,134 @@ describe("scanForSecrets", () => {
 		const findings = scanForSecrets(`hello\nela_abcdefghijklmnop0123456789\nbye`);
 		expect(findings).toEqual([{ kind: "Ellaworks API key (ela_…)", line: 2 }]);
 		expect(JSON.stringify(findings)).not.toContain("abcdefghijklmnop");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// The scan reads a Nostr secret key by the rule the CLI and the n8n nodes share:
+// `nsec1…` and `ncryptsec1…` in any case, behind `nostr:`, with `%xx` escapes decoded.
+// Every key is made when the test runs, from a throwaway key.
+
+const pair = generateKeypair();
+const NSEC = nip19.nsecEncode(pair.secretKey);
+const NCRYPTSEC = encrypt(pair.secretKey, "throwaway-password", 4);
+const HEX = bytesToHex(pair.secretKey);
+const NSEC_KIND = "Nostr secret key (nsec1…)";
+const NCRYPTSEC_KIND = "Password-protected Nostr secret key (ncryptsec1…)";
+const HEX_KIND = "64-character hex secret";
+
+/** Every character as `%xx`. */
+function escapeAll(text: string): string {
+	return [...text].map((ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`).join("");
+}
+
+describe("scanForSecrets and a Nostr secret key", () => {
+	it.each([
+		["in plain", NSEC],
+		["behind nostr:", `nostr:${NSEC}`],
+		["inside a sentence", `my key is ${NSEC} and please keep it safe`],
+		["in capitals", NSEC.toUpperCase()],
+		["in capitals, behind nostr:", `nostr:${NSEC.toUpperCase()}`],
+		["with every character %xx-escaped", escapeAll(NSEC)],
+		["with every character %xx-escaped, in lower-case digits", escapeAll(NSEC).toLowerCase()],
+	])("flags an nsec1… %s, on its line, without quoting it", (_name, text) => {
+		const findings = scanForSecrets(`hello\n${text}\nbye`);
+		expect(findings).toEqual([{ kind: NSEC_KIND, line: 2 }]);
+		expect(JSON.stringify(findings)).not.toContain(NSEC.slice(8, 30));
+	});
+
+	it.each([
+		["in plain", NCRYPTSEC],
+		["in capitals", NCRYPTSEC.toUpperCase()],
+		["behind nostr:", `nostr:${NCRYPTSEC}`],
+		["with every character %xx-escaped", escapeAll(NCRYPTSEC)],
+	])("flags an encrypted key (ncryptsec1…) %s", (_name, text) => {
+		expect(scanForSecrets(`one\n${text}`)).toEqual([{ kind: NCRYPTSEC_KIND, line: 2 }]);
+	});
+
+	it("flags both kinds on one line, the nsec1… first", () => {
+		expect(scanForSecrets(`${NCRYPTSEC} and ${NSEC}`)).toEqual([
+			{ kind: NSEC_KIND, line: 1 },
+			{ kind: NCRYPTSEC_KIND, line: 1 },
+		]);
+	});
+
+	it("leaves text that only talks about keys alone", () => {
+		for (const text of [
+			"paste your nsec1 here, or your ncryptsec1",
+			`nsec1${"q".repeat(19)}`,
+			`ncryptsec1${"q".repeat(19)}`,
+			`Our npub is ${nip19.npubEncode(pair.publicKey)}`,
+			"https://example.com/a%20b?q=%7Efoo%2Fbar",
+		]) {
+			expect(scanForSecrets(text)).toEqual([]);
+		}
+	});
+});
+
+describe("scanForSecrets and 64 hex digits", () => {
+	it.each([
+		["secret key: <hex>", `secret key: ${HEX}`],
+		["Secret: <HEX>", `Secret: ${HEX.toUpperCase()}`],
+		["private=<hex>", `private=${HEX}`],
+		["the words 20 characters before it", `secret${" ".repeat(20)}${HEX}`],
+		["on a later line than the words, nothing flagged there", `secret\n${HEX}`],
+	])("%s", (name, text) => {
+		const findings = scanForSecrets(text).filter((finding) => finding.kind === HEX_KIND);
+		expect(findings.length).toBe(name.startsWith("on a later") ? 0 : 1);
+	});
+
+	it("leaves a run without the words alone: it is as likely a public key or an event id", () => {
+		for (const text of [HEX, `Our pubkey is ${pair.publicKey}`, `event ${HEX}`, `secret${" ".repeat(21)}${HEX}`, `secret ${HEX}0`, `secret ${HEX.slice(1)}`, `secret x${HEX}`]) {
+			expect(scanForSecrets(text).filter((finding) => finding.kind === HEX_KIND)).toEqual([]);
+		}
+	});
+});
+
+describe("scanForSecrets keeps its answers for text that is not an escaped or capitalised key", () => {
+	// The two patterns this scan used before it read keys by the shared rule. For text made up of
+	// the pieces below, the old patterns and the new code must agree.
+	const OLD_NSEC = /\bnsec1[02-9ac-hj-np-z]{20,}\b/;
+	const OLD_HEX = /\b(?:secret|private)[^\n]{0,20}\b[0-9a-f]{64}\b/i;
+	const NSEC_SLOTS = [
+		["", "x", " ", "nostr:", "--", "_", "\n"],
+		[NSEC, NSEC.slice(0, 30), NSEC.slice(0, 12), `nsec1${"q".repeat(19)}`, `nsec1${"q".repeat(20)}`, "nsec1", `${NSEC}q`, `${NSEC}b`, `${NSEC}1`, `nsec1${"q".repeat(10)}b${"q".repeat(30)}`],
+		["", ".", " ok", "\nmore", "g", "_", "b", "q"],
+	];
+	const HEX_SLOTS = [
+		["secret", "private", "Secret", "PRIVATE", "key", "x"],
+		["", " ", ": ", "=", " is ", "\n", " ".repeat(20), " ".repeat(21), "_", "x".repeat(15), "x".repeat(21)],
+		[HEX, HEX.toUpperCase(), `${HEX.toUpperCase().slice(0, 32)}${HEX.slice(32)}`, HEX.slice(1), `${HEX}a`, `g${HEX}`, `${HEX}_`, `0${HEX}`],
+		["", ".", " ok", "\nmore", "g", "_"],
+	];
+
+	/** `count` texts, each one piece from every slot in turn, the same on every run. */
+	function madeUp(slots: string[][], count: number): string[] {
+		let seed = 12345;
+		const next = (limit: number): number => {
+			seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+			return seed % limit;
+		};
+		return Array.from({ length: count }, () => slots.map((slot) => slot[next(slot.length)] as string).join(""));
+	}
+
+	/** How many lines of `kind` the scan found in the texts, after checking that every text got what the old pattern gives. */
+	function agree(texts: string[], kind: string, old: RegExp): number {
+		let flagged = 0;
+		for (const text of texts) {
+			const got = scanForSecrets(text).filter((finding) => finding.kind === kind).length;
+			const lines = text.split(/\r\n|[\n\r]/).filter((line) => old.test(line)).length;
+			expect(got).toBe(lines);
+			flagged += got;
+		}
+		return flagged;
+	}
+
+	it("agrees with the old nsec1… pattern on 3000 made-up texts", () => {
+		expect(agree(madeUp(NSEC_SLOTS, 3000), NSEC_KIND, OLD_NSEC)).toBeGreaterThan(100);
+	});
+
+	it("agrees with the old 64-hex pattern on 3000 made-up texts, in either case", () => {
+		expect(agree(madeUp(HEX_SLOTS, 3000), HEX_KIND, OLD_HEX)).toBeGreaterThan(100);
 	});
 });
