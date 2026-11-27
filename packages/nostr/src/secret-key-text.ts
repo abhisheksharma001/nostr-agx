@@ -31,11 +31,13 @@ const NSEC_SHAPE = new RegExp(`\\bnsec1${BECH32_DATA}{${MIN_KEY_DATA},}\\b`, "i"
 const NCRYPTSEC_SHAPE = new RegExp(`\\bncryptsec1${BECH32_DATA}{${MIN_KEY_DATA},}\\b`, "i");
 
 /**
- * `text` with its `%xx` escapes decoded, again until none is left that decodes (at
- * most four rounds), so a key escaped twice is read too. Never throws: an escape that
- * is not two hex digits is left as it is. Only for looking at text, never for acting on it.
+ * `text` as given, then the text after each round of `%xx` decoding that changed
+ * something, until none is left that decodes (at most four rounds), so a key escaped
+ * twice is read too. Never throws: an escape that is not two hex digits is left as it
+ * is. Only for looking at text, never for acting on it.
  */
-function decodeEscapes(text: string): string {
+function escapeRounds(text: string): string[] {
+	const rounds = [text];
 	let out = text;
 	for (let round = 0; round < 4 && out.includes("%"); round++) {
 		const next = out.replace(/%([0-9a-f]{2})/gi, (_all, digits: string) =>
@@ -45,8 +47,15 @@ function decodeEscapes(text: string): string {
 			break;
 		}
 		out = next;
+		rounds.push(out);
 	}
-	return out;
+	return rounds;
+}
+
+/** `text` with its `%xx` escapes decoded as far as they go: the last of {@link escapeRounds}. */
+function decodeEscapes(text: string): string {
+	const rounds = escapeRounds(text);
+	return rounds[rounds.length - 1] as string;
 }
 
 /**
@@ -59,6 +68,7 @@ export function holdsSecretKey(text: string): boolean {
 	return /n(crypt)?sec1/i.test(decodeEscapes(text));
 }
 
+/** What kind of secret key a text holds: a plain `nsec1…`, or a password-protected `ncryptsec1…` (NIP-49). */
 export type SecretKeyKind = "nsec" | "ncryptsec";
 
 /**
@@ -66,15 +76,31 @@ export type SecretKeyKind = "nsec" | "ncryptsec";
  * by at least 20 characters of bech32 data, standing alone as a word. Each kind
  * once, `nsec` first. A key with a typo in it still counts while its data is bech32
  * characters and long enough; the bare word `nsec1` in a sentence does not.
+ *
+ * The text is looked at as given and after each round of `%xx` decoding, and a kind
+ * counts if any of them shows it: a key followed by `%5F` is a key as written, though
+ * decoded it is stuck to an underscore. Never throws: a single run of about 6 million
+ * key characters makes the regular expression run out of stack, and the answer is then
+ * taken from the prefix alone, so such a run is read as a key.
  */
 export function secretKeyKinds(text: string): SecretKeyKind[] {
-	const decoded = decodeEscapes(text);
+	const rounds = escapeRounds(text);
 	const kinds: SecretKeyKind[] = [];
-	if (NSEC_SHAPE.test(decoded)) {
-		kinds.push("nsec");
-	}
-	if (NCRYPTSEC_SHAPE.test(decoded)) {
-		kinds.push("ncryptsec");
+	try {
+		if (rounds.some((round) => NSEC_SHAPE.test(round))) {
+			kinds.push("nsec");
+		}
+		if (rounds.some((round) => NCRYPTSEC_SHAPE.test(round))) {
+			kinds.push("ncryptsec");
+		}
+	} catch {
+		kinds.length = 0;
+		if (rounds.some((round) => /nsec1/i.test(round))) {
+			kinds.push("nsec");
+		}
+		if (rounds.some((round) => /ncryptsec1/i.test(round))) {
+			kinds.push("ncryptsec");
+		}
 	}
 	return kinds;
 }
