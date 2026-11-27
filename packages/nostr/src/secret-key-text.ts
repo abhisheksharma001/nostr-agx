@@ -16,6 +16,9 @@
  *   event id and a SHA-256 hash look exactly the same. Only the slot the text came
  *   from, or the exact value of a key that is already known, can tell them apart.
  *
+ * {@link scrubSecretKeys} is the same lenient reading turned into an action: it takes
+ * the keys out of a text. It leaves 64-hex runs alone for the reason above.
+ *
  * `nsec1` and `ncryptsec1` (a password-protected key, NIP-49) are matched in any
  * case (bech32 allows all capitals), behind `nostr:`, and with `%xx` escapes
  * decoded.
@@ -127,6 +130,135 @@ export function hexKeyRuns(text: string): HexRun[] {
 		runs.push({ hex: match[0], index: match.index });
 	}
 	return runs;
+}
+
+/** A stretch of text: `start` up to, not including, `end`. */
+interface Span {
+	start: number;
+	end: number;
+}
+
+/** An `nsec1` or `ncryptsec1` needs at least this many characters after it to be taken out: fewer is the name of the thing, not a key. */
+const SCRUB_MIN_DATA = 5;
+
+/** True for an ASCII letter or digit: what a mistyped key can still be made of. */
+function isKeyChar(code: number): boolean {
+	return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isHexDigit(code: number): boolean {
+	return (code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102);
+}
+
+/**
+ * Where a key stands in `text` as it is written: each `nsec1` or `ncryptsec1` (any
+ * case) followed by at least {@link SCRUB_MIN_DATA} letters or digits, taken together
+ * with every letter and digit after it. Only the short prefix is looked for with a
+ * regular expression and the run after it is walked by hand, so the length of a run
+ * can never make the match fail.
+ */
+function keyRuns(text: string): Span[] {
+	const runs: Span[] = [];
+	const prefix = /n(?:crypt)?sec1/gi;
+	for (let found = prefix.exec(text); found !== null; found = prefix.exec(text)) {
+		const dataStart = found.index + found[0].length;
+		let end = dataStart;
+		while (end < text.length && isKeyChar(text.charCodeAt(end))) {
+			end++;
+		}
+		if (end - dataStart >= SCRUB_MIN_DATA) {
+			runs.push({ start: found.index, end });
+			prefix.lastIndex = end;
+		}
+	}
+	return runs;
+}
+
+/**
+ * Every place in `text` that holds a key, in the text as given and in each round of
+ * `%xx` decoding (see {@link escapeRounds}), as places in the text as given. A key
+ * written as escapes is taken out as the escapes it was written in; the escapes of
+ * other characters next to it are left where they are.
+ */
+function keySpans(text: string): Span[] {
+	const rounds = escapeRounds(text);
+	const runsByRound = rounds.map(keyRuns);
+	let last = 0;
+	for (let round = 0; round < runsByRound.length; round++) {
+		if ((runsByRound[round] as Span[]).length > 0) {
+			last = round;
+		}
+	}
+	const spans: Span[] = [...(runsByRound[0] as Span[])];
+	// `before[i]` is where character i of the previous round began in `text`; null stands for "at i".
+	let before: Int32Array | null = null;
+	for (let round = 1; round <= last; round++) {
+		const from = rounds[round - 1] as string;
+		const to = rounds[round] as string;
+		const after = new Int32Array(to.length + 1);
+		let out = 0;
+		for (let i = 0; i < from.length; ) {
+			after[out++] = before ? (before[i] as number) : i;
+			const escaped =
+				from.charCodeAt(i) === 37 &&
+				i + 2 < from.length &&
+				isHexDigit(from.charCodeAt(i + 1)) &&
+				isHexDigit(from.charCodeAt(i + 2));
+			i += escaped ? 3 : 1;
+		}
+		if (out !== to.length) {
+			throw new Error("escape rounds out of step");
+		}
+		after[to.length] = text.length;
+		before = after;
+		for (const run of runsByRound[round] as Span[]) {
+			spans.push({ start: after[run.start] as number, end: after[run.end] as number });
+		}
+	}
+	return spans;
+}
+
+/**
+ * `text` with every secret key in it replaced by `marker`, and everything else exactly
+ * as it was. A key is `nsec1` or `ncryptsec1` (any case, behind `nostr:` or not, written
+ * as `%xx` escapes up to the four rounds {@link holdsSecretKey} reads) and at least five
+ * letters or digits after it, and everything after those that is a letter or a digit:
+ * so a key with a typo in it or one cut short goes too, and a bare `nsec1…` in a sentence
+ * stays. A run of 64 hex digits is NOT touched: it is as likely a public key or an event
+ * id as a secret key (see {@link hexKeyRuns}), and only a caller that knows a key's exact
+ * value can say so.
+ *
+ * Never throws and takes time in proportion to the length of the text. If anything goes
+ * wrong inside, the whole text is replaced by `marker`: a scrub that fails shows nothing
+ * rather than showing a key. A key written in two pieces that are given in two calls is
+ * two texts, and neither piece is a key.
+ */
+export function scrubSecretKeys(text: string, marker: string): string {
+	try {
+		const spans = keySpans(text).sort((a, b) => a.start - b.start || b.end - a.end);
+		if (spans.length === 0) {
+			return text;
+		}
+		let out = "";
+		let copied = 0;
+		let open = spans[0] as Span;
+		const flush = (span: Span): void => {
+			out += text.slice(copied, span.start) + marker;
+			copied = span.end;
+		};
+		for (const span of spans.slice(1)) {
+			if (span.start <= open.end) {
+				open = { start: open.start, end: Math.max(open.end, span.end) };
+			} else {
+				flush(open);
+				open = span;
+			}
+		}
+		flush(open);
+		return out + text.slice(copied);
+	} catch {
+		return marker;
+	}
 }
 
 /** What was typed where a secret key is expected, sorted by its shape. */
