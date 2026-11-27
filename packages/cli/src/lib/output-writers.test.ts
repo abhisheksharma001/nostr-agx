@@ -12,8 +12,7 @@ import { describe, expect, it } from "vitest";
 // `console`, any other use of the word `console` (an alias, `const { log } = console`, `console["log"]`),
 // `process.stdout` and `process.stderr` (so an alias of them too), `process[...]` and a destructured
 // `process`, `writeSync(` (the file descriptors 1 and 2 are the terminal), the paths `/dev/stdout`,
-// `/dev/stderr` and `/dev/fd/...`, `"inherit"` (a child process that shares our streams) and an import of
-// `node:console`.
+// `/dev/stderr` and `/dev/fd/...`, and `"inherit"` (a child process that shares our streams).
 //
 // Not covered, on purpose: tests, the browser code under `ui-client`, the web UI's and the gateway's
 // HTTP answers (the gateway's `sendJson` is tested in `gateway/gateway-scrub.test.ts`), the packages
@@ -54,7 +53,6 @@ const WRITES = new RegExp(
 		String.raw`\bwriteSync\s*\(`, // fs.writeSync(1, ...) and writeSync(2, ...)
 		String.raw`/dev/(?:stdout|stderr|fd/)`, // a write to the terminal as a file
 		String.raw`["']inherit["']`, // stdio: "inherit": a child that writes to our streams
-		String.raw`["'](?:node:)?console["']`, // import { Console } from "node:console"
 	].join("|"),
 	"g",
 );
@@ -86,7 +84,7 @@ describe("what the scan of the source sees", () => {
 		["a write to /dev/stdout", 'writeFileSync("/dev/stdout", "x");'],
 		["a write to /dev/fd/2", 'appendFileSync("/dev/fd/2", "x");'],
 		["a child that inherits our streams", 'spawn(command, args, { stdio: ["pipe", "pipe", "inherit"] });'],
-		["an import of node:console", 'import { Console } from "node:console";'],
+		["an import of node:console, which holds the word console", 'import { Console } from "node:console";'],
 	])("%s", (_name, code) => {
 		expect(writesInText(code)).not.toEqual([]);
 	});
