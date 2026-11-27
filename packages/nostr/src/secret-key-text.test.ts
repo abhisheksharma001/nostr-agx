@@ -23,6 +23,15 @@ function escapeAll(text: string): string {
 	return [...text].map((ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`).join("");
 }
 
+/** `escapeAll` applied `times` times: the escapes are themselves written as escapes, that many layers deep. */
+function escapeTimes(text: string, times: number): string {
+	let out = text;
+	for (let layer = 0; layer < times; layer++) {
+		out = escapeAll(out);
+	}
+	return out;
+}
+
 describe("holdsSecretKey (lenient: for text that is about to be shown or kept)", () => {
 	it.each([
 		["an nsec1…", NSEC],
@@ -42,6 +51,9 @@ describe("holdsSecretKey (lenient: for text that is about to be shown or kept)",
 		["a key escaped in part", `nsec%31${NSEC.slice(5)}`],
 		["an ncryptsec1… escaped", escapeAll(NCRYPTSEC)],
 		["a key escaped twice", escapeAll(escapeAll(NSEC))],
+		["a key escaped three times", escapeTimes(NSEC, 3)],
+		["a key escaped four times", escapeTimes(NSEC, 4)],
+		["an ncryptsec1… escaped four times", escapeTimes(NCRYPTSEC, 4)],
 		["a key escaped behind nostr%3A", `nostr%3A${escapeAll(NSEC)}`],
 	])("is true for %s", (_name, text) => {
 		expect(holdsSecretKey(text)).toBe(true);
@@ -57,6 +69,14 @@ describe("holdsSecretKey (lenient: for text that is about to be shown or kept)",
 		["a word that only starts like a key", "nsec is not a key, and neither is ncrypt sec"],
 	])("is false for %s", (_name, text) => {
 		expect(holdsSecretKey(text)).toBe(false);
+	});
+
+	it("reads four rounds of escapes and no more: a key escaped five times is not seen", () => {
+		// Measured with the code as it is: four layers are read, the fifth is left as it is.
+		expect(holdsSecretKey(escapeTimes(NSEC, 4))).toBe(true);
+		expect(holdsSecretKey(escapeTimes(NSEC, 5))).toBe(false);
+		expect(holdsSecretKey(escapeTimes(NCRYPTSEC, 4))).toBe(true);
+		expect(holdsSecretKey(escapeTimes(NCRYPTSEC, 5))).toBe(false);
 	});
 
 	it("never throws, whatever the escapes look like", () => {
@@ -99,8 +119,24 @@ describe("secretKeyKinds (strict: for a warning the user can dismiss)", () => {
 		["a key in capitals followed by an escaped letter", `${NSEC.toUpperCase()}%62`, ["nsec"]],
 		["a key in a URL, followed by an escaped underscore", `https://example.com/cb?key=${NSEC}%5Fbackup`, ["nsec"]],
 		["an ncryptsec1… followed by an escaped letter", `${NCRYPTSEC}%62`, ["ncryptsec"]],
+		["an nsec1… escaped three times", escapeTimes(NSEC, 3), ["nsec"]],
+		["an nsec1… escaped four times", escapeTimes(NSEC, 4), ["nsec"]],
+		["an ncryptsec1… escaped four times", escapeTimes(NCRYPTSEC, 4), ["ncryptsec"]],
+		// The text as given has no key. The first reading gives the key followed by `%62` (a key as written),
+		// the second gives the key followed by `b`, which is not. Only the reading in the middle shows it.
+		["an nsec1… that shows only in the middle reading", `${escapeAll(NSEC)}%2562`, ["nsec"]],
+		["an ncryptsec1… that shows only in the middle reading", `${escapeAll(NCRYPTSEC)}%2562`, ["ncryptsec"]],
+		["an nsec1… that shows only in the second of three readings", `${escapeAll(escapeAll(NSEC))}%252562`, ["nsec"]],
 	])("finds %s", (_name, text, kinds) => {
 		expect(secretKeyKinds(text)).toEqual(kinds);
+	});
+
+	it("reads four rounds of escapes and no more: a key escaped five times is not seen", () => {
+		// Measured with the code as it is: four layers are read, the fifth is left as it is.
+		expect(secretKeyKinds(escapeTimes(NSEC, 4))).toEqual(["nsec"]);
+		expect(secretKeyKinds(escapeTimes(NSEC, 5))).toEqual([]);
+		expect(secretKeyKinds(escapeTimes(NCRYPTSEC, 4))).toEqual(["ncryptsec"]);
+		expect(secretKeyKinds(escapeTimes(NCRYPTSEC, 5))).toEqual([]);
 	});
 
 	it("needs 20 characters of data after the prefix", () => {
@@ -131,13 +167,38 @@ describe("secretKeyKinds (strict: for a warning the user can dismiss)", () => {
 		}
 	});
 
-	it("does not throw on one run of millions of key characters, and says what the prefix says", () => {
+	describe("one run of millions of key characters", () => {
 		// A regular expression over a run this long runs out of stack in V8 (about 6 million characters). The
-		// answer then comes from the prefix alone, which cannot fail, so a long run is read as a key.
-		const run = "q".repeat(6_000_000);
-		expect(secretKeyKinds(`nsec1${run} `)).toEqual(["nsec"]);
-		expect(secretKeyKinds(`ncryptsec1${run} `)).toEqual(["ncryptsec"]);
-		expect(secretKeyKinds(`${run} `)).toEqual([]);
+		// text is then read by the lenient rule: any `nsec1` or `ncryptsec1` in it, in capitals or not, as given
+		// or after decoding, counts as a key, even where an exact scan would find none. The strings are built
+		// once for the whole describe, not once per test.
+		const RUN = "q".repeat(6_000_000);
+		const RUN_UPPER = RUN.toUpperCase();
+
+		it("does not throw, and reads the prefix in front of the run as a key", () => {
+			expect(secretKeyKinds(`nsec1${RUN} `)).toEqual(["nsec"]);
+			expect(secretKeyKinds(`ncryptsec1${RUN} `)).toEqual(["ncryptsec"]);
+			expect(secretKeyKinds(`${RUN} `)).toEqual([]);
+		});
+
+		it("names each kind once when an exact find came before the run that made it give up", () => {
+			expect(secretKeyKinds(`${NSEC} ncryptsec1${RUN} `)).toEqual(["nsec", "ncryptsec"]);
+		});
+
+		it.each([
+			["an nsec1 prefix written as escapes", `${escapeAll("nsec1")}${RUN} `, ["nsec"]],
+			["an ncryptsec1 prefix written as escapes", `${escapeAll("ncryptsec1")}${RUN} `, ["ncryptsec"]],
+			["an nsec1 prefix escaped twice", `${escapeAll(escapeAll("nsec1"))}${RUN} `, ["nsec"]],
+		])("reads %s after decoding it", (_name, text, kinds) => {
+			expect(secretKeyKinds(text)).toEqual(kinds);
+		});
+
+		it.each([
+			["an nsec1 prefix in capitals", `NSEC1${RUN_UPPER} `, ["nsec"]],
+			["an ncryptsec1 prefix in capitals", `NCRYPTSEC1${RUN_UPPER} `, ["ncryptsec"]],
+		])("reads %s", (_name, text, kinds) => {
+			expect(secretKeyKinds(text)).toEqual(kinds);
+		});
 	});
 });
 
