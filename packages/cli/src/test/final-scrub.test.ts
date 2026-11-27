@@ -2,7 +2,7 @@ import { hexToBytes } from "@nostr-agx/nostr";
 import type { Command } from "commander";
 import { nip19 } from "nostr-tools";
 import { encrypt } from "nostr-tools/nip49";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgxCliError, EXIT, HumanActionRequiredError } from "../lib/errors.js";
 import { renderInboundLines } from "../lib/inbound-lines.js";
 import { createIdentity, loadIdentityFile } from "../lib/identity.js";
@@ -11,6 +11,14 @@ import { makeLogger } from "../lib/transport.js";
 import { announceActionRequired } from "../lib/wait.js";
 import { buildProgram, reportCliError } from "../program.js";
 import { agx, capture, sandbox } from "./helpers.js";
+
+// The check at the slot (lib/input-boundary.ts) now refuses a key typed into the slots these tests use
+// (a profile name, a port, a config key) before anything runs; test/input-boundary.test.ts covers that.
+// These tests are about the net behind it, for a slot nobody thought of, so the check is switched off here.
+vi.mock("../lib/input-boundary.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../lib/input-boundary.js")>()),
+	checkInputs: () => undefined,
+}));
 
 /**
  * The last net: a secret key that no check at the slot looked for must still not come out of the
@@ -148,7 +156,10 @@ describe("ordinary messages, help and exit codes do not change", () => {
 		const run = await agx(own.secretKeyHex);
 		expect(run.code).toBe(1);
 		expect(run.stderr.toLowerCase()).not.toContain(own.secretKeyHex);
-		expect(run.stderr).toContain(`error: unknown command '${MARK}'`);
+		// Any run of 64 hex digits in a parser error is replaced, so the net is not reached.
+		expect(run.stderr).toBe(
+			"error: the command line may contain a secret key (a 64-character hex string), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n",
+		);
 	});
 
 	it("every command of the program writes through the scrubbing writers, so no command can print around them", () => {

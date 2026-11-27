@@ -68,6 +68,7 @@ import { uiCommand } from "./commands/ui.js";
 import { waitCommand } from "./commands/wait.js";
 import { whoamiCommand } from "./commands/whoami.js";
 import { AgxCliError, EXIT, HumanActionRequiredError } from "./lib/errors.js";
+import { checkInputs } from "./lib/input-boundary.js";
 import {
 	emitStdoutJson,
 	errLine,
@@ -134,7 +135,7 @@ export function buildProgram(): Command {
 		.option("-p, --profile <name>", "profile to use (env: AGX_PROFILE)")
 		.option("--json", "emit machine-readable JSON")
 		.option("--no-color", "disable coloured output")
-		.hook("preAction", (thisCommand) => {
+		.hook("preAction", (thisCommand, actionCommand) => {
 			const opts = thisCommand.opts();
 			setJsonMode(Boolean(opts.json));
 			// Only ever turn colour OFF. kleur already disables itself when stdout is
@@ -143,6 +144,8 @@ export function buildProgram(): Command {
 			if (opts.color === false) {
 				setColor(false);
 			}
+			// The one place every typed value is looked at, before any command runs.
+			checkInputs(actionCommand);
 		});
 
 	/**
