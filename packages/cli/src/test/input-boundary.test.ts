@@ -102,6 +102,9 @@ const NOT_A_NAME = (slot: string): string =>
 	`${slot} is not a valid profile name (1 to 32 letters, digits, "-", "_" or "."; not "." or ".."), so it was not used and is not shown here.`;
 const KEY_REMEDIATION = "A secret key belongs only in `agx identity import` (pipe it in with --stdin). Check what each command takes with `agx --help`.";
 const NAME_REMEDIATION = "Use a short name, for example:  agx -p work identity new";
+const NOT_AN_ENV_NAME = (slot: string): string =>
+	`${slot} is not a valid environment variable name (letters, digits and "_", not starting with a digit), so it was not used and is not shown here.`;
+const ENV_NAME_REMEDIATION = "Name the variable that holds the key, for example:  agx identity import --from-env AGENT_KEY";
 const option = (name: string, command: string): string => `The value of \`${name}\` (agx ${command})`;
 const argument = (name: string, command: string): string => `The \`${name}\` argument (agx ${command})`;
 const variable = (name: string): string => `The environment variable ${name}`;
@@ -166,6 +169,20 @@ function refusedRows(): Row[] {
 		keyed("send --context-id", ["send", "--context-id", NSEC, FRIEND, "hello"], option("--context-id", "send")),
 		keyed("card --relay", ["card", FRIEND, "--relay", `ws://127.0.0.1:9/${NSEC}`], option("--relay", "card")),
 		keyed("ui --compose", ["ui", "--no-open", "--compose", `/tmp/${NSEC}.json`], option("--compose", "ui")),
+		// the name of the variable that holds a key to import: a key typed there is refused, and is not used as a name
+		keyed("identity import --from-env", ["identity", "import", "--from-env", NSEC], option("--from-env", "identity import")),
+		keyed("identity import --from-env in capitals", ["identity", "import", "--from-env", NSEC.toUpperCase()], option("--from-env", "identity import")),
+		keyed("identity import --from-env=<nsec>", ["identity", "import", `--from-env=${NSEC}`], option("--from-env", "identity import")),
+		keyed("identity import --from-env <ncryptsec>", ["identity", "import", "--from-env", NCRYPTSEC], option("--from-env", "identity import"), { secrets: [NCRYPTSEC] }),
+		{ name: "identity import --from-env <hex>", args: ["identity", "import", "--from-env", `a${STRANGER_HEX.slice(1)}`], message: HEX_RUN(option("--from-env", "identity import")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
+		{ name: "identity import --from-env <hex in capitals>", args: ["identity", "import", "--from-env", STRANGER_HEX.toUpperCase()], message: HEX_RUN(option("--from-env", "identity import")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
+		{ name: "identity import --from-env <hex, one digit short>", args: ["identity", "import", "--from-env", `a${STRANGER_HEX.slice(2)}`], message: NOT_AN_ENV_NAME(option("--from-env", "identity import")), remediation: ENV_NAME_REMEDIATION, secrets: [STRANGER_HEX] },
+		...["1KEY", "MY-KEY", "MY KEY", "KEY=1", "$HOME", ""].map((name) => ({
+			name: `identity import --from-env ${JSON.stringify(name)}`,
+			args: ["identity", "import", "--from-env", name],
+			message: NOT_AN_ENV_NAME(option("--from-env", "identity import")),
+			remediation: ENV_NAME_REMEDIATION,
+		})),
 		// a peer slot: refused before, with another message
 		keyed("identity allow", ["identity", "allow", NSEC], argument("[peers...]", "identity allow")),
 		keyed("identity deny", ["identity", "deny", NSEC], argument("<peers...>", "identity deny")),

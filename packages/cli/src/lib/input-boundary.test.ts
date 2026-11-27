@@ -11,7 +11,7 @@ import { walkProgram } from "../test/canary-kit.js";
 import { getProfile, saveProfile } from "./config.js";
 import { AgxCliError } from "./errors.js";
 import { createIdentity, saveIdentity } from "./identity.js";
-import { checkInputs, isValidProfileName, PROFILE_NAME_MAX } from "./input-boundary.js";
+import { checkInputs, isValidEnvName, isValidProfileName, PROFILE_NAME_MAX } from "./input-boundary.js";
 import { ENV_SLOTS, SLOTS, type SlotSpec, type SlotTable } from "./input-slots.js";
 import { configPath, identityPath } from "./paths.js";
 
@@ -175,6 +175,24 @@ describe("the slot table", () => {
 			}
 		}
 		expect(names.sort()).toEqual(["(program) --profile", "config use <profile>", "env AGX_PROFILE"]);
+	});
+
+	it("takes the one slot that names an environment variable (identity import --from-env) through the variable-name rule, as an identifier", () => {
+		const names: string[] = [];
+		for (const [command, entry] of Object.entries(SLOTS)) {
+			for (const [slot, spec] of Object.entries(entry)) {
+				if (typeof spec !== "function" && typeof spec !== "string" && spec.envName) {
+					names.push(`${command} ${slot}`);
+				}
+			}
+		}
+		for (const [name, spec] of Object.entries(ENV_SLOTS)) {
+			if (typeof spec !== "function" && typeof spec !== "string" && spec.envName) {
+				names.push(`env ${name}`);
+			}
+		}
+		expect(names).toEqual(["identity import --from-env"]);
+		expect(SLOTS["identity import"]?.["--from-env"]).toEqual({ kind: "identifier", envName: true });
 	});
 });
 
@@ -721,5 +739,44 @@ describe("a profile name", () => {
 			}
 		}
 		expect(await refusal(scratch(profileTable)(["--profile", "work", "go", "x"]))).toBeNull();
+	});
+});
+
+describe("a slot that takes the name of an environment variable", () => {
+	const table: SlotTable = { go: { "<thing>": "freeText", "--where": { kind: "identifier", envName: true } } };
+	const asArgs = (value: string): string[] => ["go", "fine", "--where", value];
+	const NOT_A_NAME = `${OPTION} is not a valid environment variable name (letters, digits and "_", not starting with a digit)${SHAPE}`;
+
+	it.each(["KEY", "_KEY", "key", "Key_1", "A", "_", "AGENT_KEY_2", "x".repeat(100), `a${STRANGER_HEX.slice(0, 54)}`])("lets %s through", async (name) => {
+		expect(await refusal(scratch(table)(asArgs(name)))).toBeNull();
+		expect(isValidEnvName(name)).toBe(true);
+	});
+
+	it.each(["1KEY", "MY-KEY", "MY KEY", "MY.KEY", "KEY=1", "$HOME", "KEY;ls", "a/b", "clé", "KEY\n", "", " "])("refuses %j, naming the slot and not the value", async (name) => {
+		expect(await refusal(scratch(table)(asArgs(name)))).toEqual({ message: NOT_A_NAME, exitCode: 2 });
+		expect(isValidEnvName(name)).toBe(false);
+	});
+
+	it("refuses a key in the slot as a key, before it asks whether the text is a name", async () => {
+		for (const value of [NSEC, NSEC.toUpperCase(), `nostr:${NSEC}`, `ncryptsec1${"q".repeat(40)}`, [...NSEC].map((ch) => `%${ch.charCodeAt(0).toString(16)}`).join("")]) {
+			expect(await refusal(scratch(table)(asArgs(value))), value.slice(0, 12)).toEqual({ message: KEY_TEXT(OPTION), exitCode: 2 });
+		}
+		expect(isValidEnvName(NSEC)).toBe(true);
+	});
+
+	it("refuses 64 hex digits as a hex string, and 56 to 63 of them as not being a name", async () => {
+		for (const value of [`a${STRANGER_HEX.slice(1)}`, STRANGER_HEX, STRANGER_HEX.toUpperCase()]) {
+			expect(await refusal(scratch(table)(asArgs(value))), value.slice(0, 12)).toEqual({ message: HEX_TEXT(OPTION), exitCode: 2 });
+		}
+		for (const digits of [56, 57, 60, 63]) {
+			const value = `a${STRANGER_HEX.slice(0, digits - 1)}`;
+			expect(await refusal(scratch(table)(asArgs(value))), `${digits} digits`).toEqual({ message: NOT_A_NAME, exitCode: 2 });
+			expect(isValidEnvName(value), `${digits} digits`).toBe(false);
+		}
+		expect(isValidEnvName(`a${STRANGER_HEX.slice(0, 54)}`)).toBe(true);
+	});
+
+	it("does not ask for a name of a slot that does not say so", async () => {
+		expect(await refusal(scratch({ go: { "<thing>": "freeText", "--where": "identifier" } })(asArgs("a name with spaces")))).toBeNull();
 	});
 });
