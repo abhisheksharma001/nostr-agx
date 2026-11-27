@@ -2940,7 +2940,7 @@ describe("the secret-key canary", () => {
 
 	describe("the cleanup and the home", () => {
 		it("recognises the ways a program can reach a resolver or start a process", () => {
-			for (const text of ['import { lookup } from "node:dns/promises";', "import dns from 'node:dns';", "dns.resolve4(host)", "await dns.promises.resolveTxt(name)", "const r = new Resolver();", "new dns.promises.Resolver()", "resolveSrv(name)"]) {
+			for (const text of ['import { lookup } from "node:dns/promises";', "import dns from 'node:dns';", "dns.resolve4(host)", "dns.resolve(host, cb)", "await dns.promises.resolve(host)", "await dns.promises.resolveTxt(name)", "const r = new Resolver();", "new dns.promises.Resolver()", "resolveSrv(name)"]) {
 				expect(usesResolver(text), text).toBe(true);
 			}
 			for (const text of ["const resolved = resolve(path);", "await lookupHost(name)", "// dns is not used here"]) {
