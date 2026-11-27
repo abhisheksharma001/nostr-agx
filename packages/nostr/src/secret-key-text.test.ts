@@ -117,6 +117,8 @@ describe("secretKeyKinds (strict: for a warning the user can dismiss)", () => {
 		["a secret key as hex", HEX],
 		["a key stuck to a letter in front of it", `x${NSEC}`],
 		["a key followed by a letter that bech32 does not use", `${NSEC}b`],
+		["an ncryptsec1… stuck to a letter in front of it", `x${NCRYPTSEC}`],
+		["an ncryptsec1… followed by a letter that bech32 does not use", `${NCRYPTSEC}b`],
 		["a data part with a character bech32 does not use", `nsec1${"q".repeat(10)}b${"q".repeat(30)}`],
 		["a url with ordinary escapes", "https://example.com/a%20b?q=%7Efoo%2Fbar"],
 	])("does not flag %s", (_name, text) => {
