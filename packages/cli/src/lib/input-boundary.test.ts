@@ -364,35 +364,45 @@ describe("a path, a URL and an environment variable: a content hash is normal th
 	});
 
 	const variables = Object.entries(ENV_SLOTS).filter(([name, spec]) => spec !== "secret" && name !== "AGX_PROFILE");
+	const isPlace = (spec: SlotSpec): boolean => typeof spec === "object" && spec.kind === "identifier" && spec.hexOk === true;
+	const placeVariables = variables.filter(([, spec]) => isPlace(spec)).map(([name]) => name);
+	const idVariables = variables.filter(([, spec]) => !isPlace(spec)).map(([name]) => name);
 
-	it("treats every environment variable that is not a secret or a profile name alike: a value that may hold a hash", () => {
-		expect(variables.map(([name]) => name).sort()).toEqual([
-			"AGX_DEBUG",
+	it("lets a hash through only the environment variables that hold a folder, a file or a URL", () => {
+		expect(placeVariables.sort()).toEqual([
+			"AGX_API_URL",
 			"AGX_ELLADEX_URL",
 			"AGX_HOME",
+			"AGX_RELAY",
+			"AGX_TAILSCALE_BINARY",
+			"AGX_TAILSCALE_OAUTH_API_BASE_URL",
+			"AGX_TAILSCALE_OAUTH_URL",
+			"AGX_TAILSCALE_STATE_DIR",
+		]);
+	});
+
+	it("keeps the ids and the flags among the environment variables as identifiers: a name, an id or a switch, never a place", () => {
+		expect(idVariables.sort()).toEqual([
+			"AGX_DEBUG",
 			"AGX_NO_BROWSER",
 			"AGX_ORG",
-			"AGX_RELAY",
 			"AGX_TAILSCALE",
-			"AGX_TAILSCALE_BINARY",
 			"AGX_TAILSCALE_HOSTNAME",
-			"AGX_TAILSCALE_OAUTH_API_BASE_URL",
 			"AGX_TAILSCALE_OAUTH_CLIENT_ID",
 			"AGX_TAILSCALE_OAUTH_SCOPE",
 			"AGX_TAILSCALE_OAUTH_TOKEN_AUTH",
-			"AGX_TAILSCALE_OAUTH_URL",
-			"AGX_TAILSCALE_STATE_DIR",
 			"AGX_TAILSCALE_TAGS",
 			"AGX_TAILSCALE_TAILNET",
 			"AGX_UI_DEV_STORE",
-			"AGX_API_URL",
-		].sort());
+		]);
 		for (const [name, spec] of variables) {
-			expect(typeof spec === "object" && spec.kind === "identifier" && spec.hexOk === true, name).toBe(true);
+			if (!placeVariables.includes(name)) {
+				expect(spec === "identifier" || (typeof spec === "object" && spec.kind === "identifier" && !spec.hexOk), name).toBe(true);
+			}
 		}
 	});
 
-	it.each(variables.map(([name]) => [name]))("%s: lets a run of 64 hex digits through on every command, and still refuses a key and the own key", async (name) => {
+	it.each(placeVariables.map((name) => [name]))("%s: lets a run of 64 hex digits through on every command, and still refuses a key and the own key", async (name) => {
 		const table: SlotTable = { go: { "<thing>": "freeText" } };
 		for (const value of places(STRANGER_HEX)) {
 			expect(await refusal(scratch(table, { [name]: value })(["go", "x"])), value.slice(0, 12)).toBeNull();
@@ -400,6 +410,17 @@ describe("a path, a URL and an environment variable: a content hash is normal th
 		const label = `The environment variable ${name}`;
 		expect(await refusal(scratch(table, { [name]: `/cache/${NSEC}` })(["go", "x"]))).toEqual({ message: KEY_TEXT(label), exitCode: 2 });
 		expect(await refusal(scratch(table, { [name]: `/cache/${OWN_HEX}` })(["go", "x"]))).toEqual({ message: OWN_TEXT(label), exitCode: 2 });
+	});
+
+	it.each(idVariables.map((name) => [name]))("%s: refuses a run of 64 hex digits on every command, like the option of the same name, and refuses a key and the own key", async (name) => {
+		const table: SlotTable = { go: { "<thing>": "freeText" } };
+		const label = `The environment variable ${name}`;
+		for (const value of [STRANGER_HEX, STRANGER_HEX.toUpperCase(), `a${STRANGER_HEX}`, `${STRANGER_HEX}0`]) {
+			expect(await refusal(scratch(table, { [name]: value })(["go", "x"])), value.slice(0, 12)).toEqual({ message: HEX_TEXT(label), exitCode: 2 });
+		}
+		expect(await refusal(scratch(table, { [name]: NSEC })(["go", "x"]))).toEqual({ message: KEY_TEXT(label), exitCode: 2 });
+		expect(await refusal(scratch(table, { [name]: OWN_HEX })(["go", "x"]))).toEqual({ message: HEX_TEXT(label), exitCode: 2 });
+		expect(await refusal(scratch(table, { [name]: "short" })(["go", "x"]))).toBeNull();
 	});
 
 	it("still refuses 64 hex digits as a profile name: AGX_PROFILE is a name, not a place", async () => {

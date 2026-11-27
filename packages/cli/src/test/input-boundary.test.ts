@@ -190,6 +190,10 @@ function refusedRows(): Row[] {
 		{ name: "AGX_PROFILE <hex>", args: ["config", "list"], env: { AGX_PROFILE: STRANGER_HEX }, message: HEX_RUN(variable("AGX_PROFILE")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		{ name: "domain list --org <hex>", args: ["domain", "list", "--org", STRANGER_HEX], message: HEX_RUN(option("--org", "domain list")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		{ name: "gateway key revoke <hex>", args: ["gateway", "key", "revoke", STRANGER_HEX], message: HEX_RUN(argument("<id>", "gateway key revoke")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
+		// an id or a switch in the environment is refused like the option of the same name, not let through as a place
+		{ name: "AGX_ORG <hex> (listing list)", args: ["listing", "list"], env: { AGX_ORG: STRANGER_HEX }, message: HEX_RUN(variable("AGX_ORG")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
+		{ name: "AGX_TAILSCALE_HOSTNAME <hex>", args: ["config", "list"], env: { AGX_TAILSCALE_HOSTNAME: STRANGER_HEX }, message: HEX_RUN(variable("AGX_TAILSCALE_HOSTNAME")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
+		{ name: "AGX_UI_DEV_STORE <hex>", args: ["config", "list"], env: { AGX_UI_DEV_STORE: STRANGER_HEX }, message: HEX_RUN(variable("AGX_UI_DEV_STORE")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 						// the profile's own secret key in a path or a URL, where a stranger's 64 hex digits are a hash
 		{ name: "tailscale up --state-dir <own hex>", args: ["tailscale", "up", "--state-dir", `/x/${OWN_HEX}`, "--auth-key", "tskey-auth-not-real"], message: OWN_KEY(option("--state-dir", "tailscale up")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
 		{ name: "tailscale up --state-dir </%own hex>", args: ["tailscale", "up", "--state-dir", `/x/%${OWN_HEX}`, "--auth-key", "tskey-auth-not-real"], message: OWN_KEY(option("--state-dir", "tailscale up")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
@@ -343,7 +347,6 @@ describe("a content hash in a folder, a file name or a URL", () => {
 	it.each([
 		["AGX_HOME", (home: string) => ({ AGX_HOME: join(home, HASH) })],
 		["AGX_TAILSCALE_STATE_DIR", (home: string) => ({ AGX_TAILSCALE_STATE_DIR: join(home, HASH, "ts") })],
-		["AGX_UI_DEV_STORE", (home: string) => ({ AGX_UI_DEV_STORE: join(home, HASH, "store.json") })],
 		["AGX_RELAY", () => ({ AGX_RELAY: `ws://127.0.0.1:9/${HASH}` })],
 		["AGX_API_URL", () => ({ AGX_API_URL: `http://127.0.0.1:9/${HASH}` })],
 		["AGX_ELLADEX_URL", () => ({ AGX_ELLADEX_URL: `https://elladex.example/${HASH}` })],
