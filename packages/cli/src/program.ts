@@ -1,4 +1,4 @@
-import { holdsHexKey } from "@nostr-agx/nostr";
+import { holdsHexRun } from "@nostr-agx/nostr";
 import { Command, CommanderError, Option } from "commander";
 import kleur from "kleur";
 import { cardCommand } from "./commands/card.js";
@@ -89,9 +89,15 @@ import { AGX_CLI_VERSION } from "./lib/version.js";
 const CATEGORY_HELP =
 	"category slug (repeatable): finance, sales, marketing, customer-support, hr, legal, operations, engineering, devops, data, research, productivity, communication, commerce, security";
 
-/** Printed instead of a parser error that quotes 64 hex digits: a secret key written as hex looks like a public key or an id. */
+/** A run of this many hex digits in a parser error is hidden: a key one or two digits short is a key after a few guesses. */
+const PARSER_HEX_DIGITS = 56;
+
+/** Printed instead of a parser error that quotes a long run of hex digits: a secret key written as hex looks like a public key or an id. */
 const PARSER_ERROR_WITH_HEX_RUN =
-	"error: the command line may contain a secret key (a 64-character hex string), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
+	"error: the command line may contain a secret key (a run of 56 or more hex digits), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
+
+/** Commander's "too many arguments" line: the part before the colon holds nothing that was typed, the words after it are what was typed. */
+const TOO_MANY_ARGUMENTS = /^(error: too many arguments for '[A-Za-z0-9 _-]+'\. Expected \d+ arguments? but got \d+): [\s\S]*\n$/;
 
 /** Printed instead of a parser error that quotes a secret key. */
 const PARSER_ERROR_WITH_SECRET_KEY =
@@ -100,6 +106,18 @@ const PARSER_ERROR_WITH_SECRET_KEY =
 /** Printed instead of ANY parser error of `identity import`: its argument can only be a secret, in any format (hex looks like a public key everywhere else). */
 const PARSER_ERROR_OF_IMPORT =
 	"error: `agx identity import` could not read its arguments, so they are not shown (they may hold a secret key). Usage: agx identity import [secret] [--stdin] [--force]; see `agx identity import --help`.\n";
+
+/** What the parser may print for `text`: the error as commander wrote it, unless it quotes a key. */
+function parserErrorToShow(text: string): string {
+	if (holdsSecretKey(text)) {
+		return PARSER_ERROR_WITH_SECRET_KEY;
+	}
+	if (!holdsHexRun(text, PARSER_HEX_DIGITS)) {
+		return text;
+	}
+	const tooMany = TOO_MANY_ARGUMENTS.exec(text);
+	return tooMany ? `${tooMany[1]}: the words may contain a secret key and are not shown.\n` : PARSER_ERROR_WITH_HEX_RUN;
+}
 
 /**
  * Build a fresh `agx` program. A factory, not a module-level singleton,
@@ -123,7 +141,7 @@ export function buildProgram(): Command {
 		writeOut,
 		writeErr,
 		outputError: (text, write) =>
-			write(holdsSecretKey(text) ? PARSER_ERROR_WITH_SECRET_KEY : holdsHexKey(text) ? PARSER_ERROR_WITH_HEX_RUN : text),
+			write(parserErrorToShow(text)),
 	});
 
 	program

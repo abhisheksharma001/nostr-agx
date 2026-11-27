@@ -156,9 +156,9 @@ describe("ordinary messages, help and exit codes do not change", () => {
 		const run = await agx(own.secretKeyHex);
 		expect(run.code).toBe(1);
 		expect(run.stderr.toLowerCase()).not.toContain(own.secretKeyHex);
-		// Any run of 64 hex digits in a parser error is replaced, so the net is not reached.
+		// Any run of 56 or more hex digits in a parser error is replaced, so the net is not reached.
 		expect(run.stderr).toBe(
-			"error: the command line may contain a secret key (a 64-character hex string), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n",
+			"error: the command line may contain a secret key (a run of 56 or more hex digits), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n",
 		);
 	});
 
