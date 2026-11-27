@@ -412,9 +412,17 @@ describe("the environment", () => {
 		expect(await refusal(scratch(table, { AGX_API_KEY: NSEC })(["go", "x"]))).toBeNull();
 	});
 
-	it("looks only at variables that are set and not empty", async () => {
+	it("lets an empty variable through, apart from a profile name", async () => {
 		expect(await refusal(scratch(table, { AGX_ORG: "" })(["go", "x"]))).toBeNull();
 		expect(await refusal(scratch(table, {})(["go", "x"]))).toBeNull();
+	});
+
+	it("refuses an empty AGX_PROFILE as a profile name: an empty name is the folder that holds every profile", async () => {
+		const result = await refusal(scratch(table, { AGX_PROFILE: "" })(["go", "x"]));
+		expect(result).toEqual({
+			message: 'The environment variable AGX_PROFILE is not a valid profile name (1 to 32 letters, digits, "-", "_" or "."; not "." or ".."), so it was not used and is not shown here.',
+			exitCode: 2,
+		});
 	});
 
 	it("applies the profile-name rule to AGX_PROFILE", async () => {

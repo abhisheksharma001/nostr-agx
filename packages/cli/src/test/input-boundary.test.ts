@@ -207,13 +207,14 @@ function refusedRows(): Row[] {
 		{ name: "thread <own hex> (a slot that takes ids)", args: ["thread", OWN_HEX], message: OWN_KEY(argument("<contextId>", "thread")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
 		{ name: "--profile <own hex>", args: ["--profile", OWN_HEX, "config", "list"], message: HEX_RUN("The value of `--profile`"), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
 		// profile names that are not one short folder name
-		...["../escape", "a/b", "/etc", "..", ".", "my profile", "work@acme", "a:b", "x".repeat(33), "é"].map((name) => ({
+		...["../escape", "a/b", "/etc", "..", ".", "my profile", "work@acme", "a:b", "x".repeat(33), "é", ""].map((name) => ({
 			name: `--profile ${JSON.stringify(name.length > 12 ? `${name.slice(0, 12)}…` : name)}`,
 			args: ["--profile", name, "identity", "new"],
 			message: NOT_A_NAME("The value of `--profile`"),
 			remediation: NAME_REMEDIATION,
 		})),
 		{ name: "config use <name with a slash>", args: ["config", "use", "a/b"], message: NOT_A_NAME(argument("<profile>", "config use")), remediation: NAME_REMEDIATION },
+		{ name: "AGX_PROFILE empty", args: ["config", "list"], env: { AGX_PROFILE: "" }, message: NOT_A_NAME(variable("AGX_PROFILE")), remediation: NAME_REMEDIATION },
 		{ name: "AGX_PROFILE <name with a space>", args: ["config", "list"], env: { AGX_PROFILE: "my profile" }, message: NOT_A_NAME(variable("AGX_PROFILE")), remediation: NAME_REMEDIATION },
 	];
 }
