@@ -178,9 +178,17 @@ is never logged.
   - The `agx` command line keeps its Tailscale state in its own per-run folder under `AGX_HOME`
     (`tailscale-runs/node-XXXXXX`) and removes it when the node stops, and also, as a last
     resort, when the process ends through `process.exit()`, an uncaught exception or an unhandled
-    rejection. That includes a second `Ctrl-C` while `agx serve` is still stopping. `agx serve`
-    handles `SIGINT` and `SIGTERM`, not `SIGHUP`: by Node's rules a `SIGHUP` ends it with no cleanup
-    and leaves that folder (checked for the library's own host process, not run through `agx serve`). A folder you name with `--state-dir` or in the profile is never removed.
+    rejection. That includes a second `Ctrl-C` while `agx serve` is still stopping. A folder you
+    name with `--state-dir` or in the profile is never removed. The `agx` folder is left behind in
+    these cases, because Node does not run the exit hook for them: `SIGKILL`; `SIGHUP`
+    (`agx serve` handles `SIGINT` and `SIGTERM` only; `SIGHUP` was sent to `agx serve` and to its
+    process group, and the folder was left); V8 running out of memory; `process.abort()` (the last
+    two from Node's documentation, not run); and a `Ctrl-C` or `SIGTERM` that reaches `agx serve`
+    while it is still starting, before it prints "watching for messages", because it installs its
+    two signal handlers only once the start is done (tried with a stand-in launcher that was
+    slow to report its address; `main` has the same order, so this is not new). With
+    the real launcher that window is the time it takes to join the tailnet. Delete `tailscale-runs/node-*`
+    folders under `AGX_HOME` that no running `agx` uses.
   - A `Ctrl-C` in a terminal reaches `agx serve` and the launcher it started together. If serve
     sees the launcher end first, it starts to stop and prints the launcher notice; the signal that
     reaches it a moment later is taken as that same `Ctrl-C`, so serve finishes the stop and exits
@@ -204,8 +212,16 @@ is never logged.
     bytes of `user:password`: a login of up to 10 bytes is in it in full, a longer one shows its
     first 10 bytes. Read in the source of v1.104.7 with `gh api` on 2026-11-27, and
     the format strings are also in the bundled macOS arm64 binary (read with `strings`, never run).
-    Not checked: the text of Go's own `invalid proxy address` error, which names the bad value and
-    is in the binary too. It cannot name a value with a login, because such a value is not passed.
+    Go's own error for a proxy address it cannot read, `invalid proxy address %q`
+    (`golang.org/x/net/http/httpproxy`, `proxy.go` line 163 at v0.60.0, the version in
+    `launcher/go.mod`), prints the raw value, login included; the skip above is what keeps a login
+    out of it. Read in the source with `gh api` on 2026-11-27, not run. The proxy variables are the
+    only proxy setting this package controls. On Synology Linux the Tailscale code also builds a proxy
+    address, with a login, from `/etc/proxy.conf` (`proxy_user`, `proxy_pwd`:
+    `net/tshttpproxy/tshttpproxy_synology.go` lines 102-105, wired in by `tshttpproxy_linux.go`
+    lines 21-23, v1.104.7; read with `gh api` on 2026-11-27, not run). Such a login
+    does not come from your environment, so it is not skipped; only the masking below covers it,
+    in the two shapes it is printed in. Windows has its own system proxy code that was not read.
   - *What is done to the launcher's stderr.* This package reads it and writes it to your stderr one
     whole line at a time, as a second layer. Replaced with `***`: what sits between `://` and `@`
     in any URL, the `(auth "...")` text of that CONNECT line, a `Proxy-Authorization` header (to the
@@ -216,7 +232,13 @@ is never logged.
     written as its first 65,536 characters, masked, followed by ` [line cut]`, and the rest of that line is dropped. The
     launcher's stdout is not forwarded: it carries only the SOCKS5 address, which this package reads
     and never prints. The masking cannot cover a login in your own environment, which anything that
-    can read your process's environment still sees.
+    can read your process's environment still sees. The masking knows the shapes the pinned
+    Tailscale code prints. Three shapes that code never prints still pass it unchanged: a URL
+    written with its slashes escaped for JSON (`http:\/\/user:pass@host`), a bare `user:pass@host`
+    with no `://` before it, and a loose `Basic` value of fewer than 8 base64 characters (a login of
+    about 4 bytes or less; the same login inside `(auth "...")` is masked). That is acceptable
+    because a proxy variable with a login is not passed on at all, and a login the system supplies
+    (the Synology file above) is printed only in the two shapes the masking covers.
   - *`TS_NO_LOGS_NO_SUPPORT`.* Tailscale reads it as a yes/no value and stops the whole launcher
     when it cannot read it. So the value is passed on only when it is one of `1`, `t`, `T`, `TRUE`,
     `true`, `True`, `0`, `f`, `F`, `FALSE`, `false`, `False`. Any other value is left out, with one
