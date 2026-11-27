@@ -64,6 +64,13 @@ describe("scanForSecrets and a Nostr secret key", () => {
 		["in capitals, behind nostr:", `nostr:${NSEC.toUpperCase()}`],
 		["with every character %xx-escaped", escapeAll(NSEC)],
 		["with every character %xx-escaped, in lower-case digits", escapeAll(NSEC).toLowerCase()],
+		// The key as written, followed by an escape that decodes to a word character: the scan found these
+		// before keys were read by the shared rule, and it still must.
+		["followed by an escaped underscore", `${NSEC}%5F`],
+		["followed by an escaped letter", `${NSEC}%62`],
+		["followed by an escaped digit", `${NSEC}%31`],
+		["followed by an escaped percent sign and a letter", `${NSEC}%2562`],
+		["in a URL, followed by an escaped underscore", `https://example.com/cb?key=${NSEC}%5Fbackup`],
 	])("flags an nsec1… %s, on its line, without quoting it", (_name, text) => {
 		const findings = scanForSecrets(`hello\n${text}\nbye`);
 		expect(findings).toEqual([{ kind: NSEC_KIND, line: 2 }]);
@@ -75,6 +82,7 @@ describe("scanForSecrets and a Nostr secret key", () => {
 		["in capitals", NCRYPTSEC.toUpperCase()],
 		["behind nostr:", `nostr:${NCRYPTSEC}`],
 		["with every character %xx-escaped", escapeAll(NCRYPTSEC)],
+		["followed by an escaped letter", `${NCRYPTSEC}%62`],
 	])("flags an encrypted key (ncryptsec1…) %s", (_name, text) => {
 		expect(scanForSecrets(`one\n${text}`)).toEqual([{ kind: NCRYPTSEC_KIND, line: 2 }]);
 	});

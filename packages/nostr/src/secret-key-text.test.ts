@@ -90,6 +90,15 @@ describe("secretKeyKinds (strict: for a warning the user can dismiss)", () => {
 		["both, whichever comes first", `${NCRYPTSEC} and ${NSEC}`, ["nsec", "ncryptsec"]],
 		["the same kind twice", `${NSEC} ${NSEC}`, ["nsec"]],
 		["a key with a typo in it (the data is still bech32)", `${NSEC.slice(0, 30)}q${NSEC.slice(31)}`, ["nsec"]],
+		// A key written as it is, followed by an escape that decodes to a letter, a digit or an underscore:
+		// the text as given still shows the key before a `%`, so it is flagged (the decoded text alone is not).
+		["a key followed by an escaped underscore", `${NSEC}%5F`, ["nsec"]],
+		["a key followed by an escaped letter", `${NSEC}%62`, ["nsec"]],
+		["a key followed by an escaped digit", `${NSEC}%31`, ["nsec"]],
+		["a key followed by an escaped percent sign and a letter", `${NSEC}%2562`, ["nsec"]],
+		["a key in capitals followed by an escaped letter", `${NSEC.toUpperCase()}%62`, ["nsec"]],
+		["a key in a URL, followed by an escaped underscore", `https://example.com/cb?key=${NSEC}%5Fbackup`, ["nsec"]],
+		["an ncryptsec1… followed by an escaped letter", `${NCRYPTSEC}%62`, ["ncryptsec"]],
 	])("finds %s", (_name, text, kinds) => {
 		expect(secretKeyKinds(text)).toEqual(kinds);
 	});
@@ -118,6 +127,15 @@ describe("secretKeyKinds (strict: for a warning the user can dismiss)", () => {
 		for (const text of ["%", "%zz", "%%41", `${String.fromCharCode(0xd800)}%41`]) {
 			expect(secretKeyKinds(text)).toEqual([]);
 		}
+	});
+
+	it("does not throw on one run of millions of key characters, and says what the prefix says", () => {
+		// A regular expression over a run this long runs out of stack in V8 (about 6 million characters). The
+		// answer then comes from the prefix alone, which cannot fail, so a long run is read as a key.
+		const run = "q".repeat(6_000_000);
+		expect(secretKeyKinds(`nsec1${run} `)).toEqual(["nsec"]);
+		expect(secretKeyKinds(`ncryptsec1${run} `)).toEqual(["ncryptsec"]);
+		expect(secretKeyKinds(`${run} `)).toEqual([]);
 	});
 });
 
