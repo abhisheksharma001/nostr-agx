@@ -11,7 +11,7 @@ const HEX = bytesToHex(pair.secretKey);
 const NSEC = nip19.nsecEncode(pair.secretKey);
 const NCRYPTSEC = encrypt(pair.secretKey, "throwaway-password", 4);
 const NPUB = nip19.npubEncode(pair.publicKey);
-const PUBKEY = bytesToHex(pair.publicKey);
+const PUBKEY = pair.publicKey;
 
 const MARK = "[redacted]";
 
