@@ -23,15 +23,15 @@ export interface HeldConfigLock {
 }
 
 /**
- * Another agx process that holds the config lock until a second writer is waiting for it, then
- * runs `mutation` on the parsed config.json (the variable `c`), writes it back and lets go. With no
- * `mutation` it only lets go. Resolves once the lock is held.
+ * Another agx process that holds the lock `lock` until a second writer is waiting for it, then
+ * runs `mutation` on the parsed JSON file `target` (the variable `c`), writes it back and lets go.
+ * With no `mutation` it only lets go. Resolves once the lock is held.
  *
  * A writer that waits has already made any read it did before asking for the lock, so what it
  * writes next is built from a copy that this change makes out of date. No timer decides the order,
  * so it comes out the same on an idle and on a heavily loaded machine.
  */
-export async function holdConfigLockUntilSomeoneWaits(mutation?: string): Promise<HeldConfigLock> {
+export async function holdLockUntilSomeoneWaits(lock: string, target: string, mutation?: string): Promise<HeldConfigLock> {
 	const script = [
 		'const fs = require("fs"), os = require("os"), path = require("path");',
 		"const [lock, config] = process.argv.slice(1);",
@@ -54,12 +54,12 @@ export async function holdConfigLockUntilSomeoneWaits(mutation?: string): Promis
 		"  else if (Date.now() > giveUpAt) { clearInterval(timer); finish(false); }",
 		"}, 5);",
 	].join("\n");
-	const child = spawn(process.execPath, ["-e", script, configLockFile(), configPath()], { stdio: "ignore" });
+	const child = spawn(process.execPath, ["-e", script, lock, target], { stdio: "ignore" });
 	const sawWaiter = new Promise<boolean>((resolve) => {
 		child.once("exit", (code) => resolve(code === 0));
 	});
 	const deadline = Date.now() + HELPER_START_MS;
-	while (!existsSync(configLockFile())) {
+	while (!existsSync(lock)) {
 		if (Date.now() > deadline) {
 			child.kill("SIGKILL");
 			throw new Error("the helper process never took the lock");
@@ -67,4 +67,9 @@ export async function holdConfigLockUntilSomeoneWaits(mutation?: string): Promis
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	return { child, sawWaiter };
+}
+
+/** The same, for the lock around config.json. */
+export function holdConfigLockUntilSomeoneWaits(mutation?: string): Promise<HeldConfigLock> {
+	return holdLockUntilSomeoneWaits(configLockFile(), configPath(), mutation);
 }
