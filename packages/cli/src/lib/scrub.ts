@@ -40,7 +40,30 @@ export function scrubOutput(text: string): string {
  * Typed `string` as `JSON.stringify` is, though it answers `undefined` for `undefined`.
  */
 export function scrubbedJson(value: unknown, space?: number): string {
-	return JSON.stringify(value, scrubValue, space);
+	try {
+		return JSON.stringify(value, scrubValue, space);
+	} catch {
+		// The walk rebuilds each object whose names changed, so a document about 3000 levels deep, or a circular
+		// one, can run it out of stack where `JSON.stringify` of the same document does not. Write the document
+		// as `JSON.stringify` would and scrub that text instead. If `JSON.stringify` cannot write it either
+		// (too deep, circular, a BigInt), it throws here, exactly as it always did.
+		return scrubWrittenJson(JSON.stringify(value, undefined, space));
+	}
+}
+
+/**
+ * The text of a JSON document with every key in it replaced. A key in a string or used as a name is
+ * replaced by the marker, which is safe in a string, so the text stays valid JSON. Names that scrub to
+ * the same text stay two entries here; the walk in {@link scrubbedJson} merges them.
+ */
+function scrubWrittenJson(text: string): string {
+	const scrubbed = scrubOutput(text);
+	if (scrubbed === text) {
+		return text;
+	}
+	// A line feed is written as a backslash and an `n`, and that `n` would start a match, leaving a lone
+	// backslash. Spell each one `\u000a` first: the same character, and no `n`.
+	return scrubOutput(text.replace(/\\([\s\S])/g, (pair, next: string) => (next === "n" ? "\\u000a" : pair)));
 }
 
 function scrubValue(_name: string, value: unknown): unknown {

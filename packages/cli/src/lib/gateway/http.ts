@@ -38,14 +38,19 @@ export async function readJson(req: IncomingMessage): Promise<unknown> {
 	}
 }
 
-/** Every body the gateway sends leaves here, with a secret key in it replaced (see `../scrub.ts`). */
+/**
+ * Every body the gateway sends leaves here, with a secret key in it replaced (see `../scrub.ts`).
+ * The whole text is built before the status line goes out: a body that cannot be written throws
+ * while nothing has been sent, so the caller can still answer with an error.
+ */
 export function sendJson(res: ServerResponse, status: number, body: unknown): void {
+	const text = body === undefined ? "" : scrubbedJson(body);
 	res.writeHead(status, {
 		"content-type": "application/json; charset=utf-8",
 		"cache-control": "no-store",
 		"x-content-type-options": "nosniff",
 	});
-	res.end(body === undefined ? "" : scrubbedJson(body));
+	res.end(text);
 }
 
 export function sendError(res: ServerResponse, error: ApiError): void {
