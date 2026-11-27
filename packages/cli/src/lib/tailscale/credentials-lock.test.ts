@@ -27,12 +27,13 @@ import { forgetTailscaleSecret, loadTailscaleSecret, saveTailscaleSecret } from 
 // that overlap each read the same old file, and the later write drops the earlier one's key, with both
 // exiting 0. These tests cover the lock that stops that.
 //
-// Only `fsyncSync` is wrapped (it does the real thing unless a test says otherwise): the file is written
-// to a temp file, flushed, and then renamed into place, so the flush is the point where a test can let
-// "another command" have its turn, between a save's read and its write.
+// Only `fsyncSync` and `unlinkSync` are wrapped (each does the real thing unless a test says otherwise).
+// A file is written to a temp file, flushed, and then renamed into place, so the flush is the point where
+// a test can let "another command" have its turn, between a save's read and its write. A forget removes the
+// file with `unlinkSync`, so that call is where a test can look at whether the lock is held.
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
-	return { ...actual, fsyncSync: vi.fn(actual.fsyncSync) };
+	return { ...actual, fsyncSync: vi.fn(actual.fsyncSync), unlinkSync: vi.fn(actual.unlinkSync) };
 });
 
 const KEY = "tskey-auth-k1234567890CNTRL-abcdefghijklmnop";
@@ -42,17 +43,22 @@ const FROZEN = "2026-11-27T05:00:00.000Z";
 
 let box: ReturnType<typeof sandbox>;
 let realFsync: (fd: number) => void;
+let realUnlink: (path: fs.PathLike) => void;
 const children: ChildProcess[] = [];
 let held: HeldConfigLock | undefined;
 
 beforeEach(async () => {
 	box = sandbox();
-	realFsync = (await vi.importActual<typeof import("node:fs")>("node:fs")).fsyncSync;
+	const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+	realFsync = actual.fsyncSync;
+	realUnlink = actual.unlinkSync;
 });
 
 afterEach(() => {
 	vi.mocked(fs.fsyncSync).mockReset();
 	vi.mocked(fs.fsyncSync).mockImplementation(realFsync);
+	vi.mocked(fs.unlinkSync).mockReset();
+	vi.mocked(fs.unlinkSync).mockImplementation(realUnlink);
 	held?.child.kill("SIGKILL");
 	held = undefined;
 	for (const child of children.splice(0)) {
@@ -494,6 +500,24 @@ describe("forgetting the Tailscale secrets", () => {
 		expect(forgetTailscaleSecret("default")).toBe(true);
 		expect(existsSync(secretsFile())).toBe(false);
 		expect(forgetTailscaleSecret("default")).toBe(false);
+		expect(profileFiles()).toEqual([]);
+	});
+
+	it("removes the file while this process holds the lock, so a save cannot put the old key back", () => {
+		saveTailscaleSecret("default", { authKey: KEY });
+		// The pid in the lock file at the moment the secrets file is removed: null when there is no lock file.
+		const lockHolderAtRemoval: Array<number | null> = [];
+		vi.mocked(fs.unlinkSync).mockImplementation((path) => {
+			if (path === secretsFile()) {
+				lockHolderAtRemoval.push(existsSync(lockFile()) ? JSON.parse(readFileSync(lockFile(), "utf8")).pid : null);
+			}
+			realUnlink(path);
+		});
+
+		expect(forgetTailscaleSecret("default")).toBe(true);
+
+		expect(lockHolderAtRemoval).toEqual([process.pid]);
+		expect(existsSync(secretsFile())).toBe(false);
 		expect(profileFiles()).toEqual([]);
 	});
 
