@@ -239,16 +239,13 @@ describe("scrubbedJson on a very deep document", () => {
 	});
 
 	it("writes two names that are keys in one object as two entries, which JSON.parse reads as one", () => {
-		// The walk of a shallow document merges names that scrub to the same text; the text scrub of a deep one cannot.
-		let doc: unknown = 1;
-		for (let i = 0; i < DEEP; i++) {
-			doc = { [NSEC]: doc, [NCRYPTSEC]: 2 };
-		}
-		const text = scrubbedJson(doc) as string;
-		expect(text.split(`"${REDACTED}":`).length - 1).toBe(2 * DEEP);
+		// The walk of a shallow document merges names that scrub to the same text (the later one wins);
+		// the text scrub of a deep one cannot, and leaves both in the text.
+		const text = scrubbedJson(nested(DEEP, NSEC, { [NSEC]: 1, [NCRYPTSEC]: 2 })) as string;
+		expect(text.split(`"${REDACTED}":`).length - 1).toBe(DEEP + 2);
 		expect(text).not.toContain(NSEC.slice(5, 25));
 		expect(text).not.toContain(NCRYPTSEC.slice(10, 30));
-		expect(Object.keys(JSON.parse(text) as object)).toEqual([REDACTED]);
+		expect(descend(JSON.parse(text))).toMatchObject({ levels: DEEP + 1, leaf: 2 });
 	});
 
 	it("writes a deep document with no key in it exactly as JSON.stringify does", () => {
