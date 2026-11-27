@@ -1,5 +1,4 @@
 import { existsSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
 import { z } from "zod";
 import { assertFileLockHeld, withFileLock } from "./config-lock.js";
 import { configError } from "./errors.js";
@@ -106,8 +105,8 @@ export const fileCredentialStore: CredentialStore = {
 	},
 	remove(profile) {
 		const path = credentialsPath();
-		// No home folder, no file: nothing to remove, and the lock would make the folder.
-		if (!existsSync(dirname(path))) {
+		// Nothing to remove: no lock, no write and no folder made. Looked at again once the lock is held.
+		if (!readCredentialsFile().profiles[profile]) {
 			return false;
 		}
 		return withFileLock(path, CREDENTIALS_LOCK, () => {
