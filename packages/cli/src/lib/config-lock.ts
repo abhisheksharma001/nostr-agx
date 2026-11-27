@@ -75,10 +75,10 @@ function isAlive(pid: number): boolean {
 }
 
 /**
- * True when nobody is holding the lock: a holder that has exited, one nobody refreshed for too long,
- * or a file that has stayed unreadable. Only meaningful for a file that exists. A file that has just
- * vanished was released, not abandoned, so it is never judged abandoned (that mistake let two
- * writers hold the lock at once).
+ * True when nobody is holding the lock: a holder that has exited, a lock file older than the stale age
+ * (nothing refreshes a lock file, so its age is the time since it was made), or a file that has stayed
+ * unreadable. Only meaningful for a file that exists. A file that has just vanished was released, not
+ * abandoned, so it is never judged abandoned (that mistake let two writers hold the lock at once).
  */
 function abandoned(path: string, record: LockRecord | null): boolean {
 	let age: number;
