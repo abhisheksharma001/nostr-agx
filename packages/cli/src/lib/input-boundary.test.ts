@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hexToBytes } from "@nostr-agx/nostr";
@@ -8,10 +8,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildProgram } from "../program.js";
 import { capture, sandbox } from "../test/helpers.js";
 import { walkProgram } from "../test/canary-kit.js";
+import { getProfile, saveProfile } from "./config.js";
 import { AgxCliError } from "./errors.js";
 import { createIdentity, saveIdentity } from "./identity.js";
 import { checkInputs, isValidProfileName, PROFILE_NAME_MAX } from "./input-boundary.js";
-import { ENV_SLOTS, SLOTS, type SlotTable } from "./input-slots.js";
+import { ENV_SLOTS, SLOTS, type SlotSpec, type SlotTable } from "./input-slots.js";
+import { configPath, identityPath } from "./paths.js";
 
 // The slot table says what kind of value each input of each command takes, and the check
 // that runs after the parser and before any command refuses a secret key in a slot that
@@ -33,6 +35,28 @@ beforeEach(() => {
 afterEach(() => {
 	box.restore();
 });
+
+/** The slots that take the id of a thread, which a peer chooses and may make the 64 hex digits of an event id. */
+const THREAD_ID_SLOTS: Array<[string, string]> = [
+	["inbox", "--thread"],
+	["send", "--context-id"],
+	["thread", "<contextId>"],
+];
+/** The slots that take a path or a URL, where a content hash in a folder or file name is normal. */
+const LOCATION_SLOTS: Array<[string, string]> = [
+	["card", "--relay"],
+	["listing create", "--relay"],
+	["login", "--api-base-url"],
+	["org create", "--api-base-url"],
+	["serve", "--handler"],
+	["tailscale enable", "--oauth-api-base-url"],
+	["tailscale enable", "--oauth-url"],
+	["tailscale enable", "--state-dir"],
+	["tailscale up", "--state-dir"],
+	["ui", "--compose"],
+	["ui", "--dev-store"],
+	["ui", "--drafts"],
+];
 
 // ------------------------------------------------------------------ the table is complete
 
@@ -119,7 +143,7 @@ describe("the slot table", () => {
 		expect(allowed.sort()).toEqual(["request --payload", "send --subject", "send <message>", "serve --reply-text"]);
 	});
 
-	it("lets a 64-digit run through only where a peer may choose the id: three thread-id slots", () => {
+	it("lets a 64-digit run through only where a peer may choose the id (three thread-id slots) or the value is a path or a URL (twelve)", () => {
 		const hexOk: string[] = [];
 		for (const [command, entry] of Object.entries(SLOTS)) {
 			for (const [slot, spec] of Object.entries(entry)) {
@@ -128,7 +152,12 @@ describe("the slot table", () => {
 				}
 			}
 		}
-		expect(hexOk.sort()).toEqual(["inbox --thread", "send --context-id", "thread <contextId>"]);
+		expect(hexOk.sort()).toEqual(
+			[
+				...THREAD_ID_SLOTS.map(([command, slot]) => `${command} ${slot}`),
+				...LOCATION_SLOTS.map(([command, slot]) => `${command} ${slot}`),
+			].sort(),
+		);
 	});
 
 	it("takes the three profile-name slots through the profile-name rule", () => {
@@ -306,6 +335,79 @@ describe("a value in a slot of each kind", () => {
 	});
 });
 
+describe("a path, a URL and an environment variable: a content hash is normal there", () => {
+	/** The table entry of a real slot, put in the small program as `--where`. */
+	const real = (command: string, slot: string): SlotTable => ({ go: { "<thing>": "freeText", "--where": (SLOTS[command] as Record<string, SlotSpec>)[slot] as SlotSpec } });
+	const asArgs = (value: string): string[] => ["go", "fine", "--where", value];
+	const places = (hex: string): string[] => [`/cache/${hex}/ts`, `./${hex}.mjs`, `wss://relay.example.com/${hex}`, `${hex}`, hex.toUpperCase()];
+
+	it.each(LOCATION_SLOTS)("%s %s lets a run of 64 hex digits through, in a folder, a file name or a URL", async (command, slot) => {
+		for (const value of places(STRANGER_HEX)) {
+			expect(await refusal(scratch(real(command, slot))(asArgs(value))), value.slice(0, 12)).toBeNull();
+		}
+	});
+
+	it.each(LOCATION_SLOTS)("%s %s still refuses a key, and the profile's own key written as 64 hex digits", async (command, slot) => {
+		for (const value of [NSEC, `/cache/${NSEC}/ts`, `nostr:${NSEC}`, `ncryptsec1${"q".repeat(40)}`]) {
+			expect(await refusal(scratch(real(command, slot))(asArgs(value))), value.slice(0, 12)).toEqual({ message: KEY_TEXT(OPTION), exitCode: 2 });
+		}
+		for (const value of [...places(OWN_HEX), `/tmp/%${OWN_HEX}`, `/cache/${OWN_HEX}${OWN_HEX}`]) {
+			expect(await refusal(scratch(real(command, slot))(asArgs(value))), value.slice(0, 12)).toEqual({ message: OWN_TEXT(OPTION), exitCode: 2 });
+		}
+	});
+
+	it("still refuses 64 hex digits in an identifier that is not a path or a URL: a name, an organization, a tag, a slug", async () => {
+		for (const [command, slot] of [["org create", "--slug"], ["domain list", "--org"], ["listing create", "--tag"], ["gateway key revoke", "<id>"], ["tailscale up", "--hostname"]]) {
+			const result = await refusal(scratch(real(command as string, slot as string))(asArgs(STRANGER_HEX)));
+			expect(result, `${command} ${slot}`).toEqual({ message: HEX_TEXT(OPTION), exitCode: 2 });
+		}
+	});
+
+	const variables = Object.entries(ENV_SLOTS).filter(([name, spec]) => spec !== "secret" && name !== "AGX_PROFILE");
+
+	it("treats every environment variable that is not a secret or a profile name alike: a value that may hold a hash", () => {
+		expect(variables.map(([name]) => name).sort()).toEqual([
+			"AGX_DEBUG",
+			"AGX_ELLADEX_URL",
+			"AGX_HOME",
+			"AGX_NO_BROWSER",
+			"AGX_ORG",
+			"AGX_RELAY",
+			"AGX_TAILSCALE",
+			"AGX_TAILSCALE_BINARY",
+			"AGX_TAILSCALE_HOSTNAME",
+			"AGX_TAILSCALE_OAUTH_API_BASE_URL",
+			"AGX_TAILSCALE_OAUTH_CLIENT_ID",
+			"AGX_TAILSCALE_OAUTH_SCOPE",
+			"AGX_TAILSCALE_OAUTH_TOKEN_AUTH",
+			"AGX_TAILSCALE_OAUTH_URL",
+			"AGX_TAILSCALE_STATE_DIR",
+			"AGX_TAILSCALE_TAGS",
+			"AGX_TAILSCALE_TAILNET",
+			"AGX_UI_DEV_STORE",
+			"AGX_API_URL",
+		].sort());
+		for (const [name, spec] of variables) {
+			expect(typeof spec === "object" && spec.kind === "identifier" && spec.hexOk === true, name).toBe(true);
+		}
+	});
+
+	it.each(variables.map(([name]) => [name]))("%s: lets a run of 64 hex digits through on every command, and still refuses a key and the own key", async (name) => {
+		const table: SlotTable = { go: { "<thing>": "freeText" } };
+		for (const value of places(STRANGER_HEX)) {
+			expect(await refusal(scratch(table, { [name]: value })(["go", "x"])), value.slice(0, 12)).toBeNull();
+		}
+		const label = `The environment variable ${name}`;
+		expect(await refusal(scratch(table, { [name]: `/cache/${NSEC}` })(["go", "x"]))).toEqual({ message: KEY_TEXT(label), exitCode: 2 });
+		expect(await refusal(scratch(table, { [name]: `/cache/${OWN_HEX}` })(["go", "x"]))).toEqual({ message: OWN_TEXT(label), exitCode: 2 });
+	});
+
+	it("still refuses 64 hex digits as a profile name: AGX_PROFILE is a name, not a place", async () => {
+		const result = await refusal(scratch({ go: { "<thing>": "freeText" } }, { AGX_PROFILE: STRANGER_HEX })(["go", "x"]));
+		expect(result).toEqual({ message: HEX_TEXT("The environment variable AGX_PROFILE"), exitCode: 2 });
+	});
+});
+
 describe("the profile's own key", () => {
 	const table = (kind: "publicKey" | "identifier" | "freeText"): SlotTable => ({ go: { "<thing>": "freeText", "--where": kind } });
 	const asArgs = (value: string): string[] => ["go", "fine", "--where", value];
@@ -351,6 +453,28 @@ describe("the profile's own key", () => {
 		process.env.AGX_PROFILE = "../escape";
 		expect(existsSync(join(box.home, "escape", "identity.json"))).toBe(true);
 		expect(await refusal(scratch(table("publicKey"))(asArgs(outside.secretKeyHex)))).toBeNull();
+	});
+
+	it("is refused as an npub that carries the same bytes even with spaces around it", async () => {
+		expect(await refusal(scratch(table("publicKey"))(asArgs(`  ${npubOfOwnBytes}  `)))).toEqual({ message: OWN_TEXT(OPTION), exitCode: 2 });
+		expect(await refusal(scratch(table("publicKey"))(asArgs(` ${mine.npub} `)))).toBeNull();
+	});
+
+	it("is found behind a percent sign that decoding would take for the start of an escape", async () => {
+		expect(await refusal(scratch(table("freeText"))(asArgs(`%${OWN_HEX}`)))).toEqual({ message: OWN_TEXT(OPTION), exitCode: 2 });
+		expect(await refusal(scratch(table("freeText"))(asArgs(`/tmp/%${OWN_HEX}`)))).toEqual({ message: OWN_TEXT(OPTION), exitCode: 2 });
+	});
+
+	it("is not known, and the check says nothing, when identity.json cannot be read: the command reports its own error", async () => {
+		writeFileSync(identityPath("default"), "{ this is not json");
+		expect(await refusal(scratch(table("publicKey"))(asArgs(OWN_HEX)))).toBeNull();
+		expect(await refusal(scratch(table("publicKey"))(asArgs(STRANGER_HEX)))).toBeNull();
+	});
+
+	it("is not known, and the check says nothing, when config.json cannot be read", async () => {
+		writeFileSync(configPath(), "{ this is not json");
+		expect(await refusal(scratch(table("publicKey"))(asArgs(OWN_HEX)))).toBeNull();
+		expect(await refusal(scratch(table("identifier"))(asArgs(NSEC)))).toEqual({ message: KEY_TEXT(OPTION), exitCode: 2 });
 	});
 
 	it("is the key of the profile that the command would use: --profile first, then AGX_PROFILE, then the stored one", async () => {
@@ -440,6 +564,86 @@ describe("the environment", () => {
 			exitCode: 2,
 		});
 		expect(await refusal(scratch(table, { AGX_PROFILE: "work" })(["go", "x"]))).toBeNull();
+	});
+
+	const named: SlotTable = { "(program)": { "--profile": { kind: "identifier", profileName: true } }, go: { "<thing>": "freeText" } };
+
+	it.each([
+		["an empty text", ""],
+		["a name with a space", "my profile"],
+		["a secret key", NSEC],
+		["64 hex digits", STRANGER_HEX],
+	])("does not look at AGX_PROFILE when --profile names the profile: %s is never used then", async (_name, value) => {
+		expect(await refusal(scratch(named, { AGX_PROFILE: value })(["--profile", "work", "go", "x"]))).toBeNull();
+		expect(await refusal(scratch(named, { AGX_PROFILE: value })(["-p", "work", "go", "x"]))).toBeNull();
+	});
+
+	it("still refuses AGX_PROFILE when no --profile is typed, and still refuses the flag itself", async () => {
+		const notAName = (label: string): string =>
+			`${label} is not a valid profile name (1 to 32 letters, digits, "-", "_" or "."; not "." or ".."), so it was not used and is not shown here.`;
+		expect(await refusal(scratch(named, { AGX_PROFILE: "" })(["go", "x"]))).toEqual({ message: notAName("The environment variable AGX_PROFILE"), exitCode: 2 });
+		expect(await refusal(scratch(named, { AGX_PROFILE: "work" })(["--profile", "a b", "go", "x"]))).toEqual({ message: notAName("The value of `--profile`"), exitCode: 2 });
+	});
+});
+
+describe("a profile that is already stored", () => {
+	const profileTable: SlotTable = {
+		"(program)": { "--profile": { kind: "identifier", profileName: true } },
+		go: { "<thing>": { kind: "identifier", profileName: true }, "--where": "publicKey" },
+	};
+	const notAName = (label: string): string =>
+		`${label} is not a valid profile name (1 to 32 letters, digits, "-", "_" or "."; not "." or ".."), so it was not used and is not shown here.`;
+	const FLAG = "The value of `--profile`";
+	const POSITIONAL = "The `<thing>` argument (agx go)";
+
+	it("can be named again, whatever its name holds, when it is a folder or a name in config.json that is one folder name", async () => {
+		saveIdentity("my profile", createIdentity());
+		saveIdentity("x".repeat(40), createIdentity());
+		saveProfile("only in config.json", getProfile("only in config.json"));
+		for (const name of ["my profile", "x".repeat(40), "only in config.json"]) {
+			expect(await refusal(scratch(profileTable)(["--profile", name, "go", "x"])), name).toBeNull();
+			expect(await refusal(scratch(profileTable)(["go", name])), name).toBeNull();
+		}
+		expect(await refusal(scratch(profileTable, { AGX_PROFILE: "my profile" })(["go", "x"]))).toBeNull();
+	});
+
+	it("does not let another name through: a new profile must have a name that is one short folder name", async () => {
+		saveIdentity("my profile", createIdentity());
+		for (const name of ["my profile 2", "my profile ", "My Profile", "my  profile"]) {
+			expect(await refusal(scratch(profileTable)(["--profile", name, "go", "x"])), name).toEqual({ message: notAName(FLAG), exitCode: 2 });
+			expect(await refusal(scratch(profileTable)(["go", name])), name).toEqual({ message: notAName(POSITIONAL), exitCode: 2 });
+		}
+		expect(await refusal(scratch(profileTable, { AGX_PROFILE: "my profile 2" })(["go", "x"]))).toEqual({
+			message: notAName("The environment variable AGX_PROFILE"),
+			exitCode: 2,
+		});
+	});
+
+	it("is not let through when its name holds a slash, a backslash, a dot name, a key or 64 hex digits", async () => {
+		saveIdentity("a/b", createIdentity());
+		saveIdentity("a\\b", createIdentity());
+		saveIdentity(NSEC, createIdentity());
+		saveIdentity(STRANGER_HEX, createIdentity());
+		for (const [name, message] of [
+			["a/b", notAName(FLAG)],
+			["a\\b", notAName(FLAG)],
+			["..", notAName(FLAG)],
+			[".", notAName(FLAG)],
+			["../escape", notAName(FLAG)],
+			[NSEC, KEY_TEXT(FLAG)],
+			[STRANGER_HEX, HEX_TEXT(FLAG)],
+		] as const) {
+			expect(await refusal(scratch(profileTable)(["--profile", name, "go", "x"])), name.slice(0, 6)).toEqual({ message, exitCode: 2 });
+		}
+	});
+
+	it("has its own key refused where a public key belongs, as any profile's key is", async () => {
+		const other = createIdentity();
+		saveIdentity("my profile", other);
+		const own = { message: OWN_TEXT(OPTION), exitCode: 2 };
+		expect(await refusal(scratch(profileTable)(["--profile", "my profile", "go", "x", "--where", other.secretKeyHex]))).toEqual(own);
+		expect(await refusal(scratch(profileTable)(["--profile", "my profile", "go", "x", "--where", OWN_HEX]))).toBeNull();
+		expect(await refusal(scratch(profileTable)(["--profile", "my profile", "go", "x", "--where", other.publicKey]))).toBeNull();
 	});
 });
 

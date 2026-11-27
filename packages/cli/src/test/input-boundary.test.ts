@@ -6,6 +6,7 @@ import { join, relative } from "node:path";
 import { hexToBytes, toNpub } from "@nostr-agx/nostr";
 import { nip19 } from "nostr-tools";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getProfile, saveProfile } from "../lib/config.js";
 import { createIdentity, saveIdentity } from "../lib/identity.js";
 import { setStdinForTests } from "../lib/stdin.js";
 import { agx, sandbox } from "./helpers.js";
@@ -189,8 +190,15 @@ function refusedRows(): Row[] {
 		{ name: "AGX_PROFILE <hex>", args: ["config", "list"], env: { AGX_PROFILE: STRANGER_HEX }, message: HEX_RUN(variable("AGX_PROFILE")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		{ name: "domain list --org <hex>", args: ["domain", "list", "--org", STRANGER_HEX], message: HEX_RUN(option("--org", "domain list")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		{ name: "gateway key revoke <hex>", args: ["gateway", "key", "revoke", STRANGER_HEX], message: HEX_RUN(argument("<id>", "gateway key revoke")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
-		{ name: "tailscale up --state-dir <hex>", args: ["tailscale", "up", "--state-dir", `/x/${STRANGER_HEX}`, "--auth-key", "tskey-auth-not-real"], message: HEX_RUN(option("--state-dir", "tailscale up")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
-		{ name: "AGX_ORG <hex>", args: ["config", "list"], env: { AGX_ORG: STRANGER_HEX.toUpperCase() }, message: HEX_RUN(variable("AGX_ORG")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
+						// the profile's own secret key in a path or a URL, where a stranger's 64 hex digits are a hash
+		{ name: "tailscale up --state-dir <own hex>", args: ["tailscale", "up", "--state-dir", `/x/${OWN_HEX}`, "--auth-key", "tskey-auth-not-real"], message: OWN_KEY(option("--state-dir", "tailscale up")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
+		{ name: "tailscale up --state-dir </%own hex>", args: ["tailscale", "up", "--state-dir", `/x/%${OWN_HEX}`, "--auth-key", "tskey-auth-not-real"], message: OWN_KEY(option("--state-dir", "tailscale up")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
+		{ name: "card --relay <own hex>", args: ["card", FRIEND, "--relay", `ws://127.0.0.1:9/${OWN_HEX}`], message: OWN_KEY(option("--relay", "card")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
+		{ name: "AGX_TAILSCALE_STATE_DIR <own hex>", args: ["config", "list"], env: { AGX_TAILSCALE_STATE_DIR: `/tmp/${OWN_HEX}` }, message: OWN_KEY(variable("AGX_TAILSCALE_STATE_DIR")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
+		{ name: "AGX_RELAY <own hex>", args: ["config", "list"], env: { AGX_RELAY: `ws://127.0.0.1:9/${OWN_HEX.toUpperCase()}` }, message: OWN_KEY(variable("AGX_RELAY")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
+		{ name: "AGX_ORG <own hex>", args: ["config", "list"], env: { AGX_ORG: OWN_HEX }, message: OWN_KEY(variable("AGX_ORG")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
+		// an option of a command that has subcommands, typed before the subcommand
+		keyed("gateway --host (typed before `key list`)", ["gateway", "--host", NSEC, "key", "list"], option("--host", "gateway")),
 		// the profile's own secret key where a public key, an id or text belongs
 		{ name: "card <own hex>", args: ["card", OWN_HEX], message: OWN_KEY(argument("<peer>", "card")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX, OWN_NPUB_OF_SECRET] },
 		{ name: "card <own hex in capitals>", args: ["card", OWN_HEX.toUpperCase()], message: OWN_KEY(argument("<peer>", "card")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX, OWN_NPUB_OF_SECRET] },
@@ -326,6 +334,111 @@ describe("what still goes through", () => {
 		const set = await agx("config", "set", "org", "Acme Corp");
 		expect(set.code).toBe(0);
 		expect(set.stdout).toBe('✓ Set org on profile "default".\n');
+	});
+});
+
+describe("a content hash in a folder, a file name or a URL", () => {
+	const HASH = createHash("sha256").update("a lock file").digest("hex");
+
+	it.each([
+		["AGX_HOME", (home: string) => ({ AGX_HOME: join(home, HASH) })],
+		["AGX_TAILSCALE_STATE_DIR", (home: string) => ({ AGX_TAILSCALE_STATE_DIR: join(home, HASH, "ts") })],
+		["AGX_UI_DEV_STORE", (home: string) => ({ AGX_UI_DEV_STORE: join(home, HASH, "store.json") })],
+		["AGX_RELAY", () => ({ AGX_RELAY: `ws://127.0.0.1:9/${HASH}` })],
+		["AGX_API_URL", () => ({ AGX_API_URL: `http://127.0.0.1:9/${HASH}` })],
+		["AGX_ELLADEX_URL", () => ({ AGX_ELLADEX_URL: `https://elladex.example/${HASH}` })],
+		["AGX_TAILSCALE_BINARY", (home: string) => ({ AGX_TAILSCALE_BINARY: join(home, HASH, "tailscale") })],
+	])("%s: every command still runs", async (_name, make) => {
+		Object.assign(process.env, make(box.home));
+		const run = await agx("config", "list");
+		expect(run.code).toBe(0);
+		expect(run.stderr).toBe("");
+	});
+
+	it("takes the hash in the state folder of `tailscale enable` and in a relay URL of `card`", async () => {
+		const enable = await agx("tailscale", "enable", "--no-up", "--auth-key", "tskey-auth-throwaway", "--state-dir", join(box.home, HASH, "ts"));
+		expect(enable.code).toBe(0);
+		expect(enable.stderr).not.toContain("was not used");
+		for (const args of [
+			["card", FRIEND, "--relay", `ws://127.0.0.1:9/${HASH}`],
+		]) {
+			const run = await agx(...args);
+			expect(run.stderr, args.slice(0, 2).join(" ")).not.toContain("was not used");
+		}
+	});
+
+	it("still refuses a key shape and the profile's own key in the same places", async () => {
+		const state = await agx("tailscale", "enable", "--no-up", "--auth-key", "tskey-auth-throwaway", "--state-dir", join(box.home, NSEC, "ts"));
+		expect(state.code).toBe(2);
+		expect(state.stderr).toContain("holds a secret key");
+		const own = await agx("tailscale", "enable", "--no-up", "--auth-key", "tskey-auth-throwaway", "--state-dir", join(box.home, OWN_HEX, "ts"));
+		expect(own.code).toBe(2);
+		expect(own.stderr).toContain("holds this profile's own secret key");
+		expect(own.stderr).not.toContain(OWN_HEX);
+	});
+});
+
+describe("AGX_PROFILE and --profile", () => {
+	it.each([
+		["an empty text", ""],
+		["a name with a space", "my profile"],
+		["a secret key", NSEC],
+		["64 hex digits", STRANGER_HEX],
+	])("a --profile typed on the command line wins, so AGX_PROFILE set to %s is never used and is not looked at", async (_name, value) => {
+		process.env.AGX_PROFILE = value;
+		const run = await agx("--profile", "work", "config", "list");
+		expect(run.code).toBe(0);
+		expect(run.stderr).toBe("");
+	});
+
+	it("an empty AGX_PROFILE alone is still refused: the empty name is the folder that holds every profile", async () => {
+		process.env.AGX_PROFILE = "";
+		const run = await agx("config", "list");
+		expect(run.code).toBe(2);
+		expect(run.stderr).toBe(`\n✗ ${NOT_A_NAME(variable("AGX_PROFILE"))}\n\n  ${NAME_REMEDIATION}\n\n`);
+	});
+});
+
+describe("a profile that is already stored and has a name the rule does not allow", () => {
+	/** Made the way an older build made it: the folder, the identity and the name in config.json. */
+	function storedBefore(name: string): void {
+		saveIdentity(name, createIdentity());
+		saveProfile(name, getProfile(name));
+	}
+
+	it("can be chosen again with config use, --profile and AGX_PROFILE, after another profile became the current one", async () => {
+		await agx("config", "use", "default");
+		storedBefore("my profile");
+		const use = await agx("config", "use", "my profile");
+		expect(use.code).toBe(0);
+		expect((await agx("config", "use", "default")).code).toBe(0);
+		const flag = await agx("--profile", "my profile", "identity", "show");
+		expect(flag.code).toBe(0);
+		expect(flag.stdout).toContain("my profile");
+		process.env.AGX_PROFILE = "my profile";
+		const env = await agx("identity", "show");
+		expect(env.code).toBe(0);
+		expect(env.stdout).toContain("my profile");
+	});
+
+	it("does not let a new profile be made with a name like it", async () => {
+		storedBefore("my profile");
+		for (const name of ["my other profile", "my profile "]) {
+			const run = await agx("--profile", name, "identity", "new");
+			expect(run.code, name).toBe(2);
+			expect(existsSync(join(box.home, "profiles", name))).toBe(false);
+		}
+	});
+
+	it("is refused when its name holds a key shape, 64 hex digits or a slash", async () => {
+		storedBefore(NSEC);
+		storedBefore(STRANGER_HEX);
+		storedBefore("a/b");
+		for (const name of [NSEC, STRANGER_HEX, "a/b"]) {
+			const run = await agx("config", "use", name);
+			expect(run.code, name.slice(0, 6)).toBe(2);
+			expect(run.stderr).not.toContain(name);
+		}
 	});
 });
 
