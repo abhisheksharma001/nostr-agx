@@ -199,9 +199,9 @@ function acquire(file: string, label: string, waitMs: number): { token: string; 
 					throw error;
 				}
 			}
-			const held = look(path);
-			if (held.exists && abandoned(path, held.record) && Date.now() < deadline) {
-				clearUnderBreaker(path, held.record);
+			const seen = look(path);
+			if (seen.exists && abandoned(path, seen.record) && Date.now() < deadline) {
+				clearUnderBreaker(path, seen.record);
 				pause(1);
 				continue;
 			}
@@ -212,7 +212,7 @@ function acquire(file: string, label: string, waitMs: number): { token: string; 
 				);
 			}
 			// The lock was released between our link attempt and our look: try again at once.
-			pause(held.exists ? POLL_MS : 1);
+			pause(seen.exists ? POLL_MS : 1);
 		}
 	} finally {
 		rmSync(mine, { force: true });
