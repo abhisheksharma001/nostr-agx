@@ -20,6 +20,14 @@ vi.mock("../lib/input-boundary.js", async (importOriginal) => ({
 	checkInputs: () => undefined,
 }));
 
+// One test below switches off the parser's own hex branch (the run of hex digits that replaces a
+// parser error), to show the net behind it still holds. The flag is off for every other test.
+const parserHexBranch = vi.hoisted(() => ({ off: false }));
+vi.mock("@nostr-agx/nostr", async (importOriginal) => {
+	const real = await importOriginal<typeof import("@nostr-agx/nostr")>();
+	return { ...real, holdsHexRun: (text: string, digits: number) => !parserHexBranch.off && real.holdsHexRun(text, digits) };
+});
+
 /**
  * The last net: a secret key that no check at the slot looked for must still not come out of the
  * CLI, on either stream, in human or `--json` mode. These run the real program in this process, with
@@ -37,6 +45,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	parserHexBranch.off = false;
 	setJsonMode(false);
 	box.restore();
 });
@@ -160,6 +169,21 @@ describe("ordinary messages, help and exit codes do not change", () => {
 		expect(run.stderr).toBe(
 			"error: the command line may contain a secret key (a run of 56 or more hex digits), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n",
 		);
+	});
+
+	it("with the parser's hex branch switched off, the net still scrubs a parser error that quotes the key of a profile already read", async () => {
+		expect((await agx("identity", "new")).code).toBe(EXIT.ok);
+		const own = loadIdentityFile("default");
+		expect((await agx("identity", "export", "--yes")).code).toBe(EXIT.ok);
+		parserHexBranch.off = true;
+		for (const args of [[own.secretKeyHex], [own.secretKeyHex.toUpperCase()], ["identity", own.secretKeyHex]]) {
+			const run = await agx(...args);
+			expect(run.code).toBe(1);
+			// The error is the parser's own (so the hex branch was the one switched off), with the key taken out of it.
+			expect(run.stderr).toMatch(/^error: unknown command '.*'/);
+			expect(run.stderr).toContain(MARK);
+			expect(decoded(run.stderr).toLowerCase()).not.toContain(own.secretKeyHex);
+		}
 	});
 
 	it("every command of the program writes through the scrubbing writers, so no command can print around them", () => {
