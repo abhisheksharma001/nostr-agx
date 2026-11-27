@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { withFileLock } from "../config-lock.js";
 import { AgxCliError, EXIT } from "../errors.js";
 import { profileDir, tailscaleSecretsPath } from "../paths.js";
 import { setStdinForTests } from "../stdin.js";
@@ -147,6 +148,20 @@ async function onMovedClock<T>(run: () => Promise<T> | T): Promise<{ value?: T; 
 	return outcome;
 }
 
+/**
+ * After a writer has returned: whether the other process saw it waiting. A writer that waited returns only
+ * once the other process has let go, which leaves that process a moment to finish exiting; a writer that
+ * never waited leaves it looking for one until its own limit. So it is given a few seconds to exit, then stopped.
+ */
+async function holderSawWaiter(holder: HeldConfigLock): Promise<boolean> {
+	const stop = setTimeout(() => holder.child.kill("SIGKILL"), 5_000);
+	try {
+		return await holder.sawWaiter;
+	} finally {
+		clearTimeout(stop);
+	}
+}
+
 async function withStdin<T>(input: string | null, fn: () => Promise<T>): Promise<T> {
 	const restore = setStdinForTests(input);
 	try {
@@ -225,10 +240,8 @@ describe("saving a Tailscale secret while another process is saving", () => {
 		);
 
 		const saved = saveTailscaleSecret("default", { authKey: OTHER_KEY });
-		// A save that did not wait is finished before the other process looked up; stop it so the test does not wait for it.
-		held.child.kill("SIGKILL");
 
-		expect(await held.sawWaiter).toBe(true);
+		expect(await holderSawWaiter(held)).toBe(true);
 		expect(saved).toMatchObject({ authKey: OTHER_KEY, oauthClientSecret: CLIENT_SECRET });
 		expect(stored()).toMatchObject({ version: 1, authKey: OTHER_KEY, oauthClientSecret: CLIENT_SECRET });
 		expect(profileFiles()).toEqual(["tailscale.json"]);
@@ -327,6 +340,39 @@ describe("a lock nobody is holding", () => {
 		utimesSync(lockFile(), past, past);
 		saveTailscaleSecret("default", { authKey: KEY });
 		expect(stored().authKey).toBe(KEY);
+		expect(profileFiles()).toEqual(["tailscale.json"]);
+	});
+});
+
+describe("the lock of one file", () => {
+	it("is re-entrant for that file: a save made while its lock is held takes no second lock and does not wait for itself", () => {
+		makeProfileDir();
+		const started = Date.now();
+		withFileLock(secretsFile(), "Tailscale secrets", () => {
+			const before = readFileSync(lockFile(), "utf8");
+			saveTailscaleSecret("default", { authKey: KEY });
+			// Still the outer call's own lock, not a new one the nested call made.
+			expect(readFileSync(lockFile(), "utf8")).toBe(before);
+		});
+		expect(Date.now() - started).toBeLessThan(2_000);
+		expect(stored().authKey).toBe(KEY);
+		expect(profileFiles()).toEqual(["tailscale.json"]);
+	});
+
+	it("is not the lock of another file: holding one does not stand in for the other", () => {
+		makeProfileDir();
+		const other = join(box.home, "other.json");
+		let lockedAtWrite = false;
+		withFileLock(other, "other", () => {
+			expect(existsSync(`${other}.lock`)).toBe(true);
+			whileStopped(() => {
+				lockedAtWrite = existsSync(lockFile());
+			});
+			saveTailscaleSecret("default", { authKey: KEY });
+		});
+		// The save took the lock of its own file, and both are let go.
+		expect(lockedAtWrite).toBe(true);
+		expect(existsSync(`${other}.lock`)).toBe(false);
 		expect(profileFiles()).toEqual(["tailscale.json"]);
 	});
 });
@@ -462,9 +508,8 @@ describe("forgetting the Tailscale secrets", () => {
 		held = await holdLockUntilSomeoneWaits(lockFile(), secretsFile(), `c.oauthClientSecret = ${JSON.stringify(CLIENT_SECRET)};`);
 
 		const forgot = forgetTailscaleSecret("default");
-		held.child.kill("SIGKILL");
 
-		expect(await held.sawWaiter).toBe(true);
+		expect(await holderSawWaiter(held)).toBe(true);
 		expect(forgot).toBe(true);
 		expect(existsSync(secretsFile())).toBe(false);
 		expect(profileFiles()).toEqual([]);
