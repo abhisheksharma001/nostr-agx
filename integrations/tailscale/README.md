@@ -256,11 +256,14 @@ is never logged.
     (<https://tailscale.com/docs/features/logging/network-flow-logs>, read live 2026-11-27; the
     page says it was last validated on Oct 8, 2026).
   - In the source of the Tailscale release this package pins (v1.104.7), the node also tells the
-    control server that it has opted out (`hostinfo/hostinfo.go` line 67), and if a tailnet
-    requires audit logs, a node with the switch sets itself to not run and reports "tailnet
-    requires logging to be enabled" (`ipn/ipnlocal/local.go` lines 2067-2081). Neither is stated
-    on the docs pages above. They were read from the source, and not run here, so what the
-    launcher does in that second case has not been tried.
+    control server that it has opted out (`hostinfo/hostinfo.go` line 67), and if the control
+    server's network map turns network flow logging on for the node, a node with the switch sets
+    itself to not run and reports "tailnet requires logging to be enabled"
+    (`ipn/ipnlocal/local.go` lines 2067-2081). The test there is for the capability
+    `data-plane-audit-logs`, which the same source uses to switch flow logging on for the node
+    (`NetLogIDs`, lines 8251-8259). Neither is stated on the docs pages above. They were read
+    from the source, and not run here, so what the launcher does in that second case has not
+    been tried.
 
 ### Using a proxy that is already running
 
