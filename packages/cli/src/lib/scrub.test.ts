@@ -216,6 +216,7 @@ describe("scrubbedJson on a very deep document", () => {
 		expect([...names]).toEqual([REDACTED]);
 		expect(leaf).toBe("end");
 		expect(text).not.toContain(NCRYPTSEC.slice(10, 30));
+		expect(text).toBe(JSON.stringify(JSON.parse(text), null, 2));
 	});
 
 	it("replaces a key used as the value at the bottom, behind ordinary names", () => {
