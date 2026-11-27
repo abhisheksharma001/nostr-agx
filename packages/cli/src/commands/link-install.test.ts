@@ -540,6 +540,7 @@ describe("agx link install: an existing file", () => {
 		try {
 			run = await install("codex");
 			expect(run.code).toBe(EXIT.config);
+			expect(run.stderr).toContain("Cannot look at");
 			expect(run.stderr.toLowerCase()).toContain("nothing was changed");
 		} finally {
 			chmodSync(path(".codex"), 0o755);
@@ -912,6 +913,10 @@ describe("agx link install: which commands count as an agx entry", () => {
 		"deno run -A npm:@nostr-agx/cli hook stop",
 		"deno run -A npm:agx",
 		"deno run -A npm:agx hook stop --host claude",
+		'"agx" hook stop --host claude',
+		'bash -c "agx hook stop --host claude"',
+		'pwsh -c "& {agx}"',
+		"pwsh -c '&{npx @nostr-agx/cli}'",
 		'powershell -Command "& {agx hook stop}"',
 		'pwsh -c "&{agx hook}"',
 		"pwsh -c '&{npx @nostr-agx/cli hook}'",
@@ -964,6 +969,10 @@ describe("agx link install: which commands count as an agx entry", () => {
 		"npx @nostr-agx/climate",
 		// the .ts ending is not the start of .tsx
 		"agx.tsx hook",
+		// a folder named agx on Windows, and characters after agx that make another word
+		`C:${BS}opt${BS}agx${BS}bin${BS}tool.exe`,
+		"agx{x",
+		"agx^x",
 		// a name that ends in -agx is another tool (and allowing a dash before agx would refuse it)
 		"x-agx",
 		"other-agx hook",
@@ -1470,9 +1479,9 @@ describe("agx link install: two installs at once, and a lock that was left behin
 	});
 
 	it.each([
-		["another token", () => ({ pid: process.pid, token: "another-install-with-the-same-number" })],
-		["no token", () => ({ pid: process.pid })],
-	])("a lock with this process's number and %s is not this install's lock: nothing is written and the lock stays", (_label, make) => {
+		["another token", () => ({ pid: process.pid, host: hostname(), token: "another-install-with-the-same-number" })],
+		["no token", () => ({ pid: process.pid, host: hostname() })],
+	])("a lock with this process's number, this computer's name and %s is not this install's lock: nothing is written and the lock stays", (_label, make) => {
 		put(FILE.claude, "{}");
 		const theirs = `${JSON.stringify(make())}\n`;
 		const error = threw(undefined, { beforePublish: () => writeFileSync(path(LOCK), theirs) });
