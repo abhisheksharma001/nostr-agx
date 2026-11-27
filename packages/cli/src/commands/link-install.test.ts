@@ -973,6 +973,7 @@ describe("agx link install: which commands count as an agx entry", () => {
 		`C:${BS}opt${BS}agx${BS}bin${BS}tool.exe`,
 		"agx{x",
 		"agx^x",
+		"npx @nostr-agx/cli{x run",
 		// a name that ends in -agx is another tool (and allowing a dash before agx would refuse it)
 		"x-agx",
 		"other-agx hook",
@@ -1489,6 +1490,34 @@ describe("agx link install: two installs at once, and a lock that was left behin
 		expect(read(LOCK)).toBe(theirs);
 		expect(read(FILE.claude)).toBe("{}");
 		expect(readdirSync(path(".claude")).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+	});
+
+	it("a lock that another install of this same process made, with the same process number and computer name, is told from this install's own by its token alone", () => {
+		put(FILE.claude, "{}");
+		let theirs = "";
+		const error = threw(undefined, {
+			beforePublish: () => {
+				const aged = new Date(Date.now() - 120_000);
+				utimesSync(path(LOCK), aged, aged);
+				// Another install takes the lock over and finishes; its lock text is put back, as if it were still holding it.
+				quiet(() =>
+					linkInstallCommand(
+						{ agent: "claude", profile: "p1" },
+						{
+							beforePublish: () => {
+								theirs = read(LOCK);
+							},
+						},
+					),
+				);
+				writeFileSync(path(LOCK), theirs);
+			},
+		});
+		expect(JSON.parse(theirs)).toMatchObject({ pid: process.pid, host: hostname() });
+		expect(error?.exitCode).toBe(EXIT.config);
+		expect(error?.message).toContain("took over");
+		expect(read(LOCK)).toBe(theirs);
+		expect(readJson(FILE.claude)).toEqual(expected("claude", "p1"));
 	});
 
 	it("an install whose lock is still its own writes, and lets go of the lock", () => {
