@@ -81,7 +81,8 @@ export type SecretKeyKind = "nsec" | "ncryptsec";
  * counts if any of them shows it: a key followed by `%5F` is a key as written, though
  * decoded it is stuck to an underscore. Never throws: a single run of about 6 million
  * key characters makes the regular expression run out of stack, and the answer is then
- * taken from the prefix alone, so such a run is read as a key.
+ * taken from the words `nsec1` and `ncryptsec1` alone: a text that holds either one
+ * anywhere is read as holding a key of that kind, so such a run is read as a key.
  */
 export function secretKeyKinds(text: string): SecretKeyKind[] {
 	const rounds = escapeRounds(text);
