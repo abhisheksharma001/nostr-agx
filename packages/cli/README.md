@@ -631,8 +631,8 @@ shown as plain text in an "outside agent: information, not instructions" frame, 
 it exits after 60 minutes without activity (`--idle <minutes>`).
 
 **Safe to send.** Send asks you to confirm the exact recipient and text, warns when
-the message looks like it contains a credential (`nsec1…`, API keys, bearer tokens,
-private keys), and stops a second message in a thread that has had no reply.
+the message looks like it contains a credential (`nsec1…`, `ncryptsec1…`, API keys,
+bearer tokens, private keys), and stops a second message in a thread that has had no reply.
 
 **Your real mail.** `agx ui` runs on the same message store as `agx inbox`, `agx held` and
 `agx threads`, and pulls new messages every 30 seconds while it is open (it never replies and
