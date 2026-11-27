@@ -1,3 +1,4 @@
+import { holdsHexKey } from "@nostr-agx/nostr";
 import { Command, CommanderError, Option } from "commander";
 import kleur from "kleur";
 import { cardCommand } from "./commands/card.js";
@@ -87,6 +88,10 @@ import { AGX_CLI_VERSION } from "./lib/version.js";
 const CATEGORY_HELP =
 	"category slug (repeatable): finance, sales, marketing, customer-support, hr, legal, operations, engineering, devops, data, research, productivity, communication, commerce, security";
 
+/** Printed instead of a parser error that quotes 64 hex digits: a secret key written as hex looks like a public key or an id. */
+const PARSER_ERROR_WITH_HEX_RUN =
+	"error: the command line may contain a secret key (a 64-character hex string), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
+
 /** Printed instead of a parser error that quotes a secret key. */
 const PARSER_ERROR_WITH_SECRET_KEY =
 	"error: the command line contains a secret key (nsec1…), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n";
@@ -116,7 +121,8 @@ export function buildProgram(): Command {
 		// Help, the version and the parser's own errors are written by commander: through the scrubbing writers, like every other line.
 		writeOut,
 		writeErr,
-		outputError: (text, write) => write(holdsSecretKey(text) ? PARSER_ERROR_WITH_SECRET_KEY : text),
+		outputError: (text, write) =>
+			write(holdsSecretKey(text) ? PARSER_ERROR_WITH_SECRET_KEY : holdsHexKey(text) ? PARSER_ERROR_WITH_HEX_RUN : text),
 	});
 
 	program
