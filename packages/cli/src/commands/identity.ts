@@ -113,7 +113,7 @@ export async function identityImportCommand(
 			{
 				exitCode: EXIT.config,
 				remediation:
-					"Import into a fresh profile:\n    agx identity import <nsec> --profile imported\n  Or overwrite:  agx identity import <nsec> --force",
+					"Import into a fresh profile:\n    agx identity import --stdin --profile imported\n  Or overwrite:  agx identity import --stdin --force",
 			},
 		);
 	}
@@ -126,7 +126,7 @@ export async function identityImportCommand(
 	if (!raw?.trim()) {
 		throw usageError(
 			"No secret key provided.",
-			"agx identity import nsec1…    (or pipe it: echo nsec1… | agx identity import --stdin)",
+			'Pipe it in, so it never appears in argv:\n    printf %s "$KEY" | agx identity import --stdin\n  Or read it from an environment variable:\n    agx identity import --from-env NAME',
 		);
 	}
 	const identity = identityFromSecret(parseSecretInput(raw), "imported");

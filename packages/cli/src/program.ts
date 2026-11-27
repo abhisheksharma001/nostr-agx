@@ -1,5 +1,5 @@
 import { holdsHexRun } from "@nostr-agx/nostr";
-import { Command, CommanderError, Option } from "commander";
+import { Command, CommanderError, Help, Option } from "commander";
 import kleur from "kleur";
 import { cardCommand } from "./commands/card.js";
 import {
@@ -105,7 +105,10 @@ const PARSER_ERROR_WITH_SECRET_KEY =
 
 /** Printed instead of ANY parser error of `identity import`: its argument can only be a secret, in any format (hex looks like a public key everywhere else). */
 const PARSER_ERROR_OF_IMPORT =
-	"error: `agx identity import` could not read its arguments, so they are not shown (they may hold a secret key). Usage: agx identity import [secret] [--stdin] [--force]; see `agx identity import --help`.\n";
+	"error: `agx identity import` could not read its arguments, so they are not shown (they may hold a secret key). Usage: agx identity import --stdin [--force] or agx identity import --from-env <name> [--force]; see `agx identity import --help`.\n";
+
+/** Why the help of every command that takes a secret leads with the way that keeps it off the command line. */
+const KEY_ON_THE_COMMAND_LINE = "a key typed on the command line stays in the shell's history and in the process list";
 
 /** What the parser may print for `text`: the error as commander wrote it, unless it quotes a key. */
 function parserErrorToShow(text: string): string {
@@ -248,8 +251,12 @@ export function buildProgram(): Command {
 		.action((options) => configShowCommand(withGlobals(options)));
 	config
 		.command("set <key> [value]")
-		.description(
+		.usage("apiKey --stdin\n       agx config set [options] <key> [value]")
+		.summary(
 			"set apiBaseUrl | apiKey | orgSlug | relays | org | nip05 (apiKey: pipe it with --stdin)",
+		)
+		.description(
+			`set apiBaseUrl | apiKey | orgSlug | relays | org | nip05. Pipe an apiKey in with --stdin: ${KEY_ON_THE_COMMAND_LINE}.`,
 		)
 		.option("--stdin", "read the value from stdin (one line)")
 		.action((key, value, options) =>
@@ -269,7 +276,11 @@ export function buildProgram(): Command {
 
 	const identity = program
 		.command("identity")
-		.description("manage this agent's keypair and peer allowlist");
+		.description("manage this agent's keypair and peer allowlist")
+		// The list of subcommands shows `import [options]`: the way to give the key is in its own help.
+		.configureHelp({
+			subcommandTerm: (cmd) => (cmd.name() === "import" ? "import [options]" : new Help().subcommandTerm(cmd)),
+		});
 	identity
 		.command("new")
 		.description("generate a keypair and store it in the profile")
@@ -281,7 +292,11 @@ export function buildProgram(): Command {
 		.action((options) => identityShowCommand(withGlobals(options)));
 	identity
 		.command("import [secret]")
-		.description("import an nsec1… or 64-char hex secret key")
+		.usage("--stdin [--force]\n       agx identity import --from-env <name> [--force]")
+		.summary("import a secret key (pipe it in with --stdin)")
+		.description(
+			`import a secret key (an nsec or 64 hex digits). Pipe it in with --stdin or read it from an environment variable with --from-env: ${KEY_ON_THE_COMMAND_LINE}.`,
+		)
 		.option("--stdin", "read the secret from stdin")
 		.option("--from-env <name>", "read the secret from the environment variable NAME (agx does not clear it)")
 		.option("--force", "replace an existing identity")
@@ -770,13 +785,17 @@ export function buildProgram(): Command {
 		);
 	tailscale
 		.command("enable")
-		.description("configure Tailscale auth for this profile and verify the proxy")
-		.option("--auth-key <key>", "Tailscale auth key (prefer --auth-key-stdin)")
+		.usage("[--auth-key-stdin | --oauth-client-secret-stdin] [options]")
+		.summary("configure Tailscale auth for this profile and verify the proxy")
+		.description(
+			`configure Tailscale auth for this profile and verify the proxy. Pass a key with --auth-key-stdin or a client secret with --oauth-client-secret-stdin: ${KEY_ON_THE_COMMAND_LINE}.`,
+		)
 		.option("--auth-key-stdin", "read the Tailscale auth key from stdin")
+		.option("--auth-key <key>", "Tailscale auth key (prefer --auth-key-stdin)")
 		.option("--oauth-url <url>", "OAuth token URL of the authentication service")
 		.option("--oauth-client-id <id>", "OAuth client id")
-		.option("--oauth-client-secret <secret>", "OAuth client secret (prefer stdin)")
 		.option("--oauth-client-secret-stdin", "read the OAuth client secret from stdin")
+		.option("--oauth-client-secret <secret>", "OAuth client secret (prefer stdin)")
 		.option("--oauth-scope <scope>", "OAuth scope to request")
 		.option("--oauth-tailnet <tailnet>", "tailnet for a minted key (default -)")
 		.addOption(
@@ -794,9 +813,13 @@ export function buildProgram(): Command {
 		.action((options) => tailscaleEnableCommand(withGlobals(options)));
 	tailscale
 		.command("up")
-		.description("verify the profile can start its bundled Tailscale proxy")
-		.option("--auth-key <key>", "one-off Tailscale auth key (not stored)")
+		.usage("[--auth-key-stdin] [options]")
+		.summary("verify the profile can start its bundled Tailscale proxy")
+		.description(
+			`verify the profile can start its bundled Tailscale proxy. Pass a one-off key with --auth-key-stdin: ${KEY_ON_THE_COMMAND_LINE}.`,
+		)
 		.option("--auth-key-stdin", "read a one-off Tailscale auth key from stdin")
+		.option("--auth-key <key>", "one-off Tailscale auth key (not stored)")
 		.option("--hostname <name>", "hostname to request from Tailscale")
 		.option("--state-dir <path>", "persistent tsnet state dir (default: fresh dir under AGX_HOME per run)")
 		.option("-v, --verbose", "log transport activity")
