@@ -47,6 +47,16 @@ export type SlotTable = Record<string, Record<string, SlotSpec>>;
 const THREAD_ID: SlotRule = { kind: "identifier", hexOk: true };
 
 /**
+ * A path, a URL or an environment variable: a place, not a name. A content hash in a folder or
+ * file name (a cache keyed by a sha256, a build output named by its hash) is 64 hex digits and
+ * is normal there, so a stranger's run of 64 hex digits is let through. A key shape and the
+ * profile's own key (as hex, also behind a percent sign) are still refused. The environment is
+ * looked at on every command, whether or not the command reads a variable, so a false refusal
+ * there would stop everything.
+ */
+const LOCATION: SlotRule = { kind: "identifier", hexOk: true };
+
+/**
  * A message the user means to send. The decision whether a key typed here is refused,
  * warned about or allowed is open: today it is allowed, as `agx send` always did.
  */
@@ -84,8 +94,8 @@ const HELD: Record<string, SlotSpec> = { "<npub>": "publicKey" };
 
 export const SLOTS: SlotTable = {
 	"(program)": { "--profile": { kind: "identifier", profileName: true } },
-	login: { "--api-base-url": "identifier", "--org": "identifier", "--org-name": "freeText", "--org-slug": "identifier" },
-	"org create": { "<name>": "freeText", "--slug": "identifier", "--api-base-url": "identifier" },
+	login: { "--api-base-url": LOCATION, "--org": "identifier", "--org-name": "freeText", "--org-slug": "identifier" },
+	"org create": { "<name>": "freeText", "--slug": "identifier", "--api-base-url": LOCATION },
 	"config set": { "<key>": "identifier", "[value]": CONFIG_VALUE, "--stdin": CONFIG_VALUE },
 	"config use": { "<profile>": { kind: "identifier", profileName: true } },
 	"identity import": { "[secret]": "secret", "--stdin": "secret" },
@@ -108,7 +118,7 @@ export const SLOTS: SlotTable = {
 		"--visibility": "identifier",
 		"--handle": "identifier",
 		"--domain-id": "identifier",
-		"--relay": "identifier",
+		"--relay": LOCATION,
 		"--org": "identifier",
 	},
 	"listing list": { "--org": "identifier", "--limit": "identifier" },
@@ -139,7 +149,7 @@ export const SLOTS: SlotTable = {
 	serve: {
 		"--allow": "publicKey",
 		"--capability": "identifier",
-		"--handler": "identifier",
+		"--handler": LOCATION,
 		"--poll-interval": "identifier",
 		"--max-auto-depth": "identifier",
 		"--reply-text": MESSAGE,
@@ -156,62 +166,64 @@ export const SLOTS: SlotTable = {
 	send: { "<peer>": "publicKey", "<message>": MESSAGE, "--subject": MESSAGE, "--context-id": THREAD_ID },
 	ui: {
 		"--port": "identifier",
-		"--compose": "identifier",
-		"--drafts": "identifier",
+		"--compose": LOCATION,
+		"--drafts": LOCATION,
 		"--idle": "identifier",
-		"--dev-store": "identifier",
+		"--dev-store": LOCATION,
 	},
 	request: { "<peer>": "publicKey", "<capability>": "identifier", "--payload": MESSAGE, "--timeout": "identifier" },
-	card: { "<peer>": "publicKey", "--relay": "identifier" },
+	card: { "<peer>": "publicKey", "--relay": LOCATION },
 	relay: { "--port": "identifier", "--tls-port": "identifier" },
 	"tailscale enable": {
 		"--auth-key": "secret",
 		"--auth-key-stdin": "secret",
-		"--oauth-url": "identifier",
+		"--oauth-url": LOCATION,
 		"--oauth-client-id": "identifier",
 		"--oauth-client-secret": "secret",
 		"--oauth-client-secret-stdin": "secret",
 		"--oauth-scope": "identifier",
 		"--oauth-tailnet": "identifier",
 		"--oauth-token-auth": "identifier",
-		"--oauth-api-base-url": "identifier",
+		"--oauth-api-base-url": LOCATION,
 		"--tag": "identifier",
 		"--hostname": "identifier",
-		"--state-dir": "identifier",
+		"--state-dir": LOCATION,
 	},
-	"tailscale up": { "--auth-key": "secret", "--auth-key-stdin": "secret", "--hostname": "identifier", "--state-dir": "identifier" },
+	"tailscale up": { "--auth-key": "secret", "--auth-key-stdin": "secret", "--hostname": "identifier", "--state-dir": LOCATION },
 };
 
 /**
  * The environment variables the CLI reads. Only these are looked at, and each one is
  * looked at on every command, whether or not that command reads it: a key in one of them
- * would otherwise sit there until a command that does read it prints it.
+ * would otherwise sit there until a command that does read it prints it. Because of that, a
+ * run of 64 hex digits is let through every variable that is not a secret or a profile name
+ * (see {@link LOCATION}): refusing a hash in a folder name would stop every command.
  */
 export const ENV_SLOTS: Record<string, SlotSpec> = {
-	AGX_HOME: "identifier",
+	AGX_HOME: LOCATION,
 	AGX_PROFILE: { kind: "identifier", profileName: true },
-	AGX_API_URL: "identifier",
+	AGX_API_URL: LOCATION,
 	AGX_API_KEY: "secret",
-	AGX_ORG: "identifier",
-	AGX_RELAY: "identifier",
+	AGX_ORG: LOCATION,
+	AGX_RELAY: LOCATION,
 	AGX_GATEWAY_KEY: "secret",
-	AGX_TAILSCALE: "identifier",
+	AGX_TAILSCALE: LOCATION,
 	AGX_TAILSCALE_AUTH_KEY: "secret",
 	TS_AUTHKEY: "secret",
 	AGX_TAILSCALE_OAUTH_CLIENT_SECRET: "secret",
-	AGX_TAILSCALE_OAUTH_URL: "identifier",
-	AGX_TAILSCALE_OAUTH_CLIENT_ID: "identifier",
-	AGX_TAILSCALE_OAUTH_SCOPE: "identifier",
-	AGX_TAILSCALE_OAUTH_TOKEN_AUTH: "identifier",
-	AGX_TAILSCALE_OAUTH_API_BASE_URL: "identifier",
-	AGX_TAILSCALE_TAILNET: "identifier",
-	AGX_TAILSCALE_TAGS: "identifier",
-	AGX_TAILSCALE_HOSTNAME: "identifier",
-	AGX_TAILSCALE_STATE_DIR: "identifier",
+	AGX_TAILSCALE_OAUTH_URL: LOCATION,
+	AGX_TAILSCALE_OAUTH_CLIENT_ID: LOCATION,
+	AGX_TAILSCALE_OAUTH_SCOPE: LOCATION,
+	AGX_TAILSCALE_OAUTH_TOKEN_AUTH: LOCATION,
+	AGX_TAILSCALE_OAUTH_API_BASE_URL: LOCATION,
+	AGX_TAILSCALE_TAILNET: LOCATION,
+	AGX_TAILSCALE_TAGS: LOCATION,
+	AGX_TAILSCALE_HOSTNAME: LOCATION,
+	AGX_TAILSCALE_STATE_DIR: LOCATION,
 	// Read by the launcher package, which the CLI starts with its standard error passed straight through.
-	AGX_TAILSCALE_BINARY: "identifier",
-	AGX_DEBUG: "identifier",
-	AGX_NO_BROWSER: "identifier",
-	AGX_UI_DEV_STORE: "identifier",
-	AGX_ELLADEX_URL: "identifier",
+	AGX_TAILSCALE_BINARY: LOCATION,
+	AGX_DEBUG: LOCATION,
+	AGX_NO_BROWSER: LOCATION,
+	AGX_UI_DEV_STORE: LOCATION,
+	AGX_ELLADEX_URL: LOCATION,
 };

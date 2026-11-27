@@ -1,10 +1,12 @@
+import { existsSync } from "node:fs";
 import { holdsHexKey, holdsSecretKey, normalizePubkey } from "@nostr-agx/nostr";
 import type { Command } from "commander";
-import { resolveProfileName } from "./config.js";
+import { loadConfig, resolveProfileName } from "./config.js";
 import { usageError } from "./errors.js";
 import { identityExists, loadIdentityFile } from "./identity.js";
 import { ENV_SLOTS, SLOTS, type SlotPolicy, type SlotRule, type SlotSpec, type SlotTable } from "./input-slots.js";
 import { notice } from "./output.js";
+import { profileDir } from "./paths.js";
 
 /**
  * The check every typed value goes through, once, after the parser has read the command line
@@ -21,6 +23,23 @@ const PROFILE_NAME = new RegExp(`^[A-Za-z0-9._-]{1,${PROFILE_NAME_MAX}}$`);
 /** Letters, digits, `-`, `_` and `.`, at most {@link PROFILE_NAME_MAX} of them, and not `.` or `..`. */
 export function isValidProfileName(name: string): boolean {
 	return PROFILE_NAME.test(name) && name !== "." && name !== "..";
+}
+
+/**
+ * A profile that is already stored under a name the rule does not allow (an older build took any
+ * name): its folder is there, or its name is in config.json. It can still be named, so it is not
+ * lost once it is no longer the current one. A name that is not one folder name (a slash, a
+ * backslash, `.` or `..`) is never one, and a new profile needs a name the rule allows.
+ */
+function isStoredProfileName(name: string): boolean {
+	if (name === "" || name === "." || name === ".." || /[/\\]/.test(name) || name.includes("\0")) {
+		return false;
+	}
+	try {
+		return existsSync(profileDir(name)) || Object.hasOwn(loadConfig().profiles, name);
+	} catch {
+		return false;
+	}
 }
 
 const KEY_SHAPE = "holds a secret key (nsec1… or ncryptsec1…)";
@@ -70,7 +89,7 @@ function ruleOf(spec: SlotSpec | undefined, others: Record<string, unknown>): Sl
 function ownSecretKey(profileFlag: unknown): string | null {
 	try {
 		const name = resolveProfileName(typeof profileFlag === "string" ? profileFlag : undefined);
-		return isValidProfileName(name) && identityExists(name)
+		return (isValidProfileName(name) || isStoredProfileName(name)) && identityExists(name)
 			? loadIdentityFile(name, { allowInsecurePerms: true }).secretKeyHex.toLowerCase()
 			: null;
 	} catch {
@@ -118,7 +137,7 @@ function checkValue(label: string, value: string, rule: SlotRule, own: () => str
 	if (reason !== null) {
 		refuseOrWarn(label, reason, policy);
 	}
-	if (rule.profileName && !isValidProfileName(value)) {
+	if (rule.profileName && !isValidProfileName(value) && !isStoredProfileName(value)) {
 		throw usageError(
 			`${label} is not a valid profile name (1 to ${PROFILE_NAME_MAX} letters, digits, "-", "_" or "."; not "." or ".."), so it was not used and is not shown here.`,
 			NAME_REMEDIATION,
@@ -149,8 +168,10 @@ export function checkInputs(action: Command, options: InputCheckOptions = {}): v
 
 	for (const [name, spec] of Object.entries(envTable)) {
 		const value = env[name];
-		if (value !== undefined) {
-			checkValue(`The environment variable ${name}`, value, ruleOf(spec, {}), ownKey);
+		const rule = ruleOf(spec, {});
+		// A profile name typed with --profile wins over the variable, which is then never used.
+		if (value !== undefined && !(rule.profileName && typeof profileFlag === "string")) {
+			checkValue(`The environment variable ${name}`, value, rule, ownKey);
 		}
 	}
 	chain.forEach((command, depth) => {
