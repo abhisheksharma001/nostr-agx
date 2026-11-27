@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { holdsHexKey, holdsSecretKey, normalizePubkey } from "@nostr-agx/nostr";
+import { holdsHexKey, holdsHexRun, holdsSecretKey, normalizePubkey } from "@nostr-agx/nostr";
 import type { Command } from "commander";
 import { loadConfig, resolveProfileName } from "./config.js";
 import { usageError } from "./errors.js";
@@ -42,12 +42,24 @@ function isStoredProfileName(name: string): boolean {
 	}
 }
 
+/** The name of an environment variable: letters, digits and "_", not starting with a digit. */
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** A name holding a run of this many hex digits is not accepted, so a key one or two digits short cannot be repeated back as a name (the same length the parser's own errors hide). */
+const ENV_NAME_HEX_DIGITS = 56;
+
+/** Letters, digits and "_", not starting with a digit, and no run of 56 or more hex digits. */
+export function isValidEnvName(name: string): boolean {
+	return ENV_NAME.test(name) && !holdsHexRun(name, ENV_NAME_HEX_DIGITS);
+}
+
 const KEY_SHAPE = "holds a secret key (nsec1… or ncryptsec1…)";
 const HEX_RUN = "holds a 64-character hex string, which may be a secret key";
 const OWN_KEY = "holds this profile's own secret key";
 
 const KEY_REMEDIATION = "A secret key belongs only in `agx identity import` (pipe it in with --stdin). Check what each command takes with `agx --help`.";
 const NAME_REMEDIATION = "Use a short name, for example:  agx -p work identity new";
+const ENV_NAME_REMEDIATION = "Name the variable that holds the key, for example:  agx identity import --from-env AGENT_KEY";
 
 export interface InputCheckOptions {
 	table?: SlotTable;
@@ -141,6 +153,12 @@ function checkValue(label: string, value: string, rule: SlotRule, own: () => str
 		throw usageError(
 			`${label} is not a valid profile name (1 to ${PROFILE_NAME_MAX} letters, digits, "-", "_" or "."; not "." or ".."), so it was not used and is not shown here.`,
 			NAME_REMEDIATION,
+		);
+	}
+	if (rule.envName && !isValidEnvName(value)) {
+		throw usageError(
+			`${label} is not a valid environment variable name (letters, digits and "_", not starting with a digit), so it was not used and is not shown here.`,
+			ENV_NAME_REMEDIATION,
 		);
 	}
 }

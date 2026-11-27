@@ -29,6 +29,7 @@ export interface IdentityOptions {
 	hex?: boolean;
 	nsec?: boolean;
 	stdin?: boolean;
+	fromEnv?: string;
 }
 
 export function identityNewCommand(options: IdentityOptions): void {
@@ -75,11 +76,37 @@ export function identityShowCommand(options: IdentityOptions): void {
 	});
 }
 
+const ENV_REMEDIATION =
+	"Set the variable to the key in the environment this command runs in, or pipe the key in with --stdin.";
+
+/**
+ * The text of the environment variable `name`, which holds the secret key for `--from-env`.
+ * Only the name is ever shown (the input check has already seen that it is a plain name and
+ * not a key); the value goes on to the same reading as text from standard input and is never
+ * printed. The variable is left as it is: it belongs to whoever started the command.
+ */
+function readSecretFromEnv(name: string): string {
+	const value = process.env[name];
+	if (value === undefined) {
+		throw usageError(`The environment variable ${name} is not set.`, ENV_REMEDIATION);
+	}
+	if (!value.trim()) {
+		throw usageError(`The environment variable ${name} is empty.`, ENV_REMEDIATION);
+	}
+	return value;
+}
+
 export async function identityImportCommand(
 	secret: string | undefined,
 	options: IdentityOptions,
 ): Promise<void> {
 	const profileName = resolveProfileName(options.profile);
+	if (options.fromEnv !== undefined && (secret !== undefined || options.stdin)) {
+		throw usageError(
+			"Give the key one way only: as an argument, with --stdin or with --from-env.",
+			"Use one of:\n    agx identity import --stdin\n    agx identity import --from-env NAME",
+		);
+	}
 	if (identityExists(profileName) && !options.force) {
 		throw new AgxCliError(
 			`Profile "${profileName}" already has an identity.`,
@@ -91,7 +118,9 @@ export async function identityImportCommand(
 		);
 	}
 	let raw = secret;
-	if (options.stdin || !raw) {
+	if (options.fromEnv !== undefined) {
+		raw = readSecretFromEnv(options.fromEnv);
+	} else if (options.stdin || !raw) {
 		raw = await readStdin();
 	}
 	if (!raw?.trim()) {

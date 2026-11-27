@@ -283,6 +283,7 @@ export function buildProgram(): Command {
 		.command("import [secret]")
 		.description("import an nsec1… or 64-char hex secret key")
 		.option("--stdin", "read the secret from stdin")
+		.option("--from-env <name>", "read the secret from the environment variable NAME (agx does not clear it)")
 		.option("--force", "replace an existing identity")
 		.configureOutput({
 			outputError: (_text, write) => write(PARSER_ERROR_OF_IMPORT),

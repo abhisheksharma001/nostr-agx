@@ -32,6 +32,8 @@ export interface SlotRule {
 	hexOk?: boolean;
 	/** The value is a profile name and must also be one short folder name. */
 	profileName?: boolean;
+	/** The value is the name of an environment variable (letters, digits and "_", not starting with a digit). */
+	envName?: boolean;
 }
 
 /** `others` holds the other values of the same command by slot name, for a slot whose kind depends on them. */
@@ -99,7 +101,7 @@ export const SLOTS: SlotTable = {
 	"org create": { "<name>": "freeText", "--slug": "identifier", "--api-base-url": LOCATION },
 	"config set": { "<key>": "identifier", "[value]": CONFIG_VALUE, "--stdin": CONFIG_VALUE },
 	"config use": { "<profile>": { kind: "identifier", profileName: true } },
-	"identity import": { "[secret]": "secret", "--stdin": "secret" },
+	"identity import": { "[secret]": "secret", "--stdin": "secret", "--from-env": { kind: "identifier", envName: true } },
 	"identity sign": { "<nonce>": "freeText" },
 	"identity allow": { "[peers...]": "publicKey" },
 	"identity deny": { "<peers...>": "publicKey" },
