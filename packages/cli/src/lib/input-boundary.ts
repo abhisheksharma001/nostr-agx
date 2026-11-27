@@ -169,9 +169,10 @@ export function checkInputs(action: Command, options: InputCheckOptions = {}): v
 	for (const [name, spec] of Object.entries(envTable)) {
 		const value = env[name];
 		const rule = ruleOf(spec, {});
-		// A profile name typed with --profile wins over the variable, which is then never used.
-		if (value !== undefined && !(rule.profileName && typeof profileFlag === "string")) {
-			checkValue(`The environment variable ${name}`, value, rule, ownKey);
+		// A profile name typed with --profile wins over the variable, so it is never used as a name: only the name rule is skipped.
+		const used = rule.profileName && typeof profileFlag === "string" ? { ...rule, profileName: false } : rule;
+		if (value !== undefined) {
+			checkValue(`The environment variable ${name}`, value, used, ownKey);
 		}
 	}
 	chain.forEach((command, depth) => {
