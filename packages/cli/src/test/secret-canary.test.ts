@@ -191,7 +191,7 @@ const SLOT_TABLE: Record<string, CommandEntry> = {
 	"identity new": { slots: {} },
 	"identity show": { slots: {} },
 	// A key that is accepted, so the other probes of the command get as far as the profile they are about.
-	"identity import": { slots: { "[secret]": { kind: "secret", fill: plant("nsec", "import-fill").value }, "--stdin": { kind: "secret", stdin: true, without: ["[secret]"] } }, base: ["--force"] },
+	"identity import": { slots: { "[secret]": { kind: "secret", fill: plant("nsec", "import-fill").value }, "--stdin": { kind: "secret", stdin: true, without: ["[secret]"] }, "--from-env": { kind: "id", without: ["[secret]"] } }, base: ["--force"] },
 	"identity export": { slots: {} },
 	"identity sign": { slots: { "<nonce>": "text" } },
 	"identity allow": { slots: { "[peers...]": "pubkey" } },
