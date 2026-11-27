@@ -674,6 +674,29 @@ describe("a credentials file that cannot be used: what a command says does not c
 		}
 	});
 
+	/** A file that is not valid JSON and one that has the wrong shape; neither names a profile called "nobody". */
+	const unusableFiles: Array<[string, RegExp]> = [
+		['{"version":1,"profiles":{"default":{"apiKey":"ela_LEAKME', /is not valid JSON/],
+		[`${JSON.stringify({ version: 2, profiles: { default: { apiKey: "ela_LEAKME" } } })}\n`, /does not match the expected shape/],
+	];
+
+	it("a remove of a profile the file does not name still says the file cannot be used, takes no lock and keeps the file", () => {
+		for (const [text, pattern] of unusableFiles) {
+			writeFileSync(credentialsFile(), text, { mode: 0o600 });
+			for (const name of ["nobody", "default"]) {
+				expectRefused(errorOf(() => removeCredential(name)), pattern, text);
+			}
+		}
+	});
+
+	it("a set of an entry that does not fit the shape, on a file that cannot be used, says what is wrong with the file first", () => {
+		const bad = { ...entry(), apiKey: 42 } as unknown as CredentialEntry;
+		for (const [text, pattern] of unusableFiles) {
+			writeFileSync(credentialsFile(), text, { mode: 0o600 });
+			expectRefused(errorOf(() => setCredential("nobody", bad)), pattern, text);
+		}
+	});
+
 	it("is not valid JSON while another process holds the lock: a get, a list or a remove still says so at once", async () => {
 		const broken = '{"version":1,"profiles":{"default":{"apiKey":"ela_LEAKME';
 		writeFileSync(credentialsFile(), broken, { mode: 0o600 });
