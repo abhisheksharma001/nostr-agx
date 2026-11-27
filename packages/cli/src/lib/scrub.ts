@@ -57,10 +57,6 @@ export function scrubbedJson(value: unknown, space?: number): string {
  * the same text stay two entries here; the walk in {@link scrubbedJson} merges them.
  */
 function scrubWrittenJson(text: string): string {
-	const scrubbed = scrubOutput(text);
-	if (scrubbed === text) {
-		return text;
-	}
 	// A line feed is written as a backslash and an `n`, and that `n` would start a match, leaving a lone
 	// backslash. Spell each one `\u000a` first: the same character, and no `n`.
 	return scrubOutput(text.replace(/\\([\s\S])/g, (pair, next: string) => (next === "n" ? "\\u000a" : pair)));
