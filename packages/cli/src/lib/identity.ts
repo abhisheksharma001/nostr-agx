@@ -117,8 +117,9 @@ export function toNsec(secretKey: Uint8Array): string {
  * Make `redactSecrets` know the profile's own secret key in every form agx can print it
  * in, in lower and upper case: as the hex it is stored in, as the `nsec1…` that
  * `agx identity export` gives, and as the `npub1…` the same 32 bytes make when they are
- * typed where a peer belongs (`agx card <hex>` prints that back). Without this, only
- * a key that agx sent somewhere was ever removed from an error message.
+ * typed where a peer belongs (`agx request <hex>` prints that back in an error). Without
+ * this, only a key that agx sent somewhere was ever removed from an error message. It
+ * covers only a command that has read the identity file: `agx card` has not.
  */
 function rememberOwnKey(secretKeyHex: string): void {
 	const bytes = hexToBytes(secretKeyHex);
