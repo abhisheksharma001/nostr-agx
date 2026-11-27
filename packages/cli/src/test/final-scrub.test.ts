@@ -232,10 +232,10 @@ describe("the other output points", () => {
 			throw new Error("a verbose logger was expected");
 		}
 		const { stdout, stderr } = await capture(async () => {
-			logger.debug(`cannot read ${NSEC}`);
-			logger.info("seen", NSEC);
-			logger.warn("bad", { key: NSEC, list: [NCRYPTSEC] });
-			logger.error(`x ${escapeAll(NSEC)} y`, `nostr:${NSEC.toUpperCase()}`);
+			logger.debug?.(`cannot read ${NSEC}`);
+			logger.info?.("seen", NSEC);
+			logger.warn?.("bad", { key: NSEC, list: [NCRYPTSEC] });
+			logger.error?.(`x ${escapeAll(NSEC)} y`, `nostr:${NSEC.toUpperCase()}`);
 		});
 		expect(stdout).toBe("");
 		expect(leakedPart(stderr, NSEC, 5)).toBeNull();
@@ -248,8 +248,8 @@ describe("the other output points", () => {
 	it("the verbose logger prints an ordinary line as it did", async () => {
 		const logger = makeLogger(true);
 		const { stderr } = await capture(async () => {
-			logger?.info("connected", "ws://127.0.0.1:9");
-			logger?.warn("slow");
+			logger?.info?.("connected", "ws://127.0.0.1:9");
+			logger?.warn?.("slow");
 		});
 		expect(stderr).toBe("[agx:info] connected ws://127.0.0.1:9\n[agx:warn] slow \n");
 	});
