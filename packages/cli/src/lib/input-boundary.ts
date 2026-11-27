@@ -149,7 +149,7 @@ export function checkInputs(action: Command, options: InputCheckOptions = {}): v
 
 	for (const [name, spec] of Object.entries(envTable)) {
 		const value = env[name];
-		if (value !== undefined && value !== "") {
+		if (value !== undefined) {
 			checkValue(`The environment variable ${name}`, value, ruleOf(spec, {}), ownKey);
 		}
 	}
