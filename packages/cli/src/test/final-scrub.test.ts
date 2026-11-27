@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AgxCliError, EXIT, HumanActionRequiredError } from "../lib/errors.js";
 import { renderInboundLines } from "../lib/inbound-lines.js";
 import { createIdentity, loadIdentityFile } from "../lib/identity.js";
-import { say, setJsonMode } from "../lib/output.js";
+import { say, setJsonMode, writeErr, writeOut } from "../lib/output.js";
 import { makeLogger } from "../lib/transport.js";
 import { announceActionRequired } from "../lib/wait.js";
 import { buildProgram, reportCliError } from "../program.js";
@@ -138,6 +138,32 @@ describe("ordinary messages, help and exit codes do not change", () => {
 		expect(run.stderr).toBe(
 			"error: the command line contains a secret key (nsec1…), so the error that quotes it is not shown. Check the arguments with `agx --help`.\n",
 		);
+	});
+
+	it("a parser error that quotes the key of a profile the process has already read does not show it", async () => {
+		// Only a long-lived process can know the key before it parses a command line, so the test reads the identity first.
+		expect((await agx("identity", "new")).code).toBe(EXIT.ok);
+		const own = loadIdentityFile("default");
+		expect((await agx("identity", "export", "--yes")).code).toBe(EXIT.ok);
+		const run = await agx(own.secretKeyHex);
+		expect(run.code).toBe(1);
+		expect(run.stderr.toLowerCase()).not.toContain(own.secretKeyHex);
+		expect(run.stderr).toContain(`error: unknown command '${MARK}'`);
+	});
+
+	it("every command of the program writes through the scrubbing writers, so no command can print around them", () => {
+		const unscrubbed: string[] = [];
+		const walk = (command: Command, path: string): void => {
+			const writers = command.configureOutput();
+			if (writers.writeOut !== writeOut || writers.writeErr !== writeErr) {
+				unscrubbed.push(path);
+			}
+			for (const sub of command.commands) {
+				walk(sub, `${path} ${sub.name()}`);
+			}
+		};
+		walk(buildProgram(), "agx");
+		expect(unscrubbed).toEqual([]);
 	});
 
 	it("the help of every command is untouched by the scrub, and agx --help prints it", async () => {

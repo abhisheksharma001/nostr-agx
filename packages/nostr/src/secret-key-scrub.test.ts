@@ -204,6 +204,12 @@ describe("it never throws, and fails closed", () => {
 		expect(out).not.toMatch(/n(crypt)?sec1[0-9a-z]{5}/i);
 	});
 
+	it("answers the marker, not an error, for input that is not text at all", () => {
+		for (const input of [undefined, null, 42, {}]) {
+			expect(scrubSecretKeys(input as unknown as string, MARK)).toBe(MARK);
+		}
+	});
+
 	it("answers for text with lone surrogates, a NUL and a very long line", () => {
 		expect(scrub(`\ud800 ${NSEC} \udc00 \u0000`)).toBe(`\ud800 ${MARK} \udc00 \u0000`);
 		expect(scrub(`${"a".repeat(1_000_000)}${NSEC}`)).toBe(`${"a".repeat(1_000_000)}${MARK}`);
