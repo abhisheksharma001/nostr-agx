@@ -127,14 +127,16 @@ describe("scanForSecrets and 64 hex digits", () => {
 });
 
 describe("scanForSecrets keeps its answers for text that is not an escaped or capitalised key", () => {
-	// The two patterns this scan used before it read keys by the shared rule. For text made up of
-	// the pieces below, the old patterns and the new code must agree.
+	// The two patterns this scan used before it read keys by the shared rule. Every text that can be made
+	// from one piece of each slot below, in order, is run through the old pattern and through the new code,
+	// and a line the old pattern flags must be flagged now and the other way round. Nothing is drawn at
+	// random: a list of texts that repeats itself would show less than it seems to.
 	const OLD_NSEC = /\bnsec1[02-9ac-hj-np-z]{20,}\b/;
 	const OLD_HEX = /\b(?:secret|private)[^\n]{0,20}\b[0-9a-f]{64}\b/i;
 	const NSEC_SLOTS = [
 		["", "x", " ", "nostr:", "--", "_", "\n"],
 		[NSEC, NSEC.slice(0, 30), NSEC.slice(0, 12), `nsec1${"q".repeat(19)}`, `nsec1${"q".repeat(20)}`, "nsec1", `${NSEC}q`, `${NSEC}b`, `${NSEC}1`, `nsec1${"q".repeat(10)}b${"q".repeat(30)}`],
-		["", ".", " ok", "\nmore", "g", "_", "b", "q"],
+		["", ".", " ok", "\nmore", "g", "_", "b", "q", "%5F", "%62", "%31", "%2562", "%20", "%7E"],
 	];
 	const HEX_SLOTS = [
 		["secret", "private", "Secret", "PRIVATE", "key", "x"],
@@ -143,33 +145,43 @@ describe("scanForSecrets keeps its answers for text that is not an escaped or ca
 		["", ".", " ok", "\nmore", "g", "_"],
 	];
 
-	/** `count` texts, each one piece from every slot in turn, the same on every run. */
-	function madeUp(slots: string[][], count: number): string[] {
-		let seed = 12345;
-		const next = (limit: number): number => {
-			seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-			return seed % limit;
-		};
-		return Array.from({ length: count }, () => slots.map((slot) => slot[next(slot.length)] as string).join(""));
+	/** Every text made of one piece from each slot, in order, each text once. */
+	function everyText(slots: string[][]): string[] {
+		const all = slots.reduce<string[]>((texts, slot) => texts.flatMap((text) => slot.map((piece) => text + piece)), [""]);
+		return [...new Set(all)];
 	}
 
-	/** How many lines of `kind` the scan found in the texts, after checking that every text got what the old pattern gives. */
-	function agree(texts: string[], kind: string, old: RegExp): number {
+	/** The texts in which the scan finds fewer lines of `kind` than `old` does, and the texts in which it finds more. */
+	function differences(texts: string[], kind: string, old: RegExp): { fewer: string[]; more: string[]; flagged: number } {
+		const fewer: string[] = [];
+		const more: string[] = [];
 		let flagged = 0;
 		for (const text of texts) {
 			const got = scanForSecrets(text).filter((finding) => finding.kind === kind).length;
 			const lines = text.split(/\r\n|[\n\r]/).filter((line) => old.test(line)).length;
-			expect(got).toBe(lines);
+			if (got < lines) {
+				fewer.push(text);
+			} else if (got > lines) {
+				more.push(text);
+			}
 			flagged += got;
 		}
-		return flagged;
+		return { fewer, more, flagged };
 	}
 
-	it("agrees with the old nsec1… pattern on 3000 made-up texts", () => {
-		expect(agree(madeUp(NSEC_SLOTS, 3000), NSEC_KIND, OLD_NSEC)).toBeGreaterThan(100);
+	it("agrees with the old nsec1… pattern on all 959 distinct texts that its pieces make", () => {
+		const texts = everyText(NSEC_SLOTS);
+		expect(texts.length).toBe(959);
+		const { fewer, more, flagged } = differences(texts, NSEC_KIND, OLD_NSEC);
+		expect({ fewer, more }).toEqual({ fewer: [], more: [] });
+		expect(flagged).toBeGreaterThan(100);
 	});
 
-	it("agrees with the old 64-hex pattern on 3000 made-up texts, in either case", () => {
-		expect(agree(madeUp(HEX_SLOTS, 3000), HEX_KIND, OLD_HEX)).toBeGreaterThan(100);
+	it("agrees with the old 64-hex pattern on all 3102 distinct texts that its pieces make, in either case", () => {
+		const texts = everyText(HEX_SLOTS);
+		expect(texts.length).toBe(3102);
+		const { fewer, more, flagged } = differences(texts, HEX_KIND, OLD_HEX);
+		expect({ fewer, more }).toEqual({ fewer: [], more: [] });
+		expect(flagged).toBeGreaterThan(100);
 	});
 });
