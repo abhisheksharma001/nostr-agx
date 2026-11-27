@@ -747,7 +747,7 @@ describe("a slot that takes the name of an environment variable", () => {
 	const asArgs = (value: string): string[] => ["go", "fine", "--where", value];
 	const NOT_A_NAME = `${OPTION} is not a valid environment variable name (letters, digits and "_", not starting with a digit)${SHAPE}`;
 
-	it.each(["KEY", "_KEY", "key", "Key_1", "A", "_", "AGENT_KEY_2", "x".repeat(100), `a${STRANGER_HEX.slice(0, 54)}`])("lets %s through", async (name) => {
+	it.each(["KEY", "_KEY", "key", "Key_1", "A", "_", "AGENT_KEY_2", "x".repeat(40), `a${STRANGER_HEX.slice(0, 39)}`])("lets %s through", async (name) => {
 		expect(await refusal(scratch(table)(asArgs(name)))).toBeNull();
 		expect(isValidEnvName(name)).toBe(true);
 	});
@@ -761,7 +761,6 @@ describe("a slot that takes the name of an environment variable", () => {
 		for (const value of [NSEC, NSEC.toUpperCase(), `nostr:${NSEC}`, `ncryptsec1${"q".repeat(40)}`, [...NSEC].map((ch) => `%${ch.charCodeAt(0).toString(16)}`).join("")]) {
 			expect(await refusal(scratch(table)(asArgs(value))), value.slice(0, 12)).toEqual({ message: KEY_TEXT(OPTION), exitCode: 2 });
 		}
-		expect(isValidEnvName(NSEC)).toBe(true);
 	});
 
 	it("refuses 64 hex digits as a hex string, and 56 to 63 of them as not being a name", async () => {
@@ -773,7 +772,26 @@ describe("a slot that takes the name of an environment variable", () => {
 			expect(await refusal(scratch(table)(asArgs(value))), `${digits} digits`).toEqual({ message: NOT_A_NAME, exitCode: 2 });
 			expect(isValidEnvName(value), `${digits} digits`).toBe(false);
 		}
-		expect(isValidEnvName(`a${STRANGER_HEX.slice(0, 54)}`)).toBe(true);
+	});
+
+	it("takes a name of 40 characters and refuses one of 41 or more, naming the slot and not the value", async () => {
+		for (const length of [1, 39, 40]) {
+			expect(await refusal(scratch(table)(asArgs("A".repeat(length)))), `${length} characters`).toBeNull();
+			expect(isValidEnvName("A".repeat(length)), `${length} characters`).toBe(true);
+		}
+		for (const length of [41, 42, 56, 62, 100]) {
+			expect(await refusal(scratch(table)(asArgs("A".repeat(length)))), `${length} characters`).toEqual({ message: NOT_A_NAME, exitCode: 2 });
+			expect(isValidEnvName("A".repeat(length)), `${length} characters`).toBe(false);
+		}
+	});
+
+	it("refuses the two slips that carry most of a key: a letter with 55 hex digits, and an nsec1 key typed without its 1", async () => {
+		for (const value of [`x${STRANGER_HEX.slice(0, 55)}`, NSEC.replace("nsec1", "nsec")]) {
+			const result = await refusal(scratch(table)(asArgs(value)));
+			expect(result, value.slice(0, 8)).toEqual({ message: NOT_A_NAME, exitCode: 2 });
+			expect(result?.message).not.toContain(value.slice(4, 16));
+			expect(isValidEnvName(value), value.slice(0, 8)).toBe(false);
+		}
 	});
 
 	it("does not ask for a name of a slot that does not say so", async () => {

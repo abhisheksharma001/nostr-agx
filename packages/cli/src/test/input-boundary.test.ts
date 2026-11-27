@@ -177,6 +177,9 @@ function refusedRows(): Row[] {
 		{ name: "identity import --from-env <hex>", args: ["identity", "import", "--from-env", `a${STRANGER_HEX.slice(1)}`], message: HEX_RUN(option("--from-env", "identity import")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		{ name: "identity import --from-env <hex in capitals>", args: ["identity", "import", "--from-env", STRANGER_HEX.toUpperCase()], message: HEX_RUN(option("--from-env", "identity import")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		{ name: "identity import --from-env <hex, one digit short>", args: ["identity", "import", "--from-env", `a${STRANGER_HEX.slice(2)}`], message: NOT_AN_ENV_NAME(option("--from-env", "identity import")), remediation: ENV_NAME_REMEDIATION, secrets: [STRANGER_HEX] },
+		{ name: "identity import --from-env <a letter and 55 hex digits>", args: ["identity", "import", "--from-env", `x${STRANGER_HEX.slice(0, 55)}`], message: NOT_AN_ENV_NAME(option("--from-env", "identity import")), remediation: ENV_NAME_REMEDIATION, secrets: [STRANGER_HEX.slice(0, 55)] },
+		{ name: "identity import --from-env <nsec1 typed without its 1>", args: ["identity", "import", "--from-env", NSEC.replace("nsec1", "nsec")], message: NOT_AN_ENV_NAME(option("--from-env", "identity import")), remediation: ENV_NAME_REMEDIATION, secrets: [NSEC.slice(5, 30)] },
+		{ name: "identity import --from-env <41 characters>", args: ["identity", "import", "--from-env", "A".repeat(41)], message: NOT_AN_ENV_NAME(option("--from-env", "identity import")), remediation: ENV_NAME_REMEDIATION },
 		...["1KEY", "MY-KEY", "MY KEY", "KEY=1", "$HOME", ""].map((name) => ({
 			name: `identity import --from-env ${JSON.stringify(name)}`,
 			args: ["identity", "import", "--from-env", name],

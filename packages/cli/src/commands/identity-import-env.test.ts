@@ -274,6 +274,8 @@ describe("identity import --from-env: one source for the key", () => {
 		["a key as an argument", ["identity", "import", "--from-env", VAR, NSEC]],
 		["a hex key as an argument", ["identity", "import", "--from-env", VAR, HEX]],
 		["a key as an argument, written first", ["identity", "import", NSEC, "--from-env", VAR]],
+		["an empty argument", ["identity", "import", "--from-env", VAR, ""]],
+		["an empty argument, written first", ["identity", "import", "", "--from-env", VAR]],
 		["--stdin", ["identity", "import", "--from-env", VAR, "--stdin"]],
 		["--stdin and a key as an argument", ["identity", "import", "--stdin", "--from-env", VAR, NSEC]],
 		["--force and a key as an argument", ["identity", "import", "--force", "--from-env", VAR, NSEC]],
@@ -380,6 +382,9 @@ describe("identity import --from-env: what is given as the name", () => {
 	it.each([
 		["a hex key one digit short", () => `a${HEX.slice(2)}`],
 		["a hex key eight digits short", () => `a${HEX.slice(9)}`],
+		["41 characters", () => "A".repeat(41)],
+		["a letter and 55 hex digits of a key", () => `x${HEX.slice(0, 55)}`],
+		["an nsec1 key typed without its 1", () => NSEC.replace("nsec1", "nsec")],
 	])("%s: not a name, and not printed", async (_name, make) => {
 		const name = make();
 		process.env[name] = NSEC;
@@ -394,8 +399,8 @@ describe("identity import --from-env: what is given as the name", () => {
 		}
 	});
 
-	it("takes a long name that is not a key: 55 hex digits are a name", async () => {
-		const name = `a${HEX.slice(0, 54)}`;
+	it("takes a name of exactly 40 characters (control for the 41 above), and says it when it is not set", async () => {
+		const name = "ABCDEFGHIJ".repeat(4);
 		const run = await agx("identity", "import", "--from-env", name);
 		expect(run.code).toBe(EXIT.usage);
 		expect(plain(run.stderr)).toBe(failure(`The environment variable ${name} is not set.`, NOT_SET_HINT));
@@ -422,7 +427,7 @@ describe("identity import --from-env: what is given as the name", () => {
 		expect(listing(box.home)).toEqual([]);
 	});
 
-	it.each(["KEY", "_KEY", "key", "Key_1", "A", "_", "AGENT_KEY_2", "x".repeat(100)])("%s: is a name", async (name) => {
+	it.each(["KEY", "_KEY", "key", "Key_1", "A", "_", "AGENT_KEY_2", "x".repeat(40)])("%s: is a name", async (name) => {
 		process.env[name] = NSEC;
 		try {
 			const run = await agx("identity", "import", "--from-env", name);
@@ -449,5 +454,42 @@ describe("identity import --from-env: the key is never printed, logged or kept a
 			expect(leakedPart(run.stderr, value.replace(/^nostr:/i, ""), 10)).toBeNull();
 		}
 		expect(listing(box.home)).toEqual([]);
+	});
+});
+
+describe("identity import --from-env: a name that every object already has (toString, constructor ...)", () => {
+	const PROTOTYPE_NAMES = ["toString", "__proto__", "constructor", "hasOwnProperty", "valueOf"];
+
+	it.each(PROTOTYPE_NAMES)("%s, not set: says it is not set, like any other name", async (name) => {
+		expect(Object.hasOwn(process.env, name)).toBe(false);
+		const run = await agx("identity", "import", "--from-env", name);
+		expect(run.code).toBe(EXIT.usage);
+		expect(run.stdout).toBe("");
+		expect(plain(run.stderr)).toBe(failure(`The environment variable ${name} is not set.`, NOT_SET_HINT));
+		expect(listing(box.home)).toEqual([]);
+	});
+
+	it.each(PROTOTYPE_NAMES)("%s, set to a key: imports it", async (name) => {
+		process.env[name] = NSEC;
+		try {
+			const run = await agx("identity", "import", "--from-env", name);
+			expect(run.stderr).toBe("");
+			expect(run.code).toBe(EXIT.ok);
+			expect(stored().secretKeyHex === HEX).toBe(true);
+			expect(holdsKey(run.stdout, HEX)).toBe(false);
+		} finally {
+			delete process.env[name];
+		}
+	});
+
+	it.each(PROTOTYPE_NAMES)("%s, set to words: the --stdin text, not a crash", async (name) => {
+		process.env[name] = TEXT;
+		try {
+			const run = await agx("identity", "import", "--from-env", name);
+			expect(run.code).toBe(EXIT.usage);
+			expect(plain(run.stderr)).toBe(failure(NOT_A_KEY));
+		} finally {
+			delete process.env[name];
+		}
 	});
 });
