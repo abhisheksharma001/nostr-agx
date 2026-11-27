@@ -200,7 +200,7 @@ function refusedRows(): Row[] {
 		{ name: "card --relay <own hex>", args: ["card", FRIEND, "--relay", `ws://127.0.0.1:9/${OWN_HEX}`], message: OWN_KEY(option("--relay", "card")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
 		{ name: "AGX_TAILSCALE_STATE_DIR <own hex>", args: ["config", "list"], env: { AGX_TAILSCALE_STATE_DIR: `/tmp/${OWN_HEX}` }, message: OWN_KEY(variable("AGX_TAILSCALE_STATE_DIR")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
 		{ name: "AGX_RELAY <own hex>", args: ["config", "list"], env: { AGX_RELAY: `ws://127.0.0.1:9/${OWN_HEX.toUpperCase()}` }, message: OWN_KEY(variable("AGX_RELAY")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
-		{ name: "AGX_ORG <own hex>", args: ["config", "list"], env: { AGX_ORG: OWN_HEX }, message: OWN_KEY(variable("AGX_ORG")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
+		{ name: "AGX_ORG <own hex> (an id: a 64-digit run)", args: ["config", "list"], env: { AGX_ORG: OWN_HEX }, message: HEX_RUN(variable("AGX_ORG")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
 		// an option of a command that has subcommands, typed before the subcommand
 		keyed("gateway --host (typed before `key list`)", ["gateway", "--host", NSEC, "key", "list"], option("--host", "gateway")),
 		// the profile's own secret key where a public key, an id or text belongs

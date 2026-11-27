@@ -197,34 +197,35 @@ export const SLOTS: SlotTable = {
  * The environment variables the CLI reads. Only these are looked at, and each one is
  * looked at on every command, whether or not that command reads it: a key in one of them
  * would otherwise sit there until a command that does read it prints it. Because of that, a
- * run of 64 hex digits is let through every variable that is not a secret or a profile name
- * (see {@link LOCATION}): refusing a hash in a folder name would stop every command.
+ * run of 64 hex digits is let through the variables that hold a folder, a file or a URL (see
+ * {@link LOCATION}): refusing a hash in a folder name would stop every command. The others hold
+ * an id, a name or a switch, as their options do, and refuse it.
  */
 export const ENV_SLOTS: Record<string, SlotSpec> = {
 	AGX_HOME: LOCATION,
 	AGX_PROFILE: { kind: "identifier", profileName: true },
 	AGX_API_URL: LOCATION,
 	AGX_API_KEY: "secret",
-	AGX_ORG: LOCATION,
+	AGX_ORG: "identifier",
 	AGX_RELAY: LOCATION,
 	AGX_GATEWAY_KEY: "secret",
-	AGX_TAILSCALE: LOCATION,
+	AGX_TAILSCALE: "identifier",
 	AGX_TAILSCALE_AUTH_KEY: "secret",
 	TS_AUTHKEY: "secret",
 	AGX_TAILSCALE_OAUTH_CLIENT_SECRET: "secret",
 	AGX_TAILSCALE_OAUTH_URL: LOCATION,
-	AGX_TAILSCALE_OAUTH_CLIENT_ID: LOCATION,
-	AGX_TAILSCALE_OAUTH_SCOPE: LOCATION,
-	AGX_TAILSCALE_OAUTH_TOKEN_AUTH: LOCATION,
+	AGX_TAILSCALE_OAUTH_CLIENT_ID: "identifier",
+	AGX_TAILSCALE_OAUTH_SCOPE: "identifier",
+	AGX_TAILSCALE_OAUTH_TOKEN_AUTH: "identifier",
 	AGX_TAILSCALE_OAUTH_API_BASE_URL: LOCATION,
-	AGX_TAILSCALE_TAILNET: LOCATION,
-	AGX_TAILSCALE_TAGS: LOCATION,
-	AGX_TAILSCALE_HOSTNAME: LOCATION,
+	AGX_TAILSCALE_TAILNET: "identifier",
+	AGX_TAILSCALE_TAGS: "identifier",
+	AGX_TAILSCALE_HOSTNAME: "identifier",
 	AGX_TAILSCALE_STATE_DIR: LOCATION,
 	// Read by the launcher package, which the CLI starts with its standard error passed straight through.
 	AGX_TAILSCALE_BINARY: LOCATION,
-	AGX_DEBUG: LOCATION,
-	AGX_NO_BROWSER: LOCATION,
-	AGX_UI_DEV_STORE: LOCATION,
+	AGX_DEBUG: "identifier",
+	AGX_NO_BROWSER: "identifier",
+	AGX_UI_DEV_STORE: "identifier",
 	AGX_ELLADEX_URL: LOCATION,
 };
