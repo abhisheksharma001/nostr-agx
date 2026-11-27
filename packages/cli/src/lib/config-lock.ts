@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { linkSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { configError } from "./errors.js";
 import { configPath, ensureDir } from "./paths.js";
 
@@ -14,6 +14,10 @@ import { configPath, ensureDir } from "./paths.js";
  * `allow`. This is NOT the profile lock in `lock.ts`: that one is held for the whole
  * life of `serve`, `inbox`, `gateway` and `ui`, and `identity allow` must still work
  * while one of them runs. This one is held for the milliseconds a write takes.
+ *
+ * The same lock can guard any one file that is read, changed and written back (`withFileLock`): it is
+ * made next to that file, so the lock of one file never holds up a write of another. `config.json` is
+ * the case that has a name (`withConfigLock`).
  */
 
 /** How long a writer waits for another one before it gives up. A holder normally lets go within milliseconds. */
@@ -30,8 +34,13 @@ interface LockRecord {
 	token: string;
 }
 
+/** The lock of a file sits beside it. */
+function lockPathOf(file: string): string {
+	return `${file}.lock`;
+}
+
 export function configLockPath(): string {
-	return `${configPath()}.lock`;
+	return lockPathOf(configPath());
 }
 
 function parseRecord(text: string): LockRecord | null {
@@ -161,8 +170,9 @@ function pause(ms: number): void {
 	Atomics.wait(sleeper, 0, 0, ms);
 }
 
-function acquire(waitMs: number): { token: string; release: () => void } {
-	const path = configLockPath();
+/** Take the lock of `file`. `label` names the lock for a person: "config" in "the config lock". */
+function acquire(file: string, label: string, waitMs: number): { token: string; release: () => void } {
+	const path = lockPathOf(file);
 	ensureDir(dirname(path));
 	const token = randomUUID();
 	const mine = `${path}.${process.pid}.${token.slice(0, 8)}`;
@@ -197,7 +207,7 @@ function acquire(waitMs: number): { token: string; release: () => void } {
 			}
 			if (Date.now() >= deadline) {
 				throw configError(
-					`Could not take the config lock: another agx command has been writing ${configPath()} for more than ${Math.round(waitMs / 1000)} seconds.`,
+					`Could not take the ${label} lock: another agx command has been writing ${file} for more than ${Math.round(waitMs / 1000)} seconds.`,
 					`If no other agx command is running, remove the lock and try again:\n    rm ${path}`,
 				);
 			}
@@ -209,9 +219,8 @@ function acquire(waitMs: number): { token: string; release: () => void } {
 	}
 }
 
-let depth = 0;
-/** The token in the lock record this process wrote, while it holds the lock. */
-let heldToken: string | null = null;
+/** For each file whose lock this process holds: the token in the lock record this process wrote. */
+const held = new Map<string, string>();
 
 /** A function that returns a promise is refused: the lock is let go when `fn` returns, before the promise settles. */
 type NotAPromise<T> = T extends PromiseLike<unknown> ? never : T;
@@ -228,27 +237,42 @@ function runSynchronously<T>(fn: () => NotAPromise<T>): T {
 }
 
 /**
- * Run `fn` while holding the config lock. Re-entrant within one process, so a
- * caller that already holds it can call `updateProfile` without waiting for itself.
+ * Run `fn` while holding the lock of `file`. Re-entrant within one process, so a caller that already
+ * holds it can call again without waiting for itself. `label` names the lock in what a person reads:
+ * "Tailscale secrets" gives "Could not take the Tailscale secrets lock".
+ *
+ * Nothing holds the locks of two files at once today. If something ever does, every place must take
+ * them in the same order, or two commands can each wait for the other until the wait runs out.
  */
-export function withConfigLock<T>(fn: () => NotAPromise<T>, options: { waitMs?: number } = {}): T {
-	if (depth > 0) {
+export function withFileLock<T>(
+	file: string,
+	label: string,
+	fn: () => NotAPromise<T>,
+	options: { waitMs?: number } = {},
+): T {
+	if (held.has(file)) {
 		return runSynchronously(fn);
 	}
-	const { token, release } = acquire(options.waitMs ?? CONFIG_LOCK_WAIT_MS);
-	depth = 1;
-	heldToken = token;
+	const { token, release } = acquire(file, label, options.waitMs ?? CONFIG_LOCK_WAIT_MS);
+	held.set(file, token);
 	try {
 		return runSynchronously(fn);
 	} finally {
-		depth = 0;
-		heldToken = null;
+		held.delete(file);
 		release();
 	}
 }
 
 /**
- * Called right before config.json is renamed into place. A command that is stopped for longer than
+ * Run `fn` while holding the config lock. Re-entrant within one process, so a
+ * caller that already holds it can call `updateProfile` without waiting for itself.
+ */
+export function withConfigLock<T>(fn: () => NotAPromise<T>, options: { waitMs?: number } = {}): T {
+	return withFileLock<T>(configPath(), "config", fn, options);
+}
+
+/**
+ * Called right before `file` is renamed into place. A command that is stopped for longer than
  * the stale age (a debugger, a laptop asleep) has its lock taken by the next one, and would then
  * publish its out-of-date copy over what that command saved. So the holder checks, one step before
  * the rename, that the lock file still carries its own token; if it does not, this raises and nothing
@@ -256,12 +280,18 @@ export function withConfigLock<T>(fn: () => NotAPromise<T>, options: { waitMs?: 
  * close it: that would need the file system to refuse a write from a holder that was displaced.
  * A save made outside the lock holds nothing to lose, so it is never refused.
  */
-export function assertConfigLockHeld(): void {
-	if (heldToken === null || readRecord(configLockPath())?.token === heldToken) {
+export function assertFileLockHeld(file: string, label: string): void {
+	const token = held.get(file);
+	if (token === undefined || readRecord(lockPathOf(file))?.token === token) {
 		return;
 	}
 	throw configError(
-		`This change was not saved: another agx command took over the config lock on ${configPath()} while this one was stopped for more than ${CONFIG_LOCK_STALE_MS / 1000} seconds. config.json is as that command left it.`,
+		`This change was not saved: another agx command took over the ${label} lock on ${file} while this one was stopped for more than ${CONFIG_LOCK_STALE_MS / 1000} seconds. ${basename(file)} is as that command left it.`,
 		"Run the command again.",
 	);
+}
+
+/** `assertFileLockHeld` for config.json. */
+export function assertConfigLockHeld(): void {
+	assertFileLockHeld(configPath(), "config");
 }

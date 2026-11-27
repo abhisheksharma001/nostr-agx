@@ -44,6 +44,8 @@ import { dirname, join } from "node:path";
  *                                         idempotent and background task operations and outcomes
  *     profiles/<name>/tailscale.json       opt-in Tailscale auth key / OAuth client secret
  *                                         (only when `agx tailscale enable` stored one)
+ *     profiles/<name>/tailscale.json.lock  held for the milliseconds one write of
+ *                                         tailscale.json takes (see config-lock.ts)
  */
 
 export function agxHome(): string {
