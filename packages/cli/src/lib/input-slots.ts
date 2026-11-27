@@ -14,7 +14,8 @@
  * - `secret`: a secret key (or a password or token) is expected here. Not checked.
  * - `publicKey`: an npub or 64 hex digits that name a peer. The profile's own secret key
  *   is the same 64 digits, so it is refused here; any other 64-digit run is a public key.
- * - `identifier`: a name, id, path, URL or number. No key shape and no 64-hex run belongs.
+ * - `identifier`: a name, id, path, URL or number. No key shape belongs, and no 64-hex run except
+ *   where the rule says `hexOk` (a thread id, a path, a URL or an environment variable).
  * - `freeText`: words typed by a person. A key shape is refused; a 64-hex run passes, as
  *   an event id or a hash would, except the profile's own secret key.
  */
@@ -27,7 +28,7 @@ export interface SlotRule {
 	kind: SlotKind;
 	/** Default `refuse`. `warn` prints one line on standard error and goes on; `allow` goes on. */
 	policy?: SlotPolicy;
-	/** An `identifier` that may be 64 hex digits: a slot that takes an event id. */
+	/** An `identifier` that may be 64 hex digits: an event id, or a path or URL where a content hash is normal. A key shape and the profile's own key are still refused. */
 	hexOk?: boolean;
 	/** The value is a profile name and must also be one short folder name. */
 	profileName?: boolean;
