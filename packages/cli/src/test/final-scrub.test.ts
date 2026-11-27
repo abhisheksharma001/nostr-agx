@@ -219,8 +219,10 @@ describe("ordinary messages, help and exit codes do not change", () => {
 		const run = await agx("--help");
 		expect(run.code).toBe(0);
 		expect(run.stdout).toBe(buildProgram().helpInformation());
+		// No help holds a key-shaped word any more (a key on the command line is not advertised), so the one that
+		// takes a key is checked by its own option: the words come out as the help wrote them.
 		const identityImport = await agx("identity", "import", "--help");
-		expect(identityImport.stdout).toContain("nsec1…");
+		expect(identityImport.stdout).toContain("--from-env <name>");
 	});
 
 	it("a public key, a pubkey as hex and the file path come out as they were", async () => {
