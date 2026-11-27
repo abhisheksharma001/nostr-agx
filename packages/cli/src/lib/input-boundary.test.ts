@@ -1,0 +1,477 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { hexToBytes } from "@nostr-agx/nostr";
+import { Command } from "commander";
+import { nip19 } from "nostr-tools";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { buildProgram } from "../program.js";
+import { capture, sandbox } from "../test/helpers.js";
+import { walkProgram } from "../test/canary-kit.js";
+import { AgxCliError } from "./errors.js";
+import { createIdentity, saveIdentity } from "./identity.js";
+import { checkInputs, isValidProfileName, PROFILE_NAME_MAX } from "./input-boundary.js";
+import { ENV_SLOTS, SLOTS, type SlotTable } from "./input-slots.js";
+
+// The slot table says what kind of value each input of each command takes, and the check
+// that runs after the parser and before any command refuses a secret key in a slot that
+// is not a secret slot, without ever repeating the value. Every key here is made when the
+// test runs and none is real.
+
+let box: ReturnType<typeof sandbox>;
+const mine = createIdentity();
+const stranger = createIdentity();
+const NSEC = nip19.nsecEncode(hexToBytes(stranger.secretKeyHex));
+const STRANGER_HEX = stranger.secretKeyHex;
+const OWN_HEX = mine.secretKeyHex;
+
+beforeEach(() => {
+	box = sandbox();
+	saveIdentity("default", mine);
+});
+
+afterEach(() => {
+	box.restore();
+});
+
+// ------------------------------------------------------------------ the table is complete
+
+describe("the slot table", () => {
+	const nodes = walkProgram(buildProgram());
+	/** A flag that takes no value but reads standard input: its stdin is a secret, so it is in the table. */
+	const readsStdin = (name: string): boolean => /stdin$/.test(name);
+
+	it("classifies every input of every command: each value, and each flag that reads standard input", () => {
+		const problems: string[] = [];
+		for (const node of nodes) {
+			const entry = SLOTS[node.label] ?? {};
+			for (const slot of node.slots) {
+				const listed = entry[slot.name] !== undefined;
+				const needed = slot.takesValue || readsStdin(slot.name);
+				if (needed && !listed) {
+					problems.push(`"${node.label}" ${slot.name} has no kind`);
+				}
+				if (!needed && listed) {
+					problems.push(`"${node.label}" ${slot.name} takes no value and does not read standard input: take it out`);
+				}
+			}
+			const names = new Set(node.slots.map((slot) => slot.name));
+			for (const name of Object.keys(entry)) {
+				if (!names.has(name)) {
+					problems.push(`"${node.label}" ${name} is in the table and not in the program`);
+				}
+			}
+		}
+		const labels = new Set(nodes.map((node) => node.label));
+		for (const label of Object.keys(SLOTS)) {
+			if (!labels.has(label)) {
+				problems.push(`command "${label}" is in the table and not in the program`);
+			}
+		}
+		expect(problems).toEqual([]);
+	});
+
+	it("uses all four kinds", () => {
+		const kinds = new Set<string>();
+		for (const entry of Object.values(SLOTS)) {
+			for (const spec of Object.values(entry)) {
+				if (typeof spec === "function") {
+					continue;
+				}
+				kinds.add(typeof spec === "string" ? spec : spec.kind);
+			}
+		}
+		expect([...kinds].sort()).toEqual(["freeText", "identifier", "publicKey", "secret"]);
+	});
+
+	it("names the secret slots, and only these, as secret", () => {
+		const secret: string[] = [];
+		for (const [command, entry] of Object.entries(SLOTS)) {
+			for (const [slot, spec] of Object.entries(entry)) {
+				if (typeof spec === "function" || (typeof spec === "string" ? spec : spec.kind) === "secret") {
+					secret.push(`${command} ${slot}`);
+				}
+			}
+		}
+		expect(secret.sort()).toEqual([
+			"config set --stdin",
+			"config set [value]",
+			"identity import --stdin",
+			"identity import [secret]",
+			"tailscale enable --auth-key",
+			"tailscale enable --auth-key-stdin",
+			"tailscale enable --oauth-client-secret",
+			"tailscale enable --oauth-client-secret-stdin",
+			"tailscale up --auth-key",
+			"tailscale up --auth-key-stdin",
+		]);
+	});
+
+	it("lets four message-body slots through as typed, until it is decided whether they refuse a key", () => {
+		const allowed: string[] = [];
+		for (const [command, entry] of Object.entries(SLOTS)) {
+			for (const [slot, spec] of Object.entries(entry)) {
+				if (typeof spec !== "function" && typeof spec !== "string" && spec.kind !== "secret" && spec.policy === "allow") {
+					allowed.push(`${command} ${slot}`);
+				}
+			}
+		}
+		expect(allowed.sort()).toEqual(["request --payload", "send --subject", "send <message>", "serve --reply-text"]);
+	});
+
+	it("lets a 64-digit run through only where a peer may choose the id: three thread-id slots", () => {
+		const hexOk: string[] = [];
+		for (const [command, entry] of Object.entries(SLOTS)) {
+			for (const [slot, spec] of Object.entries(entry)) {
+				if (typeof spec !== "function" && typeof spec !== "string" && spec.kind === "identifier" && spec.hexOk) {
+					hexOk.push(`${command} ${slot}`);
+				}
+			}
+		}
+		expect(hexOk.sort()).toEqual(["inbox --thread", "send --context-id", "thread <contextId>"]);
+	});
+
+	it("takes the three profile-name slots through the profile-name rule", () => {
+		const names: string[] = [];
+		for (const [command, entry] of Object.entries(SLOTS)) {
+			for (const [slot, spec] of Object.entries(entry)) {
+				if (typeof spec !== "function" && typeof spec !== "string" && spec.profileName) {
+					names.push(`${command} ${slot}`);
+				}
+			}
+		}
+		for (const [name, spec] of Object.entries(ENV_SLOTS)) {
+			if (typeof spec !== "function" && typeof spec !== "string" && spec.profileName) {
+				names.push(`env ${name}`);
+			}
+		}
+		expect(names.sort()).toEqual(["(program) --profile", "config use <profile>", "env AGX_PROFILE"]);
+	});
+});
+
+describe("the environment table", () => {
+	it("classifies every environment variable the CLI source mentions", () => {
+		const root = fileURLToPath(new URL("..", import.meta.url));
+		const found = new Set<string>();
+		const walk = (dir: string): void => {
+			for (const entry of readdirSync(dir, { withFileTypes: true })) {
+				const path = join(dir, entry.name);
+				if (entry.isDirectory()) {
+					walk(path);
+				} else if (/\.ts$/.test(entry.name) && !/\.test\.ts$/.test(entry.name) && !path.includes(`${join(root, "test")}/`)) {
+					for (const match of readFileSync(path, "utf8").matchAll(/\b(AGX_[A-Z0-9_]+|TS_AUTHKEY)\b/g)) {
+						found.add(match[1] as string);
+					}
+				}
+			}
+		};
+		walk(root);
+		// Names that start with AGX_ and are not environment variables: a constant, an OAuth client id, a scope.
+		const notEnvironment = new Set(["AGX_CLI_VERSION", "AGX_CLIENT_ID", "AGX_SCOPES", "AGX_SCOPE_STRING"]);
+		const missing = [...found].filter((name) => !notEnvironment.has(name) && !(name in ENV_SLOTS)).sort();
+		expect(missing).toEqual([]);
+	});
+
+	it("keeps the secrets (API key, gateway key, Tailscale key and OAuth client secret) as secret slots", () => {
+		const secret = Object.entries(ENV_SLOTS)
+			.filter(([, spec]) => spec === "secret")
+			.map(([name]) => name)
+			.sort();
+		expect(secret).toEqual(["AGX_API_KEY", "AGX_GATEWAY_KEY", "AGX_TAILSCALE_AUTH_KEY", "AGX_TAILSCALE_OAUTH_CLIENT_SECRET", "TS_AUTHKEY"]);
+	});
+});
+
+// --------------------------------------------------------------- the check, on a small program
+
+/** The label of the slot, as the message names it. */
+const OPTION = "The value of `--where` (agx go)";
+const ARGUMENT = "The `<thing>` argument (agx go)";
+const SHAPE = ", so it was not used and is not shown here.";
+const KEY_TEXT = (label: string): string => `${label} holds a secret key (nsec1… or ncryptsec1…)${SHAPE}`;
+const HEX_TEXT = (label: string): string => `${label} holds a 64-character hex string, which may be a secret key${SHAPE}`;
+const OWN_TEXT = (label: string): string => `${label} holds this profile's own secret key${SHAPE}`;
+
+/** A two-command program with the check installed the way `buildProgram` installs it, and a table of our own. */
+function scratch(table: SlotTable, env: NodeJS.ProcessEnv = {}, amountDefault = "5"): (args: string[]) => Promise<void> {
+	return async (args) => {
+		const program = new Command();
+		program.exitOverride();
+		program.option("--profile <name>");
+		program
+			.command("go <thing>")
+			.option("--where <path>")
+			.option("--tag <name...>")
+			.option("--amount <n>", "a number", amountDefault)
+			.action(() => undefined);
+		program.hook("preAction", (_root, action) => checkInputs(action, { table, env }));
+		await program.parseAsync(args, { from: "user" });
+	};
+}
+
+async function refusal(promise: Promise<unknown>): Promise<{ message: string; exitCode: number } | null> {
+	try {
+		await promise;
+		return null;
+	} catch (error) {
+		if (error instanceof AgxCliError) {
+			return { message: error.message, exitCode: error.exitCode };
+		}
+		throw error;
+	}
+}
+
+describe("a value in a slot of each kind", () => {
+	const table = (kind: "secret" | "publicKey" | "identifier" | "freeText"): SlotTable => ({
+		go: { "<thing>": "freeText", "--where": kind },
+	});
+	const asArgs = (value: string): string[] => ["go", "fine", "--where", value];
+	const forms: Array<[string, string]> = [
+		["an nsec1 key", NSEC],
+		["an nsec1 key in capitals", NSEC.toUpperCase()],
+		["an nsec1 key behind nostr:", `nostr:${NSEC}`],
+		["an nsec1 key written as %xx escapes", [...NSEC].map((ch) => `%${ch.charCodeAt(0).toString(16)}`).join("")],
+		["an nsec1 key inside a sentence", `my key is ${NSEC} and please keep it safe`],
+		["a key cut short", NSEC.slice(0, 12)],
+		["the bare prefix, which the lenient shared rule also reads as a key", "nsec1"],
+		["an ncryptsec1 key", `ncryptsec1${"q".repeat(40)}`],
+	];
+
+	it.each(forms)("refuses %s in a public key, identifier or free text slot, naming the slot and not the value", async (_name, value) => {
+		for (const kind of ["publicKey", "identifier", "freeText"] as const) {
+			const result = await refusal(scratch(table(kind))(asArgs(value)));
+			expect(result, kind).toEqual({ message: KEY_TEXT(OPTION), exitCode: 2 });
+		}
+	});
+
+	it.each(forms)("lets %s through a secret slot, which is what a secret slot is for", async (_name, value) => {
+		expect(await refusal(scratch(table("secret"))(asArgs(value)))).toBeNull();
+	});
+
+	it("refuses a key in a positional slot and names the argument", async () => {
+		const result = await refusal(scratch({ go: { "<thing>": "identifier", "--where": "identifier" } })(["go", NSEC]));
+		expect(result).toEqual({ message: KEY_TEXT(ARGUMENT), exitCode: 2 });
+	});
+
+	it("refuses a key in any value of a repeated option", async () => {
+		const result = await refusal(scratch({ go: { "<thing>": "identifier", "--tag": "identifier" } })(["go", "x", "--tag", "ok", NSEC]));
+		expect(result).toEqual({ message: KEY_TEXT("The value of `--tag` (agx go)"), exitCode: 2 });
+	});
+
+	it("refuses 64 hex digits in an identifier slot, in either case, even inside a longer text", async () => {
+		for (const value of [STRANGER_HEX, STRANGER_HEX.toUpperCase(), `/tmp/${STRANGER_HEX}/x`, `a${STRANGER_HEX}`, `${STRANGER_HEX}0`]) {
+			const result = await refusal(scratch(table("identifier"))(asArgs(value)));
+			expect(result, value.slice(0, 4)).toEqual({ message: HEX_TEXT(OPTION), exitCode: 2 });
+		}
+	});
+
+	it("lets 64 hex digits through a public key slot and a free text slot: they are a public key, an event id or a hash", async () => {
+		for (const kind of ["publicKey", "freeText"] as const) {
+			expect(await refusal(scratch(table(kind))(asArgs(STRANGER_HEX)))).toBeNull();
+			expect(await refusal(scratch(table(kind))(asArgs(STRANGER_HEX.toUpperCase())))).toBeNull();
+		}
+	});
+
+	it("lets 64 hex digits through an identifier slot that takes event ids, and still refuses a key there", async () => {
+		const hexOk: SlotTable = { go: { "<thing>": "freeText", "--where": { kind: "identifier", hexOk: true } } };
+		expect(await refusal(scratch(hexOk)(asArgs(STRANGER_HEX)))).toBeNull();
+		expect(await refusal(scratch(hexOk)(asArgs(NSEC)))).toEqual({ message: KEY_TEXT(OPTION), exitCode: 2 });
+	});
+
+	it("lets ordinary values through every kind", async () => {
+		const ordinary = ["alice", "invoice.review", "https://example.com/a?b=c", "npub1abc", "nsec", "2026-11-27", `63 digits ${STRANGER_HEX.slice(0, 63)}`];
+		for (const kind of ["publicKey", "identifier", "freeText"] as const) {
+			for (const value of ordinary) {
+				expect(await refusal(scratch(table(kind))(asArgs(value))), `${kind} ${value.slice(0, 12)}`).toBeNull();
+			}
+		}
+	});
+
+	it("does not look at a value that was not typed: a default is the program's own", async () => {
+		const run = scratch({ go: { "<thing>": "identifier", "--amount": "identifier" } }, {}, NSEC);
+		expect(await refusal(run(["go", "x"]))).toBeNull();
+		expect(await refusal(run(["go", "x", "--amount", NSEC]))).toEqual({ message: KEY_TEXT("The value of `--amount` (agx go)"), exitCode: 2 });
+	});
+
+	it("treats a slot that is not in the table as free text: a key is refused, 64 hex digits are not", async () => {
+		expect(await refusal(scratch({})(["go", NSEC]))).toEqual({ message: KEY_TEXT(ARGUMENT), exitCode: 2 });
+		expect(await refusal(scratch({})(["go", STRANGER_HEX]))).toBeNull();
+	});
+
+	it("takes the kind of a slot from another slot when the table says so", async () => {
+		const byKey: SlotTable = {
+			go: { "<thing>": "identifier", "--where": (others) => (others["<thing>"] === "apiKey" ? "secret" : "identifier") },
+		};
+		expect(await refusal(scratch(byKey)(["go", "apiKey", "--where", NSEC]))).toBeNull();
+		expect(await refusal(scratch(byKey)(["go", "org", "--where", NSEC]))).toEqual({ message: KEY_TEXT(OPTION), exitCode: 2 });
+	});
+});
+
+describe("the profile's own key", () => {
+	const table = (kind: "publicKey" | "identifier" | "freeText"): SlotTable => ({ go: { "<thing>": "freeText", "--where": kind } });
+	const asArgs = (value: string): string[] => ["go", "fine", "--where", value];
+	const npubOfOwnBytes = nip19.npubEncode(OWN_HEX);
+
+	it.each([
+		["as 64 hex digits", OWN_HEX],
+		["in capitals", OWN_HEX.toUpperCase()],
+		["with spaces around it", `  ${OWN_HEX}  `],
+	])("is refused in a public key slot %s, and a stranger's key is not", async (_name, value) => {
+		expect(await refusal(scratch(table("publicKey"))(asArgs(value)))).toEqual({ message: OWN_TEXT(OPTION), exitCode: 2 });
+		expect(await refusal(scratch(table("publicKey"))(asArgs(STRANGER_HEX)))).toBeNull();
+	});
+
+	it("is refused in a public key slot as the npub that carries the same 32 bytes", async () => {
+		expect(await refusal(scratch(table("publicKey"))(asArgs(npubOfOwnBytes)))).toEqual({ message: OWN_TEXT(OPTION), exitCode: 2 });
+	});
+
+	it("does not refuse the profile's own public key", async () => {
+		expect(await refusal(scratch(table("publicKey"))(asArgs(mine.npub)))).toBeNull();
+		expect(await refusal(scratch(table("publicKey"))(asArgs(mine.publicKey)))).toBeNull();
+	});
+
+	it("is refused inside a free text slot, which lets other 64-digit runs through", async () => {
+		expect(await refusal(scratch(table("freeText"))(asArgs(`my key is ${OWN_HEX} ok`)))).toEqual({ message: OWN_TEXT(OPTION), exitCode: 2 });
+		expect(await refusal(scratch(table("freeText"))(asArgs(`a public key ${STRANGER_HEX} ok`)))).toBeNull();
+	});
+
+	it("is refused in an identifier slot that takes event ids", async () => {
+		const hexOk: SlotTable = { go: { "<thing>": "freeText", "--where": { kind: "identifier", hexOk: true } } };
+		expect(await refusal(scratch(hexOk)(asArgs(OWN_HEX)))).toEqual({ message: OWN_TEXT(OPTION), exitCode: 2 });
+	});
+
+	it("is not known when the profile has no identity file: the same 64 digits pass, and the check says nothing", async () => {
+		box.restore();
+		box = sandbox();
+		expect(await refusal(scratch(table("publicKey"))(asArgs(OWN_HEX)))).toBeNull();
+	});
+
+	it("is the key of the profile that the command would use: --profile first, then AGX_PROFILE, then the stored one", async () => {
+		const other = createIdentity();
+		saveIdentity("second", other);
+		const run = scratch(table("publicKey"));
+		const own = { message: OWN_TEXT(OPTION), exitCode: 2 };
+		// Nothing says which profile: the stored one, "default".
+		expect(await refusal(run(asArgs(OWN_HEX)))).toEqual(own);
+		expect(await refusal(run(asArgs(other.secretKeyHex)))).toBeNull();
+		// The flag.
+		expect(await refusal(run(["--profile", "second", ...asArgs(other.secretKeyHex)]))).toEqual(own);
+		expect(await refusal(run(["--profile", "second", ...asArgs(OWN_HEX)]))).toBeNull();
+		// The environment, which the flag beats.
+		process.env.AGX_PROFILE = "second";
+		expect(await refusal(run(asArgs(other.secretKeyHex)))).toEqual(own);
+		expect(await refusal(run(asArgs(OWN_HEX)))).toBeNull();
+		expect(await refusal(run(["--profile", "default", ...asArgs(OWN_HEX)]))).toEqual(own);
+	});
+});
+
+describe("refuse, warn or allow, slot by slot", () => {
+	const table = (policy: "refuse" | "warn" | "allow"): SlotTable => ({ go: { "<thing>": "freeText", "--where": { kind: "freeText", policy } } });
+
+	it("refuses by default and when the slot says so", async () => {
+		expect(await refusal(scratch(table("refuse"))(["go", "x", "--where", NSEC]))).toEqual({ message: KEY_TEXT(OPTION), exitCode: 2 });
+		expect(await refusal(scratch({ go: { "<thing>": "freeText", "--where": "freeText" } })(["go", "x", "--where", NSEC]))).toEqual({
+			message: KEY_TEXT(OPTION),
+			exitCode: 2,
+		});
+	});
+
+	it("allows: the value goes through and nothing is printed", async () => {
+		const shown = await capture(async () => refusal(scratch(table("allow"))(["go", "x", "--where", NSEC])));
+		expect(shown.value).toBeNull();
+		expect(shown.stdout + shown.stderr).toBe("");
+	});
+
+	it("warns: the value goes through, one line on standard error names the slot and not the value", async () => {
+		const shown = await capture(async () => refusal(scratch(table("warn"))(["go", "x", "--where", NSEC])));
+		expect(shown.value).toBeNull();
+		expect(shown.stdout).toBe("");
+		expect(shown.stderr).toBe(`! ${OPTION} holds a secret key (nsec1… or ncryptsec1…). It is used as typed and is not shown here.\n`);
+	});
+
+	it("warns and allows only for the slot that says so", async () => {
+		const mixed: SlotTable = { go: { "<thing>": "freeText", "--where": { kind: "freeText", policy: "allow" }, "--tag": "freeText" } };
+		expect(await refusal(scratch(mixed)(["go", "x", "--where", NSEC]))).toBeNull();
+		expect(await refusal(scratch(mixed)(["go", "x", "--tag", NSEC]))).toEqual({ message: KEY_TEXT("The value of `--tag` (agx go)"), exitCode: 2 });
+	});
+
+	it("applies the rule of a slot to the own key too", async () => {
+		expect(await refusal(scratch(table("allow"))(["go", "x", "--where", OWN_HEX]))).toBeNull();
+		expect(await refusal(scratch(table("refuse"))(["go", "x", "--where", OWN_HEX]))).toEqual({ message: OWN_TEXT(OPTION), exitCode: 2 });
+	});
+});
+
+describe("the environment", () => {
+	const table: SlotTable = { go: { "<thing>": "freeText" } };
+
+	it("refuses a key in an environment variable that is not a secret one, and names the variable", async () => {
+		const result = await refusal(scratch(table, { AGX_ORG: NSEC })(["go", "x"]));
+		expect(result).toEqual({ message: `The environment variable AGX_ORG holds a secret key (nsec1… or ncryptsec1…)${SHAPE}`, exitCode: 2 });
+	});
+
+	it("lets a key through an environment variable that is a secret one", async () => {
+		expect(await refusal(scratch(table, { AGX_API_KEY: NSEC })(["go", "x"]))).toBeNull();
+	});
+
+	it("looks only at variables that are set and not empty", async () => {
+		expect(await refusal(scratch(table, { AGX_ORG: "" })(["go", "x"]))).toBeNull();
+		expect(await refusal(scratch(table, {})(["go", "x"]))).toBeNull();
+	});
+
+	it("applies the profile-name rule to AGX_PROFILE", async () => {
+		const result = await refusal(scratch(table, { AGX_PROFILE: "a b" })(["go", "x"]));
+		expect(result).toEqual({
+			message: 'The environment variable AGX_PROFILE is not a valid profile name (1 to 32 letters, digits, "-", "_" or "."; not "." or ".."), so it was not used and is not shown here.',
+			exitCode: 2,
+		});
+		expect(await refusal(scratch(table, { AGX_PROFILE: "work" })(["go", "x"]))).toBeNull();
+	});
+});
+
+// ------------------------------------------------------------------------- profile names
+
+describe("a profile name", () => {
+	it("is 1 to 32 letters, digits, dash, underscore and dot, and not . or ..", () => {
+		expect(PROFILE_NAME_MAX).toBe(32);
+		const good = ["default", "work", "a", "A1", "n8n-demo", "demo_requester", "v1.2", "claude-company-memory", ".hidden", "a..b", "x".repeat(32), "_", "-", "..."];
+		const bad: Array<[string, string]> = [
+			["empty", ""],
+			["a dot", "."],
+			["two dots", ".."],
+			["too long", "x".repeat(33)],
+			["a slash", "a/b"],
+			["a path up", "../x"],
+			["a path down", "x/.."],
+			["an absolute path", "/etc"],
+			["a backslash", "a\\b"],
+			["a space", "my profile"],
+			["a trailing space", "work "],
+			["an at sign", "work@acme"],
+			["a colon", "a:b"],
+			["a non-ASCII letter", "café"],
+			["a line feed", "a\nb"],
+			["a null character", "a\u0000b"],
+			["a tilde", "~"],
+			["a nsec1 key", NSEC],
+			["64 hex digits", STRANGER_HEX],
+		];
+		for (const name of good) {
+			expect(isValidProfileName(name), name).toBe(true);
+		}
+		for (const [why, name] of bad) {
+			expect(isValidProfileName(name), why).toBe(false);
+		}
+	});
+
+	it("is refused with one fixed message that holds no part of the name", async () => {
+		const profileTable: SlotTable = { "(program)": { "--profile": { kind: "identifier", profileName: true } }, go: { "<thing>": "freeText" } };
+		for (const name of ["../escape", "a/b", "my profile", "x".repeat(33), "..", "é"]) {
+			const result = await refusal(scratch(profileTable)(["--profile", name, "go", "x"]));
+			expect(result, name).toEqual({
+				message: 'The value of `--profile` is not a valid profile name (1 to 32 letters, digits, "-", "_" or "."; not "." or ".."), so it was not used and is not shown here.',
+				exitCode: 2,
+			});
+			expect(result?.message).not.toContain(name);
+		}
+		expect(await refusal(scratch(profileTable)(["--profile", "work", "go", "x"]))).toBeNull();
+	});
+});
