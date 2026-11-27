@@ -592,10 +592,16 @@ describe("the environment", () => {
 	it.each([
 		["an empty text", ""],
 		["a name with a space", "my profile"],
-		["a secret key", NSEC],
-		["64 hex digits", STRANGER_HEX],
-	])("does not look at AGX_PROFILE when --profile names the profile: %s is never used then", async (_name, value) => {
+	])("does not apply the profile-name rule to AGX_PROFILE when --profile names the profile: %s is never used as a name then", async (_name, value) => {
 		expect(await refusal(scratch(named, { AGX_PROFILE: value })(["--profile", "work", "go", "x"]))).toBeNull();
+	});
+
+	it.each([
+		["a secret key", NSEC, KEY_TEXT("The environment variable AGX_PROFILE")],
+		["64 hex digits", STRANGER_HEX, HEX_TEXT("The environment variable AGX_PROFILE")],
+		["the own key as 64 hex digits", OWN_HEX, HEX_TEXT("The environment variable AGX_PROFILE")],
+	])("still refuses %s in AGX_PROFILE when --profile names the profile: a key does not sit in the environment", async (_name, value, message) => {
+		expect(await refusal(scratch(named, { AGX_PROFILE: value })(["--profile", "work", "go", "x"]))).toEqual({ message, exitCode: 2 });
 	});
 
 	it("still refuses AGX_PROFILE when no --profile is typed, and still refuses the flag itself", async () => {

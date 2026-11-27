@@ -188,6 +188,10 @@ function refusedRows(): Row[] {
 		{ name: "--profile <hex>", args: ["--profile", STRANGER_HEX, "identity", "new"], message: HEX_RUN("The value of `--profile`"), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		{ name: "config use <hex>", args: ["config", "use", STRANGER_HEX], message: HEX_RUN(argument("<profile>", "config use")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		{ name: "AGX_PROFILE <hex>", args: ["config", "list"], env: { AGX_PROFILE: STRANGER_HEX }, message: HEX_RUN(variable("AGX_PROFILE")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
+		// a --profile typed on the command line wins over AGX_PROFILE, which is then not used as a name, but a key in it is still refused
+		{ name: "AGX_PROFILE <nsec> with --profile typed", args: ["--profile", "work", "identity", "show"], env: { AGX_PROFILE: NSEC }, message: SECRET_KEY(variable("AGX_PROFILE")), remediation: KEY_REMEDIATION, secrets: [NSEC] },
+		{ name: "AGX_PROFILE <hex> with --profile typed", args: ["--profile", "work", "identity", "show"], env: { AGX_PROFILE: STRANGER_HEX }, message: HEX_RUN(variable("AGX_PROFILE")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
+		{ name: "AGX_PROFILE <own hex> with --profile typed", args: ["--profile", "work", "identity", "show"], env: { AGX_PROFILE: OWN_HEX }, message: HEX_RUN(variable("AGX_PROFILE")), remediation: KEY_REMEDIATION, secrets: [OWN_HEX] },
 		{ name: "domain list --org <hex>", args: ["domain", "list", "--org", STRANGER_HEX], message: HEX_RUN(option("--org", "domain list")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		{ name: "gateway key revoke <hex>", args: ["gateway", "key", "revoke", STRANGER_HEX], message: HEX_RUN(argument("<id>", "gateway key revoke")), remediation: KEY_REMEDIATION, secrets: [STRANGER_HEX] },
 		// an id or a switch in the environment is refused like the option of the same name, not let through as a place
@@ -385,9 +389,7 @@ describe("AGX_PROFILE and --profile", () => {
 	it.each([
 		["an empty text", ""],
 		["a name with a space", "my profile"],
-		["a secret key", NSEC],
-		["64 hex digits", STRANGER_HEX],
-	])("a --profile typed on the command line wins, so AGX_PROFILE set to %s is never used and is not looked at", async (_name, value) => {
+	])("a --profile typed on the command line wins, so AGX_PROFILE set to %s is never used as a name and is accepted", async (_name, value) => {
 		process.env.AGX_PROFILE = value;
 		const run = await agx("--profile", "work", "config", "list");
 		expect(run.code).toBe(0);
