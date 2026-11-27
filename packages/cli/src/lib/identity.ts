@@ -13,6 +13,7 @@ import { nip19 } from "nostr-tools";
 import { z } from "zod";
 import { AgxCliError, configError, EXIT, usageError } from "./errors.js";
 import { identityPath, isTooPermissive, writePrivateJson } from "./paths.js";
+import { rememberSecret } from "./secrets.js";
 
 /**
  * The agent's secp256k1 identity. Stored as hex — that is the form every call
@@ -112,6 +113,22 @@ export function toNsec(secretKey: Uint8Array): string {
 	return nip19.nsecEncode(secretKey);
 }
 
+/**
+ * Make `redactSecrets` know the profile's own secret key in every form agx can print it
+ * in, in lower and upper case: as the hex it is stored in, as the `nsec1…` that
+ * `agx identity export` gives, and as the `npub1…` the same 32 bytes make when they are
+ * typed where a peer belongs (`agx card <hex>` prints that back). Without this, only
+ * a key that agx sent somewhere was ever removed from an error message.
+ */
+function rememberOwnKey(secretKeyHex: string): void {
+	const bytes = hexToBytes(secretKeyHex);
+	const hex = bytesToHex(bytes);
+	for (const form of [secretKeyHex, hex, toNsec(bytes), toNpub(hex)]) {
+		rememberSecret(form.toLowerCase());
+		rememberSecret(form.toUpperCase());
+	}
+}
+
 export function saveIdentity(profile: string, identity: IdentityFile): void {
 	writePrivateJson(identityPath(profile), identity);
 }
@@ -149,6 +166,7 @@ export function loadIdentityFile(
 			`Back it up and regenerate: mv ${path} ${path}.bak && agx identity new`,
 		);
 	}
+	rememberOwnKey(parsed.data.secretKeyHex);
 	return parsed.data;
 }
 
