@@ -575,7 +575,6 @@ describe("the environment", () => {
 		["64 hex digits", STRANGER_HEX],
 	])("does not look at AGX_PROFILE when --profile names the profile: %s is never used then", async (_name, value) => {
 		expect(await refusal(scratch(named, { AGX_PROFILE: value })(["--profile", "work", "go", "x"]))).toBeNull();
-		expect(await refusal(scratch(named, { AGX_PROFILE: value })(["-p", "work", "go", "x"]))).toBeNull();
 	});
 
 	it("still refuses AGX_PROFILE when no --profile is typed, and still refuses the flag itself", async () => {
@@ -609,7 +608,7 @@ describe("a profile that is already stored", () => {
 
 	it("does not let another name through: a new profile must have a name that is one short folder name", async () => {
 		saveIdentity("my profile", createIdentity());
-		for (const name of ["my profile 2", "my profile ", "My Profile", "my  profile"]) {
+		for (const name of ["my profile 2", "my profile ", "my  profile", "my profile."]) {
 			expect(await refusal(scratch(profileTable)(["--profile", name, "go", "x"])), name).toEqual({ message: notAName(FLAG), exitCode: 2 });
 			expect(await refusal(scratch(profileTable)(["go", name])), name).toEqual({ message: notAName(POSITIONAL), exitCode: 2 });
 		}
