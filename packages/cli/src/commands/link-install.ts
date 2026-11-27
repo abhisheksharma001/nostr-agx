@@ -281,7 +281,7 @@ function lossyContent(text: string): "number" | "key" | "deep" | null {
  * includes the CLI's own entry files, `src/bin/agx.ts` and `dist/agx.js`), `agx@<version>` (as in `npx agx@latest`),
  * or this CLI's npm package `@nostr-agx/cli` (with or without a version). It has to come after the start of the text,
  * white space, a slash, a backslash, a quote, a colon (`npm:agx`), a backtick or one of `( { ; & |`, and it ends at the
- * end, white space, a backtick, a quote or one of `; | & < > ( ) { } ,` (a slash too, for the package's own files), or at
+ * end, white space, a backtick, a quote or one of `; | & < > ( ) } ,` (a slash too, for the package's own files), or at
  * a backslash or caret that ends a line (a continuation). That covers `agx hook ...`, a path with or without spaces, `npx -y
  * agx@latest`, `pnpm dlx @nostr-agx/cli`, `deno run -A npm:agx`, `env X=y agx`, `sh -c '...'`, `$(agx ...)`,
  * `powershell -c "& {agx hook}"`, `agx>/dev/null` and `agx,hook`, in any case. It leaves out `tagx`,
@@ -292,7 +292,7 @@ function lossyContent(text: string): "number" | "key" | "deep" | null {
  * white space, a shell does not).
  */
 const AGX_AS_A_COMMAND =
-	/(?:^|[\s/\\'"(;&|:{`])(?:agx(?:@|(?:\.(?:js|mjs|cjs|ts|mts|cts|cmd|exe|com|ps1|bat|sh))?(?=$|[\s;|&<>(){}`'",]|[\\^]\r?\n))|@nostr-agx\/cli(?=$|[\s/@;|&<>(){}`'",]))/i;
+	/(?:^|[\s/\\'"(;&|:{`])(?:agx(?:@|(?:\.(?:js|mjs|cjs|ts|mts|cts|cmd|exe|com|ps1|bat|sh))?(?=$|[\s;|&<>()}`'",]|[\\^]\r?\n))|@nostr-agx\/cli(?=$|[\s/@;|&<>()}`'",]))/i;
 
 /** Whether a hook command runs agx. It errs on the side of yes: the one thing worse than a refusal is a second copy of the hook. */
 function mentionsAgx(command: string): boolean {
@@ -613,24 +613,18 @@ function withLock<T>(target: string, deps: LinkInstallDeps, run: (stillMine: () 
 
 /**
  * Refuses what a real run could not do either, so that a dry run says the same: the folder the file goes in (or the
- * nearest one that exists, when it is not there yet) is a link to nothing, is not a folder, or cannot be written into.
+ * nearest one that exists, when it is not there yet) is a link to nothing, or cannot be written into. (A file where a
+ * folder belongs is refused earlier, by `load`.)
  */
 function requireWritableFolder(folder: string, file: string): void {
 	let dir = folder;
 	while (!lookedAt(dir) && dirname(dir) !== dir) {
 		dir = dirname(dir);
 	}
-	let problem: string | null = null;
 	try {
-		if (!statSync(dir).isDirectory()) {
-			problem = "is not a folder";
-		} else {
-			accessSync(dir, constants.W_OK | constants.X_OK);
-		}
+		accessSync(dir, constants.W_OK | constants.X_OK);
 	} catch (error) {
-		problem = (error as NodeJS.ErrnoException).code === "ENOENT" ? "is a link to a folder that does not exist" : "is not writable";
-	}
-	if (problem !== null) {
+		const problem = (error as NodeJS.ErrnoException).code === "ENOENT" ? "is a link to a folder that does not exist" : "is not writable";
 		throw refusal(`${dir} ${problem}, so ${file} cannot be created or replaced there.`, "Fix that folder or its permissions, or add the entries yourself: see docs/hooks.md.");
 	}
 }
