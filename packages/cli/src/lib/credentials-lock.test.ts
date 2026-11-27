@@ -674,17 +674,23 @@ describe("a credentials file that cannot be used: what a command says does not c
 		}
 	});
 
-	it("is not valid JSON while another process holds the lock: a get or a list still says so at once", () => {
+	it("is not valid JSON while another process holds the lock: a get, a list or a remove still says so at once", async () => {
 		const broken = '{"version":1,"profiles":{"default":{"apiKey":"ela_LEAKME';
 		writeFileSync(credentialsFile(), broken, { mode: 0o600 });
 		plantLiveLock();
-		const started = Date.now();
-		for (const [, run] of everyCommand.slice(0, 2)) {
-			const error = errorOf(run);
-			expect(error).toBeInstanceOf(AgxCliError);
-			expect((error as AgxCliError).message).toMatch(/is not valid JSON/);
-		}
-		expect(Date.now() - started).toBeLessThan(2_000);
+		const run = await onMovedClock(() => {
+			for (const [name, call] of everyCommand) {
+				if (name === "set") {
+					continue;
+				}
+				const error = errorOf(call);
+				expect(error, name).toBeInstanceOf(AgxCliError);
+				expect((error as AgxCliError).message, name).toMatch(/is not valid JSON/);
+			}
+		});
+		expect(run.error).toBeUndefined();
+		expect(run.waited).toBeLessThan(1_000);
+		expect(readFileSync(credentialsFile(), "utf8")).toBe(broken);
 	});
 
 	it("is not valid JSON and the lock left by a process that has exited is in the way: a set says the same as without it", () => {
@@ -778,6 +784,28 @@ describe("removing a profile that is not there", () => {
 		expect(removeCredential("nobody")).toBe(false);
 		expect(existsSync(process.env.AGX_HOME)).toBe(false);
 		expect(homeFiles()).toEqual([]);
+	});
+
+	it("returns false at once while another command holds the lock, and does not touch it", async () => {
+		setCredential("keep", entry());
+		plantLiveLock();
+		const theirs = readFileSync(lockFile(), "utf8");
+
+		const run = await onMovedClock(() => removeCredential("nobody"));
+
+		expect(run.error).toBeUndefined();
+		expect(run.value).toBe(false);
+		expect(run.waited).toBeLessThan(1_000);
+		expect(readFileSync(lockFile(), "utf8")).toBe(theirs);
+		expect(homeFiles()).toEqual(["credentials.json", "credentials.json.lock"]);
+	});
+
+	it("returns false and leaves the mode of the home folder as it was", () => {
+		setCredential("keep", entry());
+		chmodSync(box.home, 0o750);
+		expect(removeCredential("nobody")).toBe(false);
+		expect(statSync(box.home).mode & 0o777).toBe(0o750);
+		expect(homeFiles()).toEqual(["credentials.json"]);
 	});
 });
 
