@@ -856,6 +856,16 @@ function sourceFiles(): { root: string; files: string[] } {
 	return { root, files };
 }
 
+/** Does this source text import `node:dns` or call a resolver (`dns.resolve*`, `Resolver`), which the connection guard does not watch? */
+function usesResolver(text: string): boolean {
+	return /\bnew (?:dns\.)?(?:promises\.)?Resolver\b|\bdns\.(?:promises\.)?resolve|\bresolve(?:4|6|Any|Srv|Txt|Mx|Cname|Ns)\(|["']node:dns["']|["']node:dns\/promises["']/.test(text);
+}
+
+/** Does this source text import `node:child_process`? */
+function usesChildProcess(text: string): boolean {
+	return /["']node:child_process["']/.test(text);
+}
+
 /** The home of the person running the test, as it is before any run changes it. */
 const REAL_HOME = homedir();
 
@@ -2929,16 +2939,27 @@ describe("the secret-key canary", () => {
 	});
 
 	describe("the cleanup and the home", () => {
+		it("recognises the ways a program can reach a resolver or start a process", () => {
+			for (const text of ['import { lookup } from "node:dns/promises";', "import dns from 'node:dns';", "dns.resolve4(host)", "await dns.promises.resolveTxt(name)", "const r = new Resolver();", "new dns.promises.Resolver()", "resolveSrv(name)"]) {
+				expect(usesResolver(text), text).toBe(true);
+			}
+			for (const text of ["const resolved = resolve(path);", "await lookupHost(name)", "// dns is not used here"]) {
+				expect(usesResolver(text), text).toBe(false);
+			}
+			expect(usesChildProcess('import { spawn } from "node:child_process";')).toBe(true);
+			expect(usesChildProcess("const child = 1;")).toBe(false);
+		});
+
 		it("knows what the connection guard does not watch: other resolver calls and child processes", () => {
 			const { root, files } = sourceFiles();
 			const resolvers: string[] = [];
 			const children: string[] = [];
 			for (const file of files) {
 				const text = readFileSync(file, "utf8");
-				if (/\bnew (?:dns\.)?(?:promises\.)?Resolver\b|\bdns\.(?:promises\.)?resolve|\bresolve(?:4|6|Any|Srv|Txt|Mx|Cname|Ns)\(|["']node:dns["']|["']node:dns\/promises["']/.test(text)) {
+				if (usesResolver(text)) {
 					resolvers.push(relative(root, file));
 				}
-				if (/["']node:child_process["']/.test(text)) {
+				if (usesChildProcess(text)) {
 					children.push(relative(root, file));
 				}
 			}
