@@ -66,10 +66,14 @@ describe("holdsSecretKey (lenient: for text that is about to be shown or kept)",
 		}
 	});
 
-	it("is quick on a long text with many escapes", () => {
-		const started = Date.now();
+	it("copes with a very long text full of escapes and with long runs of key characters", () => {
+		// No time limit is asserted (a wall clock is a poor test on a busy machine); a regular expression
+		// that backtracked without end would run into the test timeout instead.
 		expect(holdsSecretKey(`${"%41%42%43 ".repeat(50_000)}${escapeAll("nsec1")}`)).toBe(true);
-		expect(Date.now() - started).toBeLessThan(5000);
+		expect(holdsSecretKey("%41%42%43 ".repeat(50_000))).toBe(false);
+		expect(secretKeyKinds(`${("nsec1" + "q".repeat(1000) + "b").repeat(1000)}`)).toEqual([]);
+		expect(secretKeyKinds(`nsec1${"q".repeat(200_000)}b`)).toEqual([]);
+		expect(hexKeyRuns("a".repeat(200_000))).toEqual([]);
 	});
 });
 
