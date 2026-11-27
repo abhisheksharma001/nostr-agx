@@ -167,3 +167,109 @@ describe("scrubbedJson", () => {
 		expect(JSON.parse(text)).toEqual({ text: REDACTED });
 	});
 });
+
+/** `levels` objects inside one another, each holding the one name `name`, with `leaf` at the bottom. Built from the inside out, so building it takes no stack. */
+function nested(levels: number, name: string, leaf: unknown): unknown {
+	let doc = leaf;
+	for (let i = 0; i < levels; i++) {
+		doc = { [name]: doc };
+	}
+	return doc;
+}
+
+/** Walks a parsed `nested` document from the outside in, one level at a time (no recursion): how deep it is, every name met, and what is at the bottom. */
+function descend(doc: unknown): { levels: number; names: Set<string>; leaf: unknown } {
+	const names = new Set<string>();
+	let levels = 0;
+	let node = doc;
+	while (typeof node === "object" && node !== null && !Array.isArray(node)) {
+		const own = Object.keys(node);
+		if (own.length !== 1) {
+			break;
+		}
+		names.add(own[0] as string);
+		node = (node as Record<string, unknown>)[own[0] as string];
+		levels++;
+	}
+	return { levels, names, leaf: node };
+}
+
+// A document 3000 levels deep is about 18 KB, which `JSON.stringify` writes without trouble. The
+// scrub must write it too: a peer controls the answer to its own task, and the gateway sends that
+// answer through `sendJson`.
+describe("scrubbedJson on a very deep document", () => {
+	const DEEP = 3000;
+
+	it("replaces a key used as a name at every level, and the document stays valid and as deep", () => {
+		const text = scrubbedJson(nested(DEEP, NSEC, "end")) as string;
+		const { levels, names, leaf } = descend(JSON.parse(text));
+		expect(levels).toBe(DEEP);
+		expect([...names]).toEqual([REDACTED]);
+		expect(leaf).toBe("end");
+		expect(text).not.toContain(NSEC.slice(5, 25));
+	});
+
+	it("does the same when the text is indented", () => {
+		const text = scrubbedJson(nested(DEEP, NCRYPTSEC, "end"), 2) as string;
+		const { levels, names, leaf } = descend(JSON.parse(text));
+		expect(levels).toBe(DEEP);
+		expect([...names]).toEqual([REDACTED]);
+		expect(leaf).toBe("end");
+		expect(text).not.toContain(NCRYPTSEC.slice(10, 30));
+	});
+
+	it("replaces a key used as the value at the bottom, behind ordinary names", () => {
+		const text = scrubbedJson(nested(DEEP, "a", `x ${NSEC} y`)) as string;
+		const { levels, leaf } = descend(JSON.parse(text));
+		expect(levels).toBe(DEEP);
+		expect(leaf).toBe(`x ${REDACTED} y`);
+	});
+
+	it("keeps a line feed followed by `sec1…` at the bottom as it was, which a text scrub of the written JSON would break", () => {
+		const value = "first line\nsec1abcdefghijklmnop";
+		const { levels, names, leaf } = descend(JSON.parse(scrubbedJson(nested(DEEP, NSEC, value)) as string));
+		expect(levels).toBe(DEEP);
+		expect([...names]).toEqual([REDACTED]);
+		expect(leaf).toBe(value);
+	});
+
+	it("keeps an escaped backslash before a key as it was, and replaces only the key", () => {
+		const { leaf } = descend(JSON.parse(scrubbedJson(nested(DEEP, NSEC, `back${String.fromCharCode(92)}${NSEC}`)) as string));
+		expect(leaf).toBe(`back${String.fromCharCode(92)}${REDACTED}`);
+	});
+
+	it("writes two names that are keys in one object as two entries, which JSON.parse reads as one", () => {
+		// The walk of a shallow document merges names that scrub to the same text; the text scrub of a deep one cannot.
+		let doc: unknown = 1;
+		for (let i = 0; i < DEEP; i++) {
+			doc = { [NSEC]: doc, [NCRYPTSEC]: 2 };
+		}
+		const text = scrubbedJson(doc) as string;
+		expect(text.split(`"${REDACTED}":`).length - 1).toBe(2 * DEEP);
+		expect(text).not.toContain(NSEC.slice(5, 25));
+		expect(text).not.toContain(NCRYPTSEC.slice(10, 30));
+		expect(Object.keys(JSON.parse(text) as object)).toEqual([REDACTED]);
+	});
+
+	it("writes a deep document with no key in it exactly as JSON.stringify does", () => {
+		const doc = nested(5000, "a", { text: "plain", list: [1, 2, null] });
+		expect(scrubbedJson(doc)).toBe(JSON.stringify(doc));
+		expect(scrubbedJson(doc, 2)).toBe(JSON.stringify(doc, null, 2));
+	});
+
+	it.each([
+		["with ordinary names", "a"],
+		["with names that are keys", NSEC],
+	])("fails as JSON.stringify fails on a document too deep for it to write, %s", (_name, name) => {
+		const doc = nested(20_000, name, 1);
+		expect(() => JSON.stringify(doc)).toThrow(RangeError);
+		expect(() => scrubbedJson(doc)).toThrow(RangeError);
+	});
+
+	it("fails as JSON.stringify fails on a circular document, also when a name in it is a key", () => {
+		const circular: Record<string, unknown> = { [NSEC]: 1 };
+		circular.again = circular;
+		expect(() => JSON.stringify(circular)).toThrow(TypeError);
+		expect(() => scrubbedJson(circular)).toThrow(TypeError);
+	});
+});

@@ -131,6 +131,80 @@ describe("sendJson and sendError", () => {
 	});
 });
 
+/** `levels` objects inside one another, each holding the one name `name`, with `leaf` at the bottom. */
+function nested(levels: number, name: string, leaf: unknown): unknown {
+	let doc = leaf;
+	for (let i = 0; i < levels; i++) {
+		doc = { [name]: doc };
+	}
+	return doc;
+}
+
+/** The names met going down a parsed `nested` document one level at a time, how many levels there were, and what is at the bottom. */
+function descend(doc: unknown): { levels: number; names: Set<string>; leaf: unknown } {
+	const names = new Set<string>();
+	let levels = 0;
+	let node = doc;
+	while (typeof node === "object" && node !== null && !Array.isArray(node)) {
+		const own = Object.keys(node);
+		names.add(own[0] as string);
+		node = (node as Record<string, unknown>)[own[0] as string];
+		levels++;
+	}
+	return { levels, names, leaf: node };
+}
+
+// A peer controls the answer to its own task, and the gateway sends that answer through `sendJson`.
+// A document 3000 levels deep is about 18 KB: `JSON.stringify` writes it, so the gateway does too.
+// One that cannot be written at all must fail before the status line is sent, so the caller can still
+// answer with an error instead of ending a "200" with nothing in it.
+describe("sendJson on a very deep body", () => {
+	it("sends 3000 levels with a key as the name at each, replaced, as valid JSON", async () => {
+		const url = await answering((res) => sendJson(res, 200, nested(3000, NSEC, "end")));
+		const res = await fetch(url);
+		expect(res.status).toBe(200);
+		const text = await res.text();
+		const { levels, names, leaf } = descend(JSON.parse(text));
+		expect(levels).toBe(3000);
+		expect([...names]).toEqual([MARK]);
+		expect(leaf).toBe("end");
+		expect(leaksKey(text, NSEC, 5)).toBe(false);
+	});
+
+	it("sends 3000 levels with ordinary names byte for byte as JSON.stringify writes them", async () => {
+		const body = nested(3000, "a", { text: "plain" });
+		const url = await answering((res) => sendJson(res, 200, body));
+		expect(await (await fetch(url)).text()).toBe(JSON.stringify(body));
+	});
+
+	it.each([
+		[
+			"a circular body",
+			() => {
+				const circular: Record<string, unknown> = { label: NSEC };
+				circular.again = circular;
+				return circular;
+			},
+		],
+		["a body too deep to be written at all", () => nested(20_000, NSEC, 1)],
+		["a body that holds a BigInt", () => ({ label: NSEC, n: 10n })],
+	])("throws before it sends anything for %s, so the caller can still answer with an error", async (_name, make) => {
+		let sentBeforeThrow: boolean | undefined;
+		const url = await answering((res) => {
+			try {
+				sendJson(res, 200, make());
+			} catch {
+				sentBeforeThrow = res.headersSent;
+				sendError(res, new ApiError(500, "internal_error", "The gateway could not complete the request"));
+			}
+		});
+		const res = await fetch(url);
+		expect(sentBeforeThrow).toBe(false);
+		expect(res.status).toBe(500);
+		expect(await res.json()).toEqual({ error: { code: "internal_error", message: "The gateway could not complete the request" } });
+	});
+});
+
 describe("the real gateway", () => {
 	let relay: RunningRelay;
 	let box: ReturnType<typeof sandbox>;

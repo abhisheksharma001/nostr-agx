@@ -165,6 +165,40 @@ describe("a secret key in a JSON document does not come out, and the document st
 		const { stdout } = await capture(async () => json(value));
 		expect(JSON.parse(stdout)).toEqual(value);
 	});
+
+	// A document 3000 levels deep is about 18 KB, which `JSON.stringify` writes without trouble: a peer
+	// can send one as the answer to its own task, and `--json` prints it.
+	describe("a document 3000 levels deep, with a key as the name at every level", () => {
+		const deep = () => {
+			let doc: unknown = "end";
+			for (let i = 0; i < 3000; i++) {
+				doc = { [NSEC]: doc };
+			}
+			return doc;
+		};
+		const depthOf = (text: string) => {
+			let levels = 0;
+			let node: unknown = JSON.parse(text);
+			while (typeof node === "object" && node !== null) {
+				const names = Object.keys(node);
+				expect(names).toEqual([MARK]);
+				node = (node as Record<string, unknown>)[MARK];
+				levels++;
+			}
+			return { levels, leaf: node };
+		};
+
+		it.each([
+			["json() in --json mode", (value: unknown) => json(value), true, "stdout"],
+			["emitStdoutJson", (value: unknown) => emitStdoutJson(value), false, "stdout"],
+			["emitStderrJson", (value: unknown) => emitStderrJson(value), false, "stderr"],
+		] as const)("%s prints it with every name replaced, as valid JSON", async (_name, write, jsonOn, stream) => {
+			setJsonMode(jsonOn);
+			const out = await capture(async () => write(deep()));
+			expect(depthOf(out[stream])).toEqual({ levels: 3000, leaf: "end" });
+			expect(leakedPart(out.stdout + out.stderr, NSEC, 5)).toBeNull();
+		});
+	});
 });
 
 describe("ordinary output comes out exactly as it did", () => {
