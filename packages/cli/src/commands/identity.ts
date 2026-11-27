@@ -86,7 +86,8 @@ const ENV_REMEDIATION =
  * printed. The variable is left as it is: it belongs to whoever started the command.
  */
 function readSecretFromEnv(name: string): string {
-	const value = process.env[name];
+	// Own property only: `process.env` inherits from Object.prototype, so `process.env.toString` is a function.
+	const value = Object.hasOwn(process.env, name) ? process.env[name] : undefined;
 	if (value === undefined) {
 		throw usageError(`The environment variable ${name} is not set.`, ENV_REMEDIATION);
 	}

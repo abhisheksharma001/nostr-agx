@@ -45,12 +45,15 @@ function isStoredProfileName(name: string): boolean {
 /** The name of an environment variable: letters, digits and "_", not starting with a digit. */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/** The longest variable name accepted. A longer text is not shown back: a key typed as a name, one character off, is longer. */
+const ENV_NAME_MAX = 40;
+
 /** A name holding a run of this many hex digits is not accepted, so a key one or two digits short cannot be repeated back as a name (the same length the parser's own errors hide). */
 const ENV_NAME_HEX_DIGITS = 56;
 
-/** Letters, digits and "_", not starting with a digit, and no run of 56 or more hex digits. */
+/** Letters, digits and "_", not starting with a digit, at most 40 characters, and no run of 56 or more hex digits. */
 export function isValidEnvName(name: string): boolean {
-	return ENV_NAME.test(name) && !holdsHexRun(name, ENV_NAME_HEX_DIGITS);
+	return name.length <= ENV_NAME_MAX && ENV_NAME.test(name) && !holdsHexRun(name, ENV_NAME_HEX_DIGITS);
 }
 
 const KEY_SHAPE = "holds a secret key (nsec1… or ncryptsec1…)";
