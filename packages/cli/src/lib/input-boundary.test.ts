@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hexToBytes } from "@nostr-agx/nostr";
@@ -343,6 +343,14 @@ describe("the profile's own key", () => {
 		box.restore();
 		box = sandbox();
 		expect(await refusal(scratch(table("publicKey"))(asArgs(OWN_HEX)))).toBeNull();
+	});
+
+	it("is not read from outside the profiles folder, when the name of the profile in use is not a folder name", async () => {
+		const outside = createIdentity();
+		saveIdentity("../escape", outside);
+		process.env.AGX_PROFILE = "../escape";
+		expect(existsSync(join(box.home, "escape", "identity.json"))).toBe(true);
+		expect(await refusal(scratch(table("publicKey"))(asArgs(outside.secretKeyHex)))).toBeNull();
 	});
 
 	it("is the key of the profile that the command would use: --profile first, then AGX_PROFILE, then the stored one", async () => {
