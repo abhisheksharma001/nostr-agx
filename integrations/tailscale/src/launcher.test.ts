@@ -608,7 +608,8 @@ describe("a stand-in that waits for a trigger file", () => {
 	it.skipIf(!posix)("leaves when the process that started it is gone", async () => {
 		// A short-lived parent starts the stand-in and ends at once, as a host that
 		// was killed would; nothing ever creates the trigger file.
-		const fake = await fakeBinary("#!/bin/sh\n" + endingTail(join(tmpdir(), `agx-launcher-no-trigger-${process.pid}`), "exit 7"));
+		const trigger = join(tmpdir(), `agx-launcher-no-trigger-${process.pid}`);
+		const fake = await fakeBinary("#!/bin/sh\n" + endingTail(trigger, "exit 7"));
 		let pid = 0;
 		try {
 			const parent = spawn(
@@ -651,6 +652,8 @@ describe("a stand-in that waits for a trigger file", () => {
 				}
 			}
 			await rm(fake.dir, { recursive: true, force: true });
+			// The stand-in writes this file just before it ends; it is outside `fake.dir`.
+			await rm(`${trigger}.gone`, { force: true });
 		}
 	}, 20_000);
 });
