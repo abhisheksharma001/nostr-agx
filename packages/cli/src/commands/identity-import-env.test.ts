@@ -382,7 +382,7 @@ describe("identity import --from-env: what is given as the name", () => {
 	it.each([
 		["a hex key one digit short", () => `a${HEX.slice(2)}`],
 		["a hex key eight digits short", () => `a${HEX.slice(9)}`],
-		["41 characters", () => "A".repeat(41)],
+		["41 characters", () => "Z".repeat(41)],
 		["a letter and 55 hex digits of a key", () => `x${HEX.slice(0, 55)}`],
 		["an nsec1 key typed without its 1", () => NSEC.replace("nsec1", "nsec")],
 	])("%s: not a name, and not printed", async (_name, make) => {

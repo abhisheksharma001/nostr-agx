@@ -776,12 +776,12 @@ describe("a slot that takes the name of an environment variable", () => {
 
 	it("takes a name of 40 characters and refuses one of 41 or more, naming the slot and not the value", async () => {
 		for (const length of [1, 39, 40]) {
-			expect(await refusal(scratch(table)(asArgs("A".repeat(length)))), `${length} characters`).toBeNull();
-			expect(isValidEnvName("A".repeat(length)), `${length} characters`).toBe(true);
+			expect(await refusal(scratch(table)(asArgs("Z".repeat(length)))), `${length} characters`).toBeNull();
+			expect(isValidEnvName("Z".repeat(length)), `${length} characters`).toBe(true);
 		}
 		for (const length of [41, 42, 56, 62, 100]) {
-			expect(await refusal(scratch(table)(asArgs("A".repeat(length)))), `${length} characters`).toEqual({ message: NOT_A_NAME, exitCode: 2 });
-			expect(isValidEnvName("A".repeat(length)), `${length} characters`).toBe(false);
+			expect(await refusal(scratch(table)(asArgs("Z".repeat(length)))), `${length} characters`).toEqual({ message: NOT_A_NAME, exitCode: 2 });
+			expect(isValidEnvName("Z".repeat(length)), `${length} characters`).toBe(false);
 		}
 	});
 
