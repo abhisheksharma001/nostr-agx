@@ -31,6 +31,8 @@ import { dirname, join } from "node:path";
  *                                         config.json takes (see config-lock.ts)
  *     credentials.json                    API keys, one per profile, each bound
  *                                         to the one origin it may be sent to
+ *     credentials.json.lock               held for the milliseconds one write of
+ *                                         credentials.json takes (see config-lock.ts)
  *     profiles/<name>/identity.json       the secret key
  *     profiles/<name>/state.json          cursor + listing id
  *     profiles/<name>/seen.json           replay-protection ids
