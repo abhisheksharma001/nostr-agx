@@ -250,7 +250,9 @@ describe("scrubbedJson on a very deep document", () => {
 	});
 
 	it("writes a deep document with no key in it exactly as JSON.stringify does", () => {
-		const doc = nested(5000, "a", { text: "plain", list: [1, 2, null] });
+		// How deep `JSON.stringify` itself can go depends on the machine's stack: 5000 levels is already too deep
+		// on the Linux runners, so this uses the same depth as the other cases here.
+		const doc = nested(DEEP, "a", { text: "plain", list: [1, 2, null] });
 		expect(scrubbedJson(doc)).toBe(JSON.stringify(doc));
 		expect(scrubbedJson(doc, 2)).toBe(JSON.stringify(doc, null, 2));
 	});
